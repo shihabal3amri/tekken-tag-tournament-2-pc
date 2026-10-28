@@ -49,9 +49,11 @@ bool RegisterRollbackWriteHandler(CaptureRollbackWriter capture, RollbackWriteHa
 bool ProtectForRollback(void* address, size_t bytes, bool readOnly);
 unsigned long LastError();
 
-#if defined(__linux__)
-// Keep the first 64 KiB zero-backed and read-only. A guest write executes once
-// under single-step, then the whole guarded range is cleared before protection returns.
+#if defined(__linux__) || defined(__APPLE__)
+// Keep the first 64 KiB zero-backed and read-only. On x86-64 Linux a guest write
+// executes once under single-step, then the whole guarded range is cleared before
+// protection returns; ARM64 (Android, macOS) relies on the generated-store guard.
+// macOS: the API stays in 4 KiB pages over 16 KiB host pages (host_vm_mac.cpp).
 bool EnableNullPageGuard();
 // Signal-handler cleanup if another fault interrupts a single-stepped null
 // write. Restores zero contents and read-only protection before recovery.

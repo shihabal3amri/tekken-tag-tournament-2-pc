@@ -228,6 +228,15 @@ private:
                          SDL_GetError());
             return;
         }
+        // TTT2_AUDIO_MUTE=1 (tests on shared machines): the real device and its clock, at zero gain.
+        // Unlike TTT2_AUDIO_SILENT the output still paces the mixer exactly as an audible run does.
+        if (const char* e = std::getenv("TTT2_AUDIO_MUTE"); e && *e == '1')
+        {
+            if (SDL_SetAudioDeviceGain(device_, 0.0f))
+                std::fprintf(stderr, "[snd-output] TTT2_AUDIO_MUTE=1: device opened at zero gain\n");
+            else
+                std::fprintf(stderr, "[snd-output] SDL_SetAudioDeviceGain: %s\n", SDL_GetError());
+        }
         SDL_AudioSpec obtained{};
         int deviceFrames = 0;
         SDL_GetAudioDeviceFormat(device_, &obtained, &deviceFrames);

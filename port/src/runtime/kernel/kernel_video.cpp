@@ -27,6 +27,12 @@
 #include "../host_window.h"
 #include "../host_thread.h"
 #include "../host_deadline_wait.h"
+#if defined(__APPLE__) && defined(__x86_64__)
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <mach/thread_policy.h>
+#include <pthread.h>
+#endif
 #include "host_settings.h"
 #ifdef _WIN32
 #include "../host_window_win32.h"
@@ -2528,6 +2534,26 @@ static void VideoTick()
     auto period = std::chrono::microseconds((1000000 + refreshHz / 2) / refreshHz);
     auto spinMargin = (std::min)(std::chrono::microseconds(1500), period / 8);
     host_deadline::Waiter deadlineWaiter;
+#if defined(__APPLE__) && defined(__x86_64__)
+    {
+        // Intel Macs: a yielding spin loses its core to the busy game threads and woke the vblank
+        // 1.4-2.3 ms late on a 4-core Intel iMac (TTT2_PACING_PROBE wake_late). A time-constraint
+        // thread is scheduled at its deadline, like Core Audio's and the display link's threads.
+        mach_timebase_info_data_t timebase{};
+        mach_timebase_info(&timebase);
+        const auto ticks = [&](std::chrono::microseconds us) {
+            return uint32_t(double(us.count()) * 1000.0 * timebase.denom / timebase.numer);
+        };
+        thread_time_constraint_policy_data_t policy{};
+        policy.period = ticks(period);
+        policy.computation = ticks(std::chrono::microseconds(3000));
+        policy.constraint = ticks(std::chrono::microseconds(5000));
+        policy.preemptible = 1;
+        if (thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
+                              reinterpret_cast<thread_policy_t>(&policy), THREAD_TIME_CONSTRAINT_POLICY_COUNT) != KERN_SUCCESS)
+            std::fprintf(stderr, "[vd] vblank thread: time-constraint policy refused\n");
+    }
+#endif
     if (refreshHz != 60)
         std::fprintf(stderr, "[vd] throughput probe: guest vblank %d Hz; simulation pacing may accelerate\n", refreshHz);
     const char* refreshFile = std::getenv("TTT2_VIDEO_HZ_FILE");

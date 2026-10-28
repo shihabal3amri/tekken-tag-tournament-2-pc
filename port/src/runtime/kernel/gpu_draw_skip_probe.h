@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include <time.h>
 #endif
 
@@ -42,7 +42,7 @@ inline const char* ControlPath()
 }
 inline double ThreadCpuMs()
 {
-#if defined(__linux__)
+#if !defined(_WIN32)
     timespec time{};
     if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time) == 0)
         return double(time.tv_sec) * 1000 + double(time.tv_nsec) / 1e6;

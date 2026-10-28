@@ -31,7 +31,7 @@ else()
     # manifest was generated from the Windows configuration and differs where
     # FFmpeg chooses platform-specific objects (for example file_open.c).
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    set(_ff_source_script "${CMAKE_SOURCE_DIR}/tools/ffmpeg_sources.py")
+    set(_ff_source_script "${CMAKE_CURRENT_LIST_DIR}/../../tools/ffmpeg_sources.py")
     execute_process(
         COMMAND "${Python3_EXECUTABLE}" "${_ff_source_script}" "${FFMPEG_SRC}" "${FFMPEG_BUILD}"
         OUTPUT_VARIABLE _ff_source_lines
@@ -138,10 +138,17 @@ if(WIN32)
     endif()
 else()
     find_package(Threads REQUIRED)
-    # FFmpeg's Linux config.mak lists -pthread -lm -latomic for both libavcodec
-    # and libavutil. Keep the static archive's final link dependencies together.
-    target_link_libraries(ttt2_ffmpeg PUBLIC Threads::Threads m atomic)
-    target_compile_options(ttt2_ffmpeg PRIVATE -O2)
+    if(APPLE)
+        # macOS has no libatomic (C11 atomics are builtins in Apple clang). Keep FP contraction
+        # off so arm64 decodes the same samples as the x86-64 builds, which have no FMA.
+        target_link_libraries(ttt2_ffmpeg PUBLIC Threads::Threads m)
+        target_compile_options(ttt2_ffmpeg PRIVATE -O2 -ffp-contract=off)
+    else()
+        # FFmpeg's Linux config.mak lists -pthread -lm -latomic for both libavcodec
+        # and libavutil. Keep the static archive's final link dependencies together.
+        target_link_libraries(ttt2_ffmpeg PUBLIC Threads::Threads m atomic)
+        target_compile_options(ttt2_ffmpeg PRIVATE -O2)
+    endif()
 endif()
 set_target_properties(ttt2_ffmpeg PROPERTIES C_STANDARD 17)
 if(WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang")

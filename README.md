@@ -135,12 +135,17 @@ game's shaders for you, usually in a few minutes.
 > sound, stages and movies are all built on your PC from your disc image and title update.
 > They are never included here.
 
+**On a Mac** &nbsp; Get `TTT2-macOS-<version>.zip` from the same release, unzip it, move
+*Tekken Tag Tournament 2* to Applications and open it. The first time, it asks for the same disc image and
+Title Update 3, builds the game files and prepares the shaders (about 8 minutes), then starts. Online play
+on Apple Silicon is experimental: for now it only matches other Apple Silicon players, not Windows PCs.
+
 ---
 
 ## What you need
 
 <table>
-  <tr><td><b>System</b></td><td>Windows 10 or 11, 64-bit</td></tr>
+  <tr><td><b>System</b></td><td>Windows 10 or 11, 64-bit; or macOS 14.4+ on Apple Silicon, macOS 13+ on Intel</td></tr>
   <tr><td><b>Graphics</b></td><td>Any DirectX 11 graphics card (on laptops, the port picks the dedicated one)</td></tr>
   <tr><td><b>Storage</b></td><td>About 13 GB free</td></tr>
   <tr><td><b>Your game</b></td><td><i>Tekken Tag Tournament 2 (USA, Europe)</i> Xbox 360 disc image (<code>.iso</code>) + Title Update 3</td></tr>

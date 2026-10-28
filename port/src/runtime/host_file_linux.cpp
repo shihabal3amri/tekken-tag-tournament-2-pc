@@ -1,14 +1,18 @@
 #include "host_file.h"
 
-#if !defined(__linux__)
-#error "This file backend requires Linux"
+#if !defined(__linux__) && !defined(__APPLE__)
+#error "This file backend requires Linux or macOS"
 #endif
 
 #include <cerrno>
 #include <algorithm>
 #include <dirent.h>
 #include <fcntl.h>
+#if defined(__linux__)
 #include <linux/fs.h>
+#else
+#include <stdio.h> // renameatx_np, RENAME_EXCL
+#endif
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
@@ -43,6 +47,17 @@ struct DeleteMark
     ino_t inode = 0;
 };
 std::vector<DeleteMark> g_deleteMarks;
+
+#if defined(__linux__)
+constexpr int DirectoryPathFlags = O_PATH | O_DIRECTORY;
+// A descriptor used only for fstat of a save entry.
+constexpr int MetadataFlags = O_PATH;
+#else
+// macOS has no O_PATH. O_SEARCH opens a directory for lookups only; a save
+// entry is opened read-only and non-blocking (a FIFO is rejected by fstat).
+constexpr int DirectoryPathFlags = O_SEARCH;
+constexpr int MetadataFlags = O_RDONLY | O_NONBLOCK;
+#endif
 
 bool DeletePending(dev_t device, ino_t inode)
 {
@@ -146,14 +161,14 @@ uint32_t Status(int error)
 uint32_t OpenDirectoryNoFollow(const std::filesystem::path& path, int& directory)
 {
     if (!path.is_absolute()) return 0xC0000033u;
-    int fd = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
+    int fd = open("/", DirectoryPathFlags | O_CLOEXEC);
     if (fd < 0) return Status(errno);
     for (const auto& component : path.relative_path())
     {
         if (component == ".") continue;
         if (component == "..") { close(fd); return 0xC0000022u; }
         const int next = openat(fd, component.c_str(),
-                                O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                                DirectoryPathFlags | O_NOFOLLOW | O_CLOEXEC);
         if (next < 0)
         {
             const uint32_t status = Status(errno);
@@ -240,7 +255,7 @@ uint32_t QueryAttributes(const std::filesystem::path& path,
                 return status;
             }
             if (!exists) { close(parent); return 0xC0000034u; }
-            fd = openat(parent, name.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+            fd = openat(parent, name.c_str(), MetadataFlags | O_NOFOLLOW | O_CLOEXEC);
             const int openError = errno;
             close(parent);
             if (fd < 0) return Status(openError);
@@ -260,7 +275,7 @@ uint32_t QueryAttributes(const std::filesystem::path& path,
             size = directory ? 0 : uint64_t(info.st_size);
             return 0;
         }
-        else fd = openat(parent, name.c_str(), O_PATH | O_NOFOLLOW | O_CLOEXEC);
+        else fd = openat(parent, name.c_str(), MetadataFlags | O_NOFOLLOW | O_CLOEXEC);
         const int error = errno;
         close(parent);
         if (fd < 0) return Status(error);
@@ -583,10 +598,17 @@ uint32_t Rename(File* file, const std::filesystem::path& target, bool replace)
                 return SharingViolation;
     }
     else if (targetExists) name = requested; // removed between lookup and stat
+#if defined(__linux__)
     const unsigned flags = replace ? 0 : RENAME_NOREPLACE;
     if (syscall(SYS_renameat2, file->parent, file->name.c_str(),
                 file->parent, name.c_str(), flags) < 0)
         return Status(errno);
+#else
+    const unsigned flags = replace ? 0 : RENAME_EXCL;
+    if (renameatx_np(file->parent, file->name.c_str(),
+                     file->parent, name.c_str(), flags) < 0)
+        return Status(errno);
+#endif
     const std::string oldName = file->name;
     for (File* other : g_openFiles)
     {

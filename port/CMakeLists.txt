@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
+# macOS: os_sync_wait_on_address (host_posix_compat.h) needs 14.4. Set before project().
+# The x86-64 slice passes 13.0 (mac/build_game.sh); host_posix_compat.h then calls the ulock
+# functions those wrappers use.
+if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Darwin" AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.4" CACHE STRING "Minimum macOS version")
+endif()
 project(tekken_recomp C CXX)
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/ShaderBuildId.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/KernelStubs.cmake")
@@ -316,6 +322,219 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_include_directories(community_net_test PRIVATE src/runtime/kernel)
     target_compile_options(community_net_test PRIVATE -O2 -Wall -Wextra)
     target_link_libraries(community_net_test PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+    return()
+endif()
+
+# macOS arm64 and x86-64, one architecture per build tree. The Android ARM64 target is the
+# model for the arm64 pieces, the Linux one for the desktop and x86-64 pieces.
+# Build: mac/build_game.sh (ARCH=x86_64 for the Intel slice).
+if(APPLE)
+    get_filename_component(TTT2_MAC_DIR "${CMAKE_SOURCE_DIR}/../mac" ABSOLUTE)
+    if(CMAKE_OSX_ARCHITECTURES)
+        set(_ttt2_mac_arch "${CMAKE_OSX_ARCHITECTURES}")
+    else()
+        set(_ttt2_mac_arch "${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
+    if(NOT _ttt2_mac_arch MATCHES "^(arm64|x86_64)$")
+        message(FATAL_ERROR "macOS builds one architecture per tree (arm64 or x86_64), not '${_ttt2_mac_arch}'")
+    endif()
+    # Every library comes from mac/build_libs.sh, build_vkd3d.sh and build_dxvk.sh for this ARCH in
+    # mac/deps/install-<arch>, built for this slice's deployment target. Never a Homebrew one: its
+    # bottles target the macOS they were built on, and on Apple Silicon they are arm64 only.
+    set(_ttt2_mac_install "${TTT2_MAC_DIR}/deps/install-${_ttt2_mac_arch}")
+    set(_ttt2_mac_ffmpeg_build "${TTT2_MAC_DIR}/deps/ffmpeg-build-mac-${_ttt2_mac_arch}")
+    if(_ttt2_mac_arch STREQUAL "arm64")
+        set(_ttt2_mac_out "${TTT2_MAC_DIR}/out/ppc")
+    else()
+        set(_ttt2_mac_out "${TTT2_MAC_DIR}/out/ppc-${_ttt2_mac_arch}")
+    endif()
+    list(PREPEND CMAKE_PREFIX_PATH "${_ttt2_mac_install}/sdl3")
+    if(NOT OPENSSL_ROOT_DIR)
+        set(OPENSSL_ROOT_DIR "${_ttt2_mac_install}/openssl")
+    endif()
+    set(CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH OFF)
+    find_package(SDL3 3.4.0 REQUIRED CONFIG)
+    find_package(OpenSSL 3.0 REQUIRED)
+    find_package(Threads REQUIRED)
+
+    set(TTT2_RENDERER_PPC_DIR "${CMAKE_SOURCE_DIR}/../re/ppc" CACHE PATH "Generated PPC headers")
+    set(TTT2_RENDERER_XENON_UTILS "${CMAKE_SOURCE_DIR}/../tools/XenonRecomp/XenonUtils" CACHE PATH "XenonUtils headers")
+    set(TTT2_RENDERER_SIMDE_DIR "${CMAKE_SOURCE_DIR}/../tools/XenonRecomp/thirdparty/simde" CACHE PATH "SIMDe headers")
+    set(TTT2_MAC_PPC_ARCHIVE "${_ttt2_mac_out}/libttt2_mac_ppc.a" CACHE FILEPATH
+        "PPC archive for this architecture (mac/build_ppc.sh)")
+    set(TTT2_MAC_PPC_HEADERS "${_ttt2_mac_out}/headers" CACHE PATH
+        "arm64 header overlay for the generated PPC code (ppc_arm64_compat.h); unused on x86-64")
+    set(TTT2_DXVK_NATIVE_ROOT "${_ttt2_mac_install}/dxvk" CACHE PATH "DXVK Native prefix")
+    set(TTT2_VKD3D_ROOT "${_ttt2_mac_install}/vkd3d" CACHE PATH "vkd3d-shader prefix")
+    set(FFMPEG_SRC "${TTT2_MAC_DIR}/deps/FFmpeg-n7.1" CACHE PATH "FFmpeg n7.1 source")
+    set(FFMPEG_BUILD "${_ttt2_mac_ffmpeg_build}" CACHE PATH "Configured FFmpeg build")
+    set(_ttt2_rt "${CMAKE_SOURCE_DIR}/src/runtime")
+    add_compile_options(
+        "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=port"
+        "-ffile-prefix-map=${CMAKE_BINARY_DIR}=build"
+        "-ffile-prefix-map=${FFMPEG_SRC}=ffmpeg"
+        "-ffile-prefix-map=${FFMPEG_BUILD}=ffmpeg-build")
+
+    # Headless test of the 16 KiB-page VM backend (no game, no window).
+    add_executable(ttt2_host_vm_test "${TTT2_MAC_DIR}/tests/host_vm_test.cpp"
+        "${_ttt2_rt}/host_vm_mac.cpp" "${_ttt2_rt}/host_fault_mac.cpp")
+    target_include_directories(ttt2_host_vm_test PRIVATE "${_ttt2_rt}")
+    target_compile_options(ttt2_host_vm_test PRIVATE -O2 -Wall -Wextra)
+    target_link_libraries(ttt2_host_vm_test PRIVATE Threads::Threads)
+
+    add_executable(community_net_test
+        tools/community_net_test.cpp src/runtime/kernel/community_net.cpp
+        src/runtime/kernel/server_list.cpp src/runtime/kernel/community_tls.cpp)
+    target_include_directories(community_net_test PRIVATE src/runtime/kernel)
+    target_compile_options(community_net_test PRIVATE -O2)
+    target_link_libraries(community_net_test PRIVATE OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+    set_target_properties(community_net_test PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+    if(NOT EXISTS "${TTT2_RENDERER_PPC_DIR}/ppc_config.h")
+        message(WARNING "Generated PPC headers missing (${TTT2_RENDERER_PPC_DIR}); only tests are built")
+        return()
+    endif()
+    # Before mac/build_ppc.sh has run, compile against an overlay made here so the
+    # runtime can be checked without the archive.
+    if(_ttt2_mac_arch STREQUAL "arm64" AND NOT EXISTS "${TTT2_MAC_PPC_HEADERS}/ppc_arm64_compat.h")
+        message(WARNING "No PPC overlay at ${TTT2_MAC_PPC_HEADERS}; run mac/build_ppc.sh")
+    endif()
+
+    find_path(TTT2_DXVK_NATIVE_INCLUDE d3d11.h
+        HINTS "${TTT2_DXVK_NATIVE_ROOT}/include/dxvk/directx" NO_DEFAULT_PATH)
+    find_library(TTT2_DXVK_NATIVE_D3D11 dxvk_d3d11 HINTS "${TTT2_DXVK_NATIVE_ROOT}/lib" NO_DEFAULT_PATH)
+    find_library(TTT2_DXVK_NATIVE_DXGI dxvk_dxgi HINTS "${TTT2_DXVK_NATIVE_ROOT}/lib" NO_DEFAULT_PATH)
+    find_path(TTT2_VKD3D_INCLUDE vkd3d_shader.h HINTS "${TTT2_VKD3D_ROOT}/include/vkd3d" NO_DEFAULT_PATH)
+    find_library(TTT2_VKD3D_SHADER vkd3d-shader HINTS "${TTT2_VKD3D_ROOT}/lib" NO_DEFAULT_PATH)
+    if(NOT TTT2_DXVK_NATIVE_INCLUDE OR NOT TTT2_DXVK_NATIVE_D3D11 OR NOT TTT2_DXVK_NATIVE_DXGI
+       OR NOT TTT2_VKD3D_INCLUDE OR NOT TTT2_VKD3D_SHADER)
+        message(FATAL_ERROR "macOS game needs DXVK Native and vkd3d-shader (mac/build_dxvk.sh, mac/build_vkd3d.sh)")
+    endif()
+    get_filename_component(_ttt2_dxvk_inc "${TTT2_DXVK_NATIVE_INCLUDE}/.." ABSOLUTE)
+    add_subdirectory(third_party/ffmpeg_xma)
+
+    ttt2_generate_kernel_stubs(TTT2_MAC_KERNEL_STUBS "${TTT2_RENDERER_PPC_DIR}" "${_ttt2_rt}")
+    # Steam online: on when the Steamworks SDK sits in tools/steamworks_sdk_165 (user-supplied,
+    # not in the repository). The POSIX helper-process bridge (steam_bridge_linux.cpp) links the
+    # SDK's universal macOS libsteam_api.dylib; mac/make_app.sh bundles it.
+    set(TTT2_MAC_STEAMWORKS "${CMAKE_SOURCE_DIR}/../tools/steamworks_sdk_165/sdk" CACHE PATH
+        "Steamworks SDK sdk directory")
+    set(_ttt2_mac_steam_api "${TTT2_MAC_STEAMWORKS}/redistributable_bin/osx/libsteam_api.dylib")
+    if(EXISTS "${TTT2_MAC_STEAMWORKS}/public/steam/steam_api.h" AND EXISTS "${_ttt2_mac_steam_api}")
+        set(_ttt2_mac_default_steam ON)
+    else()
+        set(_ttt2_mac_default_steam OFF)
+    endif()
+    option(TTT2_MAC_STEAM "Steam matchmaking and P2P transport" ${_ttt2_mac_default_steam})
+    set(_ttt2_mac_have_steam 0)
+    if(TTT2_MAC_STEAM)
+        if(NOT _ttt2_mac_default_steam)
+            message(FATAL_ERROR "TTT2_MAC_STEAM needs the Steamworks SDK in ${TTT2_MAC_STEAMWORKS}")
+        endif()
+        set(_ttt2_mac_have_steam 1)
+    endif()
+    message(STATUS "Steam online: ${TTT2_MAC_STEAM}")
+
+    file(GLOB TTT2_KERNEL_MAC CONFIGURE_DEPENDS "${_ttt2_rt}/kernel/*.cpp")
+    # data_watch: Windows debug registers. diag_hooks.cpp comes in through
+    # diag_hooks_linux.cpp. Without Steam, the Linux stub replaces the bridge.
+    foreach(_excluded data_watch.cpp diag_hooks.cpp steam_bridge.cpp host_settings_windows.cpp)
+        list(REMOVE_ITEM TTT2_KERNEL_MAC "${_ttt2_rt}/kernel/${_excluded}")
+    endforeach()
+    if(TTT2_MAC_STEAM)
+        list(REMOVE_ITEM TTT2_KERNEL_MAC "${_ttt2_rt}/kernel/steam_bridge_linux_stub.cpp")
+    else()
+        list(REMOVE_ITEM TTT2_KERNEL_MAC "${_ttt2_rt}/kernel/steam_bridge_linux.cpp")
+    endif()
+    # Every runtime source compiled once; the game executable and the
+    # compile-only check (ttt2_mac_runtime) share these objects.
+    add_library(ttt2_mac_runtime OBJECT
+        "${_ttt2_rt}/main.cpp" "${_ttt2_rt}/apple_game_entry.cpp"
+        "${_ttt2_rt}/runtime_math.cpp" "${_ttt2_rt}/guest_time.cpp"
+        "${_ttt2_rt}/skin_profile.cpp" "${_ttt2_rt}/audio_output.cpp"
+        "${_ttt2_rt}/host_window_sdl.cpp" "${_ttt2_rt}/host_input_sdl.cpp"
+        "${_ttt2_rt}/host_thread_sdl.cpp" "${_ttt2_rt}/host_sleep.cpp"
+        "${_ttt2_rt}/host_status.cpp" "${_ttt2_rt}/host_process.cpp"
+        "${_ttt2_rt}/host_vm_mac.cpp" "${_ttt2_rt}/host_fault_mac.cpp"
+        "${_ttt2_rt}/host_runtime_mac.cpp" "${_ttt2_rt}/host_file_common.cpp"
+        "${_ttt2_rt}/host_file_linux.cpp" "${_ttt2_rt}/host_storage_linux.cpp"
+        "${_ttt2_rt}/host_udp_linux.cpp" "${_ttt2_rt}/host_random_linux.cpp"
+        "${_ttt2_rt}/phys_mirror_linux.cpp" "${_ttt2_rt}/native_d3dcompiler.cpp"
+        "${TTT2_MAC_KERNEL_STUBS}"
+        ${TTT2_KERNEL_MAC})
+    ttt2_shader_build_id(ttt2_mac_runtime "${_ttt2_rt}")
+    # arm64: the overlay precedes re/ppc (its ppc_context_arm64.h replaces the x86 one);
+    # port/android/include supplies simde-backed <emmintrin.h>/<immintrin.h>.
+    # x86-64 reads re/ppc as it is, as on Windows and Linux.
+    if(_ttt2_mac_arch STREQUAL "arm64")
+        target_include_directories(ttt2_mac_runtime PRIVATE "${TTT2_MAC_PPC_HEADERS}")
+    endif()
+    target_include_directories(ttt2_mac_runtime PRIVATE
+        "${TTT2_RENDERER_PPC_DIR}"
+        "${TTT2_RENDERER_XENON_UTILS}" "${TTT2_RENDERER_SIMDE_DIR}"
+        "${_ttt2_dxvk_inc}" "${_ttt2_dxvk_inc}/directx" "${_ttt2_dxvk_inc}/windows"
+        "${CMAKE_SOURCE_DIR}/native/include" "${TTT2_VKD3D_INCLUDE}"
+        "${_ttt2_rt}" "${_ttt2_rt}/kernel")
+    if(_ttt2_mac_arch STREQUAL "arm64")
+        target_include_directories(ttt2_mac_runtime BEFORE PRIVATE "${CMAKE_SOURCE_DIR}/android/include")
+        target_compile_options(ttt2_mac_runtime PRIVATE
+            "SHELL:-include ${TTT2_MAC_PPC_HEADERS}/ppc_arm64_compat.h")
+    else()
+        # The CPU level of the generated code (mac/build_ppc.sh), which Rosetta also runs;
+        # skin_profile.cpp needs SSSE3 as on Linux.
+        target_compile_options(ttt2_mac_runtime PRIVATE -march=x86-64-v2)
+    endif()
+    target_compile_definitions(ttt2_mac_runtime PRIVATE
+        TTT2_HOST_GAME_UI=1 TTT2_LOCAL_SAVES=1 TTT2_HAVE_STEAM=${_ttt2_mac_have_steam}
+        TTT2_GPU_HW_BACKEND=1 TTT2_GPU_HW_D3D11=1 TTT2_D3D11_MOVIE_BACKEND=1)
+    if(TTT2_MAC_STEAM)
+        target_include_directories(ttt2_mac_runtime PRIVATE "${TTT2_MAC_STEAMWORKS}/public")
+    endif()
+    # -ffp-contract=off on the whole runtime, not only skin_profile and the audio
+    # files as on Linux: x86-64-v2 has no FMA, so nothing fuses there, while
+    # arm64 clang fuses a*b+c by default. CPU: Apple clang's arm64-apple-macos
+    # default is apple-m1 (ARMv8.5-A with crypto/fp16/dotprod), which every
+    # Apple Silicon Mac meets; no -march is added on arm64.
+    target_compile_options(ttt2_mac_runtime PRIVATE -O2 -ffp-contract=off -Wno-everything)
+    set_source_files_properties("${_ttt2_rt}/main.cpp" PROPERTIES
+        COMPILE_DEFINITIONS "main=ttt2_game_main")
+    target_link_libraries(ttt2_mac_runtime PRIVATE SDL3::SDL3 OpenSSL::SSL OpenSSL::Crypto ttt2_ffmpeg)
+
+    if(NOT EXISTS "${TTT2_MAC_PPC_ARCHIVE}")
+        message(WARNING "No PPC archive at ${TTT2_MAC_PPC_ARCHIVE}: only ttt2_mac_runtime builds")
+        return()
+    endif()
+    add_library(ttt2_mac_ppc STATIC IMPORTED GLOBAL)
+    set_target_properties(ttt2_mac_ppc PROPERTIES IMPORTED_LOCATION "${TTT2_MAC_PPC_ARCHIVE}")
+    # First launch without game data: the import window (the counterpart of ttt2_setup.exe) over the
+    # Android importer's ISO/TU3 readers and checks.
+    enable_language(OBJCXX)
+    set(TTT2_GAME_SOURCE "${CMAKE_SOURCE_DIR}/.." CACHE PATH "Checkout with tools/XenonRecomp")
+    add_subdirectory(android/setup android_setup EXCLUDE_FROM_ALL)
+    add_executable(tekken_recomp_mac $<TARGET_OBJECTS:ttt2_mac_runtime> "${_ttt2_rt}/apple_import.mm")
+    set_source_files_properties("${_ttt2_rt}/apple_import.mm" PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-O2")
+    target_link_libraries(tekken_recomp_mac PRIVATE ttt2_setup_core "-framework AppKit")
+    # The runtime's overrides (strong sub_X) beat the archive's PPC_WEAK_FUNC
+    # wrappers: XenonRecomp emits wrappers, not aliases, on Apple.
+    target_link_libraries(tekken_recomp_mac PRIVATE ttt2_mac_ppc ttt2_ffmpeg SDL3::SDL3
+        "${TTT2_DXVK_NATIVE_D3D11}" "${TTT2_DXVK_NATIVE_DXGI}" "${TTT2_VKD3D_SHADER}"
+        OpenSSL::SSL OpenSSL::Crypto Threads::Threads)
+    if(TTT2_MAC_STEAM)
+        target_link_libraries(tekken_recomp_mac PRIVATE "${_ttt2_mac_steam_api}")
+        # Valve's install name is @loader_path/libsteam_api.dylib: keep a copy beside the
+        # executable for runs from the build tree.
+        add_custom_command(TARGET tekken_recomp_mac POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_ttt2_mac_steam_api}"
+                    "$<TARGET_FILE_DIR:tekken_recomp_mac>/libsteam_api.dylib")
+    endif()
+    get_filename_component(_ttt2_dxvk_lib "${TTT2_DXVK_NATIVE_D3D11}" DIRECTORY)
+    get_filename_component(_ttt2_vkd3d_lib "${TTT2_VKD3D_SHADER}" DIRECTORY)
+    # mac/make_app.sh copies the dylibs into Contents/Frameworks and keeps only the
+    # bundle rpath; the build tree also finds them in place.
+    set_target_properties(tekken_recomp_mac PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+        BUILD_RPATH "@executable_path/../Frameworks;${_ttt2_dxvk_lib};${_ttt2_vkd3d_lib}"
+        INSTALL_RPATH "@executable_path/../Frameworks")
     return()
 endif()
 

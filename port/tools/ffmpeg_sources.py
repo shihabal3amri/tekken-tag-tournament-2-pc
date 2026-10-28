@@ -16,9 +16,15 @@ for line in (build / "ffbuild" / "config.mak").read_text().splitlines():
 # configure command recorded in config.mak to reject an accidental Win64 or
 # other-host configuration before selecting platform-specific sources.
 configuration = cfg.get("FFMPEG_CONFIGURATION", "")
-for option in ("--target-os=linux", "--arch=x86_64"):
-    if not re.search(r"(?:^|\s)" + re.escape(option) + r"(?:\s|$)", configuration):
-        raise SystemExit(f"native FFmpeg configuration is missing {option}")
+# The native hosts: Linux x86-64, and macOS arm64 and x86-64 (mac/build_ffmpeg.sh, also --disable-asm).
+native_hosts = (("--target-os=linux", "--arch=x86_64"),
+                ("--target-os=darwin", "--arch=aarch64"),
+                ("--target-os=darwin", "--arch=x86_64"))
+def has_option(option):
+    return re.search(r"(?:^|\s)" + re.escape(option) + r"(?:\s|$)", configuration)
+if not any(all(has_option(o) for o in host) for host in native_hosts):
+    raise SystemExit("native FFmpeg configuration is not one of: " +
+                     ", ".join(" ".join(host) for host in native_hosts))
 
 make_subdirs = []
 for key in ("ARCH", "INTRINSICS"):

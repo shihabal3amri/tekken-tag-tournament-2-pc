@@ -9,12 +9,14 @@
 #include <cerrno>
 #include <csignal>
 #include <dlfcn.h>
-#include <linux/futex.h>
 #include <pthread.h>
-#include <sys/syscall.h>
-#include <sys/uio.h>
+#if defined(__APPLE__)
+#include <sys/ucontext.h>
+#else
 #include <ucontext.h>
+#endif
 #include <unistd.h>
+#include "host_posix_compat.h"
 #endif
 #include "host_thread.h"
 #include "host_vm.h"
@@ -486,7 +488,7 @@ struct Target
     HANDLE thread = nullptr;
 #else
     pthread_t thread{};
-    pid_t nativeTid = 0;
+    uint64_t nativeTid = 0;
     std::atomic<int> pending{0};
     Sample captured{};
 #endif
@@ -690,9 +692,7 @@ constexpr int SampleSignal = SIGURG;
 
 bool ReadSampleMemory(const void* address, void* output, size_t bytes)
 {
-    iovec local{output, bytes};
-    iovec remote{const_cast<void*>(address), bytes};
-    return syscall(SYS_process_vm_readv, getpid(), &local, 1ul, &remote, 1ul, 0ul) == ssize_t(bytes);
+    return host_posix::ReadOwnMemory(address, output, bytes);
 }
 
 void CaptureSample(int number, siginfo_t* info, void* rawContext)
@@ -716,7 +716,10 @@ void CaptureSample(int number, siginfo_t* info, void* rawContext)
     clock_gettime(CLOCK_MONOTONIC, &now);
     sample.at = int64_t(now.tv_sec) * 1000000000 + now.tv_nsec;
     auto* context = static_cast<ucontext_t*>(rawContext);
-#if defined(__x86_64__)
+#if defined(__APPLE__)
+    sample.host[sample.hostDepth++] = host_posix::ContextPc(context);
+    uintptr_t frame = host_posix::ContextFp(context);
+#elif defined(__x86_64__)
     sample.host[sample.hostDepth++] = context->uc_mcontext.gregs[REG_RIP];
     uintptr_t frame = context->uc_mcontext.gregs[REG_RBP];
 #elif defined(__aarch64__)
@@ -754,7 +757,7 @@ void CaptureSample(int number, siginfo_t* info, void* rawContext)
         }
     }
     target->pending.store(3, std::memory_order_release);
-    syscall(SYS_futex, &target->pending, FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+    host_posix::WakeOne(reinterpret_cast<int*>(&target->pending));
     errno = savedError;
 }
 }
@@ -770,19 +773,8 @@ void InitializeSampler(Target& target)
         if (sigaction(SampleSignal, &action, &g_previousSampler) != 0) std::abort();
     });
     target.thread = pthread_self();
-    target.nativeTid = pid_t(syscall(SYS_gettid));
-    pthread_attr_t attributes;
-    if (pthread_getattr_np(target.thread, &attributes) == 0)
-    {
-        void* base = nullptr;
-        size_t bytes = 0;
-        if (pthread_attr_getstack(&attributes, &base, &bytes) == 0)
-        {
-            target.stackLow = uintptr_t(base);
-            target.stackHigh = uintptr_t(base) + bytes;
-        }
-        pthread_attr_destroy(&attributes);
-    }
+    target.nativeTid = host_posix::ThreadId();
+    host_posix::CurrentStack(target.stackLow, target.stackHigh);
     t_sampleTarget = &target;
 }
 
@@ -794,7 +786,7 @@ bool Take(Target& target, Sample& sample)
     if (state == 3) target.pending.store(0, std::memory_order_release);
     int idle = 0;
     if (!target.pending.compare_exchange_strong(idle, 1, std::memory_order_acq_rel)) return false;
-    if (syscall(SYS_tgkill, getpid(), target.nativeTid, SampleSignal) != 0)
+    if (!host_posix::SignalThread(target.thread, target.nativeTid, SampleSignal))
     {
         target.pending.store(0, std::memory_order_release);
         return false;
@@ -810,8 +802,7 @@ bool Take(Target& target, Sample& sample)
             return false;
         }
         const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(left).count();
-        timespec timeout{time_t(ns / 1000000000), long(ns % 1000000000)};
-        syscall(SYS_futex, &target.pending, FUTEX_WAIT_PRIVATE, state, &timeout, nullptr, 0);
+        host_posix::WaitOnWord(reinterpret_cast<int*>(&target.pending), state, int64_t(ns));
     }
     sample = target.captured;
     target.pending.store(0, std::memory_order_release);
@@ -839,7 +830,8 @@ bool Waiting(uint64_t leaf)
 #else
     Dl_info info{};
     if (!dladdr(reinterpret_cast<void*>(leaf), &info) || !info.dli_sname) return false;
-    for (const char* name : { "futex", "pthread_cond", "pthread_mutex", "nanosleep", "sem_wait", "sched_yield" })
+    for (const char* name : { "futex", "pthread_cond", "pthread_mutex", "nanosleep", "sem_wait", "sched_yield",
+                              "__ulock_wait", "__psynch_", "os_sync_wait", "semaphore_wait", "mach_msg", "swtch_pri" })
         if (std::strstr(info.dli_sname, name)) return true;
     return false;
 #endif

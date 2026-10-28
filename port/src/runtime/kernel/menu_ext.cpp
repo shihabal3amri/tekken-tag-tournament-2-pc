@@ -556,7 +556,13 @@ void UpdateBox(PPCContext& ctx, uint8_t* base, const BoxState& b)
 std::string ClipboardText()
 {
     std::string out;
+#if defined(__APPLE__)
+    // NSPasteboard belongs to the main thread (apple_game_entry.cpp pumps SDL there).
+    char* text = nullptr;
+    SDL_RunOnMainThread([](void* out) { *static_cast<char**>(out) = SDL_GetClipboardText(); }, &text, true);
+#else
     char* text = SDL_GetClipboardText();
+#endif
     if (text)
     {
         for (size_t i = 0; text[i] && text[i] != '\r' && text[i] != '\n' && out.size() < 512; ++i)

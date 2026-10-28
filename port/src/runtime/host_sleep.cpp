@@ -6,7 +6,7 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__APPLE__)
 #include <cerrno>
 #include <time.h>
 #endif
@@ -39,6 +39,11 @@ void For100ns(int64_t ticks, bool highResolution)
     timespec remaining{static_cast<time_t>(ticks / 10000000),
                        static_cast<long>(ticks % 10000000) * 100};
     while (clock_nanosleep(CLOCK_MONOTONIC, 0, &remaining, &remaining) == EINTR) {}
+#elif defined(__APPLE__)
+    // macOS has no clock_nanosleep; nanosleep keeps nanosecond requests.
+    timespec remaining{static_cast<time_t>(ticks / 10000000),
+                       static_cast<long>(ticks % 10000000) * 100};
+    while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {}
 #else
     std::this_thread::sleep_for(std::chrono::microseconds(ticks / 10 + (ticks % 10 != 0)));
 #endif

@@ -53,3 +53,43 @@ port\build-o1\tekken_recomp.exe "<install folder>\game\tekken.img"
 The development exe is a console program and logs to stderr; redirect it to a file
 (`... > run.txt 2>&1`) for long runs. `TTT2_NET=loopback` keeps online play on this PC (two
 instances, no Steam).
+
+## macOS
+
+One universal app: native on Apple Silicon (arm64, macOS 14.4+) and on Intel Macs (x86_64, macOS 13+).
+`mac/README.md` explains what changed for the Mac.
+
+Requirements: Xcode command line tools, CMake, Ninja, Meson, Python 3.10+, Homebrew `bison` and
+`spirv-headers` (used while building only), your disc image and the Title Update 3 package.
+
+1. **Generate the C++** (steps 1-3 above in one script): `mac/gen_ppc.sh <disc.iso> <TU3 file>`. It
+   builds XenonRecomp, extracts and checks `Default.xex`, `Default.xexp` and the patched image with the
+   installer's own readers, then runs the recompiler, the fix-up scripts and the acceptance check.
+2. **Libraries**, built from source for each CPU and its minimum macOS (arm64 is the default `ARCH`):
+
+   ```
+   mac/build_libs.sh && mac/build_vkd3d.sh && mac/build_dxvk.sh && mac/build_ffmpeg.sh && mac/build_ppc.sh
+   ARCH=x86_64 mac/build_libs.sh   # and the same four with ARCH=x86_64
+   ```
+
+   `build_libs.sh` builds SDL3, OpenSSL and the Vulkan loader and fetches MoltenVK's universal release;
+   `build_dxvk.sh` applies the repo's DXVK patches plus `mac/patches`. Everything goes to
+   `mac/deps/install-<arch>`; no Homebrew library is linked.
+3. **Steamworks SDK** 1.65 in `tools/steamworks_sdk_165/sdk` (optional, as on Windows).
+4. **Build**: `mac/build_game.sh` and `ARCH=x86_64 mac/build_game.sh`.
+5. **App**:
+
+   ```
+   mac/make_app.sh --binary mac/build/game/tekken_recomp_mac \
+       --binary-x86 mac/build/game-x86_64/tekken_recomp_mac --release [--notarize <profile>]
+   ```
+
+   gives `mac/out/Tekken Tag Tournament 2.app` and `mac/out/TTT2-macOS-<version>.zip`, signed with your
+   Developer ID. It has no game data: on first launch it asks for the disc image and Title Update 3
+   (`port/src/runtime/apple_import.mm`).
+
+To run a build against game data you already have:
+
+```
+TTT2_VFS_ROOT=<game>/game_files_x mac/build/game/tekken_recomp_mac <game>/tekken.img
+```

@@ -56,7 +56,7 @@
 #include <unistd.h>
 #endif
 #include <d3dcompiler.h>
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include "dxvk_native_com_ptr.h"
 #include <wsi/native_sdl3.h>
 #else
@@ -104,7 +104,7 @@ using Microsoft::WRL::ComPtr;
 
 inline void HostClientRect(HWND window, RECT* rect)
 {
-#if defined(__linux__)
+#if !defined(_WIN32)
     int width = 0, height = 0;
     SDL_GetWindowSizeInPixels(dxvk::wsi::fromHwnd(window), &width, &height);
     *rect = RECT{0, 0, width, height};
@@ -115,7 +115,7 @@ inline void HostClientRect(HWND window, RECT* rect)
 
 inline bool HostWindowFocused(HWND window)
 {
-#if defined(__linux__)
+#if !defined(_WIN32)
     return (SDL_GetWindowFlags(dxvk::wsi::fromHwnd(window)) & SDL_WINDOW_INPUT_FOCUS) != 0;
 #else
     return GetForegroundWindow() == window;
@@ -124,7 +124,7 @@ inline bool HostWindowFocused(HWND window)
 
 inline void HostYield()
 {
-#if defined(__linux__)
+#if !defined(_WIN32)
     std::this_thread::yield();
 #else
     YieldProcessor();
@@ -135,21 +135,21 @@ inline void HostBackgroundPriority()
 {
 #if defined(__ANDROID__)
     setpriority(PRIO_PROCESS, 0, 10);
-#elif !defined(__linux__)
+#elif defined(_WIN32)
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 #endif
 }
 
 inline unsigned long long HostThreadTag()
 {
-#if defined(__linux__)
+#if !defined(_WIN32)
     return std::hash<std::thread::id>{}(std::this_thread::get_id());
 #else
     return GetCurrentThreadId();
 #endif
 }
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 inline bool HostWaitFence(ID3D11Fence* fence, uint64_t value, std::chrono::milliseconds timeout)
 {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -1054,7 +1054,7 @@ public:
         ComPtr<ID3D11Fence> fence = value ? readbackFence_ : nullptr;
         if (!fence) return {};
         return [fence, value] {
-#if defined(__linux__)
+#if !defined(_WIN32)
             return HostWaitFence(fence.Get(), value, std::chrono::milliseconds(100));
 #else
             static thread_local HANDLE copied = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -1436,7 +1436,7 @@ private:
     }
     static uint32_t DisplayHz(HWND w)
     {
-#if defined(__linux__)
+#if !defined(_WIN32)
         const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(dxvk::wsi::fromHwnd(w)));
         return mode && mode->refresh_rate > 0 ? uint32_t(std::lround(mode->refresh_rate)) : 0;
 #else
@@ -2442,7 +2442,7 @@ private:
         std::call_once(started, [this] {
             std::fprintf(stderr, "[gpu-probe] enabled: present and staged-copy queue-to-fence latency\n");
             std::thread([this] {
-#if !defined(__linux__)
+#if defined(_WIN32)
                 HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 #endif
                 struct Summary
@@ -2463,7 +2463,7 @@ private:
                         probeMarks_.pop_front();
                     }
                     const size_t kind = m.label[0] == 'p' ? 0 : 1;
-#if defined(__linux__)
+#if !defined(_WIN32)
                     const bool passed = HostWaitFence(readbackFence_.Get(), m.value, std::chrono::milliseconds(2000));
 #else
                     const bool passed = SUCCEEDED(readbackFence_->SetEventOnCompletion(m.value, done)) &&
@@ -2801,7 +2801,12 @@ private:
     static std::filesystem::path ShaderCacheDirectory()
     {
         std::filesystem::path p;
-#if defined(__linux__)
+#if defined(__APPLE__)
+        // macOS: ~/Library/Caches/TTT2Recomp/shadercache (the system may clear it; it is rebuilt).
+        if (const char* override = std::getenv("TTT2_SHADER_CACHE")) p = override;
+        else if (const char* home = std::getenv("HOME")) p = std::filesystem::path(home) / "Library" / "Caches" / "TTT2Recomp" / "shadercache";
+        else return {};
+#elif !defined(_WIN32)
         if (const char* override = std::getenv("TTT2_SHADER_CACHE")) p = override;
         else if (const char* cache = std::getenv("XDG_CACHE_HOME")) p = std::filesystem::path(cache) / "TTT2Recomp" / "shadercache";
         else if (const char* home = std::getenv("HOME")) p = std::filesystem::path(home) / ".cache" / "TTT2Recomp" / "shadercache";

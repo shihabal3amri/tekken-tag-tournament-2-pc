@@ -110,12 +110,12 @@ inline bool Guarded(const char* what, F&& f)
         if (timing) RecordStage(stage, start, locked);
         g_failed.store(true, std::memory_order_relaxed);
         ReportBackendFailure(what, e);
-#if defined(__linux__)
+#if !defined(_WIN32)
         // A failed DXVK Native device makes the software renderer unusably slow.
         // Keep explicit TTT2_GPU_HW=0 software runs available for diagnostics.
         if (RequestedMode() != Mode::Off)
         {
-            std::fprintf(stderr, "[gpu-hw] Linux hardware renderer unavailable; exiting instead of falling back to CPU rendering.\n");
+            std::fprintf(stderr, "[gpu-hw] DXVK Native hardware renderer unavailable; exiting instead of falling back to CPU rendering.\n");
             std::exit(EXIT_FAILURE);
         }
 #endif

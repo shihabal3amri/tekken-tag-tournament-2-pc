@@ -1,0 +1,285 @@
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 90a26b0d..bf3c2d2f 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -1922,7 +1922,7 @@ namespace dxvk {
+     DxvkDeviceFeatures supported = adapter->features();
+     DxvkDeviceFeatures enabled   = {};
+ 
+-    enabled.core.features.geometryShader                          = VK_TRUE;
++    enabled.core.features.geometryShader                          = supported.core.features.geometryShader;
+     enabled.core.features.robustBufferAccess                      = VK_TRUE;
+     enabled.core.features.shaderStorageImageWriteWithoutFormat    = VK_TRUE;
+     enabled.core.features.depthBounds                             = supported.core.features.depthBounds;
+@@ -1953,7 +1953,7 @@ namespace dxvk {
+       enabled.core.features.sampleRateShading                     = VK_TRUE;
+       enabled.core.features.samplerAnisotropy                     = supported.core.features.samplerAnisotropy;
+       enabled.core.features.shaderClipDistance                    = VK_TRUE;
+-      enabled.core.features.shaderCullDistance                    = VK_TRUE;
++      enabled.core.features.shaderCullDistance                    = supported.core.features.shaderCullDistance;
+       enabled.core.features.textureCompressionBC                  = VK_TRUE;
+       enabled.extDepthClipEnable.depthClipEnable                  = supported.extDepthClipEnable.depthClipEnable;
+       enabled.extHostQueryReset.hostQueryReset                    = supported.extHostQueryReset.hostQueryReset;
+@@ -1973,8 +1973,8 @@ namespace dxvk {
+       enabled.core.features.logicOp                               = supported.core.features.logicOp;
+       enabled.core.features.shaderImageGatherExtended             = VK_TRUE;
+       enabled.core.features.variableMultisampleRate               = supported.core.features.variableMultisampleRate;
+-      enabled.extTransformFeedback.transformFeedback              = VK_TRUE;
+-      enabled.extTransformFeedback.geometryStreams                = VK_TRUE;
++      enabled.extTransformFeedback.transformFeedback              = supported.extTransformFeedback.transformFeedback;
++      enabled.extTransformFeedback.geometryStreams                = supported.extTransformFeedback.geometryStreams;
+     }
+     
+     if (featureLevel >= D3D_FEATURE_LEVEL_10_1) {
+@@ -1989,7 +1989,7 @@ namespace dxvk {
+       enabled.core.features.shaderFloat64                         = supported.core.features.shaderFloat64;
+       enabled.core.features.shaderInt64                           = supported.core.features.shaderInt64;
+       enabled.core.features.shaderStorageImageReadWithoutFormat   = supported.core.features.shaderStorageImageReadWithoutFormat;
+-      enabled.core.features.tessellationShader                    = VK_TRUE;
++      enabled.core.features.tessellationShader                    = supported.core.features.tessellationShader;
+     }
+     
+     if (featureLevel >= D3D_FEATURE_LEVEL_11_1) {
+diff --git a/src/dxvk/dxvk_adapter.cpp b/src/dxvk/dxvk_adapter.cpp
+index 9db50ae4..a25ddf6b 100644
+--- a/src/dxvk/dxvk_adapter.cpp
++++ b/src/dxvk/dxvk_adapter.cpp
+@@ -263,7 +263,7 @@ namespace dxvk {
+           DxvkDeviceFeatures  enabledFeatures) {
+     DxvkDeviceExtensions devExtensions;
+ 
+-    std::array<DxvkExt*, 28> devExtensionList = {{
++    std::array<DxvkExt*, 29> devExtensionList = {{
+       &devExtensions.amdMemoryOverallocationBehaviour,
+       &devExtensions.amdShaderFragmentMask,
+       &devExtensions.ext4444Formats,
+@@ -287,6 +287,7 @@ namespace dxvk {
+       &devExtensions.khrDrawIndirectCount,
+       &devExtensions.khrDriverProperties,
+       &devExtensions.khrImageFormatList,
++      &devExtensions.khrPortabilitySubset,
+       &devExtensions.khrSamplerMirrorClampToEdge,
+       &devExtensions.khrShaderFloatControls,
+       &devExtensions.khrSwapchain,
+diff --git a/src/dxvk/dxvk_extensions.h b/src/dxvk/dxvk_extensions.h
+index 33c72a42..6aa55265 100644
+--- a/src/dxvk/dxvk_extensions.h
++++ b/src/dxvk/dxvk_extensions.h
+@@ -299,6 +299,7 @@ namespace dxvk {
+     DxvkExt khrDrawIndirectCount              = { VK_KHR_DRAW_INDIRECT_COUNT_EXTENSION_NAME,                DxvkExtMode::Optional };
+     DxvkExt khrDriverProperties               = { VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME,                  DxvkExtMode::Optional };
+     DxvkExt khrImageFormatList                = { VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,                  DxvkExtMode::Required };
++    DxvkExt khrPortabilitySubset              = { "VK_KHR_portability_subset",                              DxvkExtMode::Optional };
+     DxvkExt khrSamplerMirrorClampToEdge       = { VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME,       DxvkExtMode::Optional };
+     DxvkExt khrShaderFloatControls            = { VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,              DxvkExtMode::Optional };
+     DxvkExt khrSwapchain                      = { VK_KHR_SWAPCHAIN_EXTENSION_NAME,                          DxvkExtMode::Required };
+@@ -315,6 +316,7 @@ namespace dxvk {
+   struct DxvkInstanceExtensions {
+     DxvkExt extDebugUtils                   = { VK_EXT_DEBUG_UTILS_EXTENSION_NAME,                      DxvkExtMode::Optional };
+     DxvkExt khrGetSurfaceCapabilities2      = { VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME,       DxvkExtMode::Optional };
++    DxvkExt khrPortabilityEnumeration       = { "VK_KHR_portability_enumeration",                       DxvkExtMode::Optional };
+     DxvkExt khrSurface                      = { VK_KHR_SURFACE_EXTENSION_NAME,                          DxvkExtMode::Required };
+   };
+   
+diff --git a/src/dxvk/dxvk_instance.cpp b/src/dxvk/dxvk_instance.cpp
+index 3d18a1cd..9be64bcb 100644
+--- a/src/dxvk/dxvk_instance.cpp
++++ b/src/dxvk/dxvk_instance.cpp
+@@ -95,6 +95,7 @@ namespace dxvk {
+ 
+     std::vector<DxvkExt*> insExtensionList = {{
+       &insExtensions.khrGetSurfaceCapabilities2,
++      &insExtensions.khrPortabilityEnumeration,
+       &insExtensions.khrSurface,
+     }};
+ 
+@@ -138,7 +139,9 @@ namespace dxvk {
+     VkInstanceCreateInfo info;
+     info.sType                    = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+     info.pNext                    = nullptr;
+-    info.flags                    = 0;
++    // The Vulkan loader hides portability drivers (MoltenVK) unless the instance
++    // asks for them: VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR = 0x1.
++    info.flags                    = m_extensions.khrPortabilityEnumeration ? 0x00000001 : 0;
+     info.pApplicationInfo         = &appInfo;
+     info.enabledLayerCount        = 0;
+     info.ppEnabledLayerNames      = nullptr;
+diff --git a/src/dxvk/platform/dxvk_sdl3_exts.cpp b/src/dxvk/platform/dxvk_sdl3_exts.cpp
+index adaeaecc..0132bdb4 100644
+--- a/src/dxvk/platform/dxvk_sdl3_exts.cpp
++++ b/src/dxvk/platform/dxvk_sdl3_exts.cpp
+@@ -13,6 +13,22 @@ namespace dxvk {
+ 
+ 
+   DxvkNameSet DxvkPlatformExts::getInstanceExtensions() {
++#if defined(__APPLE__)
++    // macOS: no dummy window. Cocoa windows may only be made on the main thread,
++    // and the device is often created elsewhere. SDL's Cocoa backend returns a
++    // fixed list (VK_KHR_surface + VK_EXT_metal_surface) that needs no window;
++    // without SDL video (an offscreen device) the same two names are used.
++    DxvkNameSet appleNames;
++    if (SDL_WasInit(SDL_INIT_VIDEO)) {
++      uint32_t extensionCount = 0;
++      const char* const* extensionNames = SDL_Vulkan_GetInstanceExtensions(&extensionCount);
++      for (uint32_t i = 0; extensionNames && i < extensionCount; i++)
++        appleNames.add(extensionNames[i]);
++    }
++    appleNames.add("VK_KHR_surface");
++    appleNames.add("VK_EXT_metal_surface");
++    return appleNames;
++#endif
+ #if !defined(__ANDROID__)
+     // Desktop SDL may not have loaded Vulkan yet. Android already owns its
+     // native window and cannot create a second hidden window here.
+diff --git a/src/util/meson.build b/src/util/meson.build
+index e414107b..1ee54abd 100644
+--- a/src/util/meson.build
++++ b/src/util/meson.build
+@@ -35,7 +35,7 @@ util_src_linux = [
+ 
+ if dxvk_platform == 'windows'
+   util_src += util_src_win32
+-elif dxvk_platform == 'linux' or dxvk_platform == 'android'
++elif dxvk_platform == 'linux' or dxvk_platform == 'android' or dxvk_platform == 'darwin'
+   util_src += util_src_linux
+ else
+   error('Unknown platform for util')
+diff --git a/src/util/platform/util_env_linux.cpp b/src/util/platform/util_env_linux.cpp
+index fe053409..1aef0a3d 100644
+--- a/src/util/platform/util_env_linux.cpp
++++ b/src/util/platform/util_env_linux.cpp
+@@ -4,15 +4,27 @@
+ #include <filesystem>
+ #include <unistd.h>
+ #include <limits.h>
++#ifdef __APPLE__
++#include <mach-o/dyld.h>
++#endif
+ 
+ namespace dxvk::env {
+ 
+   std::string getExePath() {
+     std::array<char, PATH_MAX> exePath = {};
+ 
+-    size_t count = readlink("/proc/self/exe", exePath.data(), exePath.size());
++#ifdef __APPLE__
++    uint32_t size = exePath.size();
++    if (_NSGetExecutablePath(exePath.data(), &size) != 0)
++      return std::string();
++    return std::string(exePath.data());
++#else
++    ssize_t count = readlink("/proc/self/exe", exePath.data(), exePath.size());
++    if (count <= 0)
++      return std::string();
+ 
+     return std::string(exePath.begin(), exePath.begin() + count);
++#endif
+   }
+   
+   
+diff --git a/src/wsi/sdl3/wsi_presenter_sdl2.cpp b/src/wsi/sdl3/wsi_presenter_sdl2.cpp
+index 7a74522b..78f908b6 100644
+--- a/src/wsi/sdl3/wsi_presenter_sdl2.cpp
++++ b/src/wsi/sdl3/wsi_presenter_sdl2.cpp
+@@ -13,9 +13,30 @@ namespace dxvk::wsi {
+           VkSurfaceKHR*       pSurface) {
+     SDL_Window* window = fromHwnd(hWindow);
+ 
++#if defined(__APPLE__)
++    // SDL's Cocoa backend makes an NSView (Cocoa_Metal_CreateView: addSubview) without
++    // hopping to the main thread itself; AppKit views may only be touched there.
++    // SDL_RunOnMainThread runs inline when this already is the main thread.
++    struct Request {
++      SDL_Window*   window;
++      VkInstance    instance;
++      VkSurfaceKHR* surface;
++      bool          ok;
++    } request = { window, vki->instance(), pSurface, false };
++
++    bool dispatched = SDL_RunOnMainThread([] (void* userdata) {
++      auto* r = static_cast<Request*>(userdata);
++      r->ok = SDL_Vulkan_CreateSurface(r->window, r->instance, nullptr, r->surface);
++    }, &request, true);
++
++    return dispatched && request.ok
++         ? VK_SUCCESS
++         : VK_ERROR_OUT_OF_HOST_MEMORY;
++#else
+     return SDL_Vulkan_CreateSurface(window, vki->instance(), nullptr, pSurface)
+          ? VK_SUCCESS
+          : VK_ERROR_OUT_OF_HOST_MEMORY;
++#endif
+   }
+ 
+ }
+diff --git a/src/wsi/sdl3/wsi_window_sdl2.cpp b/src/wsi/sdl3/wsi_window_sdl2.cpp
+index f76e6f3b..b2d37b04 100644
+--- a/src/wsi/sdl3/wsi_window_sdl2.cpp
++++ b/src/wsi/sdl3/wsi_window_sdl2.cpp
+@@ -10,6 +10,26 @@
+ 
+ namespace dxvk::wsi {
+ 
++#if defined(__APPLE__)
++  // AppKit windows may only be changed on the main thread, and SDL's Cocoa backend does not
++  // hop there itself. DXGI calls these from whichever thread owns the swap chain (on Apple the
++  // game's worker thread, while the main thread pumps SDL events), so send them over.
++  // SDL_RunOnMainThread runs the call inline when this already is the main thread.
++  template<typename Fn>
++  static bool onMainThread(Fn&& fn) {
++    struct Call { Fn* fn; bool ok; } call = { &fn, false };
++    if (!SDL_RunOnMainThread([] (void* userdata) {
++          auto* c = static_cast<Call*>(userdata);
++          c->ok = (*c->fn)();
++        }, &call, true))
++      return false;
++    return call.ok;
++  }
++  #define DXVK_SDL_WINDOW_CALL(expr) onMainThread([&] { return bool(expr); })
++#else
++  #define DXVK_SDL_WINDOW_CALL(expr) bool(expr)
++#endif
++
+   void getWindowSize(
+         HWND      hWindow,
+         uint32_t* pWidth,
+@@ -34,7 +54,7 @@ namespace dxvk::wsi {
+           uint32_t         Height) {
+     SDL_Window* window = fromHwnd(hWindow);
+ 
+-    SDL_SetWindowSize(window, int32_t(Width), int32_t(Height));
++    DXVK_SDL_WINDOW_CALL(SDL_SetWindowSize(window, int32_t(Width), int32_t(Height)));
+   }
+ 
+ 
+@@ -59,7 +79,7 @@ namespace dxvk::wsi {
+       return false;
+     }
+ 
+-    if (!SDL_SetWindowFullscreenMode(window, &mode)) {
++    if (!DXVK_SDL_WINDOW_CALL(SDL_SetWindowFullscreenMode(window, &mode))) {
+       Logger::err(str::format("SDL3 WSI: setWindowMode: SDL_SetWindowFullscreenMode: ", SDL_GetError()));
+       return false;
+     }
+@@ -80,10 +100,10 @@ namespace dxvk::wsi {
+     if (!isDisplayValid(displayId))
+       return false;
+ 
+-    if (!ModeSwitch && !SDL_SetWindowFullscreenMode(window, nullptr))
++    if (!ModeSwitch && !DXVK_SDL_WINDOW_CALL(SDL_SetWindowFullscreenMode(window, nullptr)))
+       return false;
+ 
+-    if (!SDL_SetWindowFullscreen(window, true)) {
++    if (!DXVK_SDL_WINDOW_CALL(SDL_SetWindowFullscreen(window, true))) {
+       Logger::err(str::format("SDL3 WSI: enterFullscreenMode: SDL_SetWindowFullscreen: ", SDL_GetError()));
+       return false;
+     }
+@@ -97,7 +117,7 @@ namespace dxvk::wsi {
+           DxvkWindowState* pState) {
+     SDL_Window* window = fromHwnd(hWindow);
+ 
+-    if (!SDL_SetWindowFullscreen(window, false)) {
++    if (!DXVK_SDL_WINDOW_CALL(SDL_SetWindowFullscreen(window, false))) {
+       Logger::err(str::format("SDL3 WSI: leaveFullscreenMode: SDL_SetWindowFullscreen: ", SDL_GetError()));
+       return false;
+     }

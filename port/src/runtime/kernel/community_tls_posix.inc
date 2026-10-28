@@ -45,6 +45,11 @@ bool TlsStream::Connect(const std::string& host, uint16_t port, int timeoutMs,
     for (auto* a = found; a; a = a->ai_next) {
         int fd = socket(a->ai_family, a->ai_socktype, a->ai_protocol); if (fd < 0) continue;
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
+#if defined(__APPLE__)
+        // Darwin: the per-socket SIGPIPE guard, in addition to MSG_NOSIGNAL.
+        { int on = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on)); }
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
         int rc = connect(fd, a->ai_addr, a->ai_addrlen), status = 0; socklen_t len = sizeof(status);
         if ((rc == 0 || (errno == EINPROGRESS && Ready(fd, POLLOUT, deadline))) && getsockopt(fd, SOL_SOCKET, SO_ERROR, &status, &len) == 0 && status == 0) { socket_ = fd; break; }
         close(fd);

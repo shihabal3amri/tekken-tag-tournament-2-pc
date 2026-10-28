@@ -2,11 +2,11 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <spawn.h>
-#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 extern char** environ;
 #include "steam_net.h"
+#include "../host_posix_compat.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -220,8 +220,8 @@ void Reader(int in, uint32_t generation)
 bool Launch()
 {
     int toChild[2], fromChild[2];
-    if (::pipe2(toChild, O_CLOEXEC)) return false;
-    if (::pipe2(fromChild, O_CLOEXEC)) { ::close(toChild[0]); ::close(toChild[1]); return false; }
+    if (host_posix::PipeCloexec(toChild)) return false;
+    if (host_posix::PipeCloexec(fromChild)) { ::close(toChild[0]); ::close(toChild[1]); return false; }
     // Frames use private descriptors 3 and 4; Steam's stdout goes to the log.
     // Duplicate above 4 first so spawn actions cannot overwrite a pipe they still need.
     int childIn = ::fcntl(toChild[0], F_DUPFD_CLOEXEC, 5);
@@ -236,7 +236,14 @@ bool Launch()
     posix_spawn_file_actions_adddup2(&actions, childIn, 3);
     posix_spawn_file_actions_adddup2(&actions, childOut, 4);
     posix_spawn_file_actions_adddup2(&actions, STDERR_FILENO, STDOUT_FILENO);
-    char self[] = "/proc/self/exe", flag[] = "--steam-bridge", in[] = "3", out[] = "4";
+#if defined(__APPLE__)
+    // No /proc on macOS: spawn the executable by its resolved path.
+    char self[PATH_MAX] = {};
+    if (!host_posix::ExecutablePath(self, sizeof(self))) std::strcpy(self, "/nonexistent");
+#else
+    char self[] = "/proc/self/exe";
+#endif
+    char flag[] = "--steam-bridge", in[] = "3", out[] = "4";
     char* args[] = {self, flag, in, out, nullptr};
     pid_t child = -1;
     int error = posix_spawn(&child, self, &actions, nullptr, args, environ);

@@ -1,10 +1,11 @@
 #include "host_udp.h"
 
-#if !defined(__linux__)
-#error "This UDP backend requires Linux"
+#if !defined(__linux__) && !defined(__APPLE__)
+#error "This UDP backend requires Linux or macOS"
 #endif
 
 #include <cerrno>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -15,8 +16,17 @@ struct Socket { int native = -1; };
 Socket* BindLoopback(uint16_t firstPort, uint16_t attempts, uint16_t& boundPort)
 {
     boundPort = 0;
+#if defined(__APPLE__)
+    // macOS has no SOCK_CLOEXEC. The shader prebuild child is the only exec.
+    const int native = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (native < 0) return nullptr;
+    fcntl(native, F_SETFD, FD_CLOEXEC);
+    // kern.ipc.maxsockbuf is 8 MiB by default and caps the buffer below that.
+    // A refused size leaves the system default in place, as on Linux.
+#else
     const int native = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
     if (native < 0) return nullptr;
+#endif
     int big = 8 << 20;
     setsockopt(native, SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
     setsockopt(native, SOL_SOCKET, SO_SNDBUF, &big, sizeof(big));

@@ -746,6 +746,8 @@ static void PollInjectFile(PadScript& s, uint64_t now)
     // TTT2_INSTANCE=<tag>: pad_inject<tag>.txt, so two instances can be driven separately.
     static const std::string injectPath = [] {
         const char* tag = std::getenv("TTT2_INSTANCE");
+        // TTT2_PAD_INJECT=<file>: where the inject file is on hosts without C:/ttt2 (macOS tests).
+        if (const char* path = std::getenv("TTT2_PAD_INJECT"); path && *path) return std::string(path);
 #if defined(__ANDROID__)
         // ADB can place a command file here while the SDL activity is running.
         if (const char* root = std::getenv("TTT2_DEBUG_ROOT"); root && *root)

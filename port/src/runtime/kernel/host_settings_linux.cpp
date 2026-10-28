@@ -1,8 +1,8 @@
 #include "host_settings_platform.h"
 #include "../host_storage.h"
 
-#if !defined(__linux__)
-#error "This settings backend requires Linux"
+#if !defined(__linux__) && !defined(__APPLE__)
+#error "This settings backend requires Linux or macOS"
 #endif
 
 #include <algorithm>
@@ -65,6 +65,13 @@ std::filesystem::path SettingsOverride()
 
 std::filesystem::path DefaultSettingsFolder()
 {
+#if defined(__APPLE__)
+    // Settings sit beside the saves: ~/Library/Application Support/TTT2Recomp.
+    const char* home = std::getenv("HOME");
+    if (home && *home && std::filesystem::path(home).is_absolute())
+        return std::filesystem::path(home) / "Library" / "Application Support" / "TTT2Recomp";
+    return std::filesystem::path(".") / "TTT2Recomp";
+#else
     const char* xdg = std::getenv("XDG_CONFIG_HOME");
     const char* home = std::getenv("HOME");
     if (xdg && *xdg && std::filesystem::path(xdg).is_absolute())
@@ -72,6 +79,7 @@ std::filesystem::path DefaultSettingsFolder()
     if (home && *home && std::filesystem::path(home).is_absolute())
         return std::filesystem::path(home) / ".config" / "ttt2-recomp";
     return std::filesystem::path(".") / "ttt2-recomp";
+#endif
 }
 
 std::filesystem::path DefaultDiagnosticFolder(const std::filesystem::path& settingsPath)

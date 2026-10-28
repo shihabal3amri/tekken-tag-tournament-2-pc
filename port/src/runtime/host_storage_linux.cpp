@@ -1,7 +1,7 @@
 #include "host_storage.h"
 
-#if !defined(__linux__)
-#error "This save storage backend requires Linux"
+#if !defined(__linux__) && !defined(__APPLE__)
+#error "This save storage backend requires Linux or macOS"
 #endif
 
 #include <cerrno>
@@ -15,6 +15,14 @@
 #include <vector>
 
 namespace host_storage {
+namespace {
+#if defined(__linux__)
+constexpr int DirectoryPathFlags = DirectoryPathFlags;
+#else
+constexpr int DirectoryPathFlags = O_SEARCH; // macOS: lookup-only directory descriptor
+#endif
+}
+
 uint32_t Error(const std::error_code& error)
 {
     if (!error) return 0;
@@ -39,6 +47,13 @@ uint32_t SaveBase(std::filesystem::path& root)
 {
     if (const char* overridePath = std::getenv("TTT2_SAVE_ROOT"); overridePath && *overridePath)
         root = overridePath;
+#if defined(__APPLE__)
+    else if (const char* home = std::getenv("HOME");
+             home && *home && std::filesystem::path(home).is_absolute())
+        root = std::filesystem::path(home) / "Library" / "Application Support" /
+               "TTT2Recomp" / "saves";
+    else return 3;             // ERROR_PATH_NOT_FOUND
+#else
     else
     {
         const char* data = std::getenv("XDG_DATA_HOME");
@@ -49,6 +64,7 @@ uint32_t SaveBase(std::filesystem::path& root)
             root = std::filesystem::path(home) / ".local" / "share" / "ttt2-recomp" / "saves";
         else return 3;         // ERROR_PATH_NOT_FOUND
     }
+#endif
     return root.is_absolute() ? 0 : 123; // ERROR_INVALID_NAME
 }
 
@@ -70,14 +86,14 @@ uint32_t RejectLinks(const std::filesystem::path& path)
 uint32_t CreateDirectories(const std::filesystem::path& path)
 {
     if (!path.is_absolute()) return 123; // ERROR_INVALID_NAME
-    int directory = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
+    int directory = open("/", DirectoryPathFlags | O_CLOEXEC);
     if (directory < 0) return Error(std::error_code(errno, std::generic_category()));
     for (const auto& component : path.relative_path())
     {
         if (component == ".") continue;
         if (component == "..") { close(directory); return 5; }
         int next = openat(directory, component.c_str(),
-                          O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                          DirectoryPathFlags | O_NOFOLLOW | O_CLOEXEC);
         if (next < 0 && errno == ENOENT)
         {
             if (mkdirat(directory, component.c_str(), 0700) < 0 && errno != EEXIST)
@@ -87,7 +103,7 @@ uint32_t CreateDirectories(const std::filesystem::path& path)
                 return error;
             }
             next = openat(directory, component.c_str(),
-                          O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                          DirectoryPathFlags | O_NOFOLLOW | O_CLOEXEC);
         }
         if (next < 0)
         {
@@ -117,6 +133,12 @@ uint32_t NativeError() { return Error(std::error_code(errno, std::generic_catego
 int Sync(int fd)
 {
     int result;
+#if defined(__APPLE__)
+    // macOS fsync only reaches the drive's cache; F_FULLFSYNC flushes it.
+    // Some file systems do not support it, so fall back to fsync.
+    do { result = fcntl(fd, F_FULLFSYNC); } while (result < 0 && errno == EINTR);
+    if (result == 0) return 0;
+#endif
     do { result = fsync(fd); } while (result < 0 && errno == EINTR);
     return result;
 }
@@ -128,14 +150,14 @@ int Sync(int fd)
 uint32_t OpenParent(const std::filesystem::path& path, int& directory)
 {
     if (!path.is_absolute()) return 123;
-    int fd = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
+    int fd = open("/", DirectoryPathFlags | O_CLOEXEC);
     if (fd < 0) return NativeError();
     for (const auto& component : path.parent_path().relative_path())
     {
         if (component == ".") continue;
         if (component == "..") { close(fd); return 5; }
         const int next = openat(fd, component.c_str(),
-                                O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+                                DirectoryPathFlags | O_NOFOLLOW | O_CLOEXEC);
         if (next < 0)
         {
             const uint32_t error = NativeError();

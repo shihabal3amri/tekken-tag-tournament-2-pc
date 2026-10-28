@@ -398,6 +398,9 @@ void DisconnectServer()
 
 const char* GameProtocol()
 {
+    // Test switch: TTT2_NET_PROTO replaces the protocol, so test builds only find each other's public rooms
+    // and no stock build sees them (or joins them).
+    if (const char* forced = std::getenv("TTT2_NET_PROTO"); forced && *forced) return forced;
     // Rollback builds (TTT2_ROLLBACK, rollback_session.cpp) play a different netcode - a different
     // random-number split and the input delay picked by the host's ONLINE NETCODE - so they only meet
     // each other.
@@ -410,7 +413,15 @@ const char* GameProtocol()
     // "-9": test build 6d - the file loaders at rest across snapshots and restores; the time sync slows the
     //       leader's vblank clock instead of yielding frames.
     // "-10": test build 7 - 6d plus the community servers (servers accept it: server/internal/config).
+    // "-arm64": arm64 builds (macOS, Android, Linux) and x86-64 builds (Windows, Intel Macs) compute the
+    //       fighters' state differently at rare moments (float edge cases: mac/DETERMINISM.md), so a match
+    //       between them drifts apart while the rollback's RNG check still agrees. They only meet their own CPU
+    //       family; a community server admits arm64 players when accepted_protocols lists the "-arm64" name.
+#if defined(__aarch64__) || defined(_M_ARM64)
+    return ::SessionEnabled() ? "ttt2-port-10-rollback-arm64" : "ttt2-port-1-arm64";
+#else
     return ::SessionEnabled() ? "ttt2-port-10-rollback" : "ttt2-port-1";
+#endif
 }
 
 std::shared_ptr<community::Client> Community() { return std::atomic_load(&g_server); }

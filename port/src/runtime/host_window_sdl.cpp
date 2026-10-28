@@ -77,7 +77,37 @@ struct Window {
     bool textInput = false;
 };
 
+#ifdef __APPLE__
+// macOS: AppKit windows, views and the event pump belong to the process's main thread, and SDL's
+// Cocoa backend does not create a video device anywhere else (Cocoa_CreateDevice). The game's
+// main() runs on a worker there (apple_game_entry.cpp) while the main thread pumps SDL, so every
+// window operation below is handed to it. SDL_RunOnMainThread runs the call inline when the
+// caller already is the main thread; the main thread never waits for the game, so the wait
+// cannot deadlock.
+namespace {
+template <class F>
+void OnMainThread(F&& call)
+{
+    auto* pointer = &call;
+    using Pointer = decltype(pointer);
+    if (!SDL_RunOnMainThread([](void* raw) { (**static_cast<Pointer*>(raw))(); }, &pointer, true))
+        std::fprintf(stderr, "[window] SDL_RunOnMainThread: %s\n", SDL_GetError());
+}
+} // namespace
+#endif
+
+#ifdef __APPLE__
+static Window* OpenOnMainThread(uint32_t width, uint32_t height);
 Window* Open(uint32_t width, uint32_t height)
+{
+    Window* window = nullptr;
+    OnMainThread([&] { window = OpenOnMainThread(width, height); });
+    return window;
+}
+static Window* OpenOnMainThread(uint32_t width, uint32_t height)
+#else
+Window* Open(uint32_t width, uint32_t height)
+#endif
 {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
         std::fprintf(stderr, "[window] SDL video init: %s\n", SDL_GetError());
@@ -90,6 +120,16 @@ Window* Open(uint32_t width, uint32_t height)
     // SDL fullscreen enables Android's immersive sticky mode, hiding both
     // system bars and restoring them only temporarily for system gestures.
     flags |= SDL_WINDOW_VULKAN | SDL_WINDOW_FULLSCREEN;
+#endif
+#ifdef __APPLE__
+    // DXVK presents through SDL_Vulkan_CreateSurface (a CAMetalLayer view for MoltenVK); a
+    // Vulkan window also keeps SDL's loader loaded across DXVK's own probing. High pixel density
+    // makes the layer as large as the window in pixels; the back buffer follows
+    // SDL_GetWindowSizeInPixels. TTT2_HIGH_DPI=0 renders at point size (the system scales it).
+    if (const char* hw = std::getenv("TTT2_GPU_HW"); !(hw && *hw == '0'))
+        flags |= SDL_WINDOW_VULKAN;
+    if (const char* hiDpi = std::getenv("TTT2_HIGH_DPI"); !(hiDpi && *hiDpi == '0'))
+        flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #endif
     SDL_Window* handle = SDL_CreateWindow("Tekken Tag Tournament 2 (recomp)",
                                           int(width), int(height), flags);
@@ -120,6 +160,9 @@ Window* Open(uint32_t width, uint32_t height)
 void Close(Window* window)
 {
     if (!window) return;
+#ifdef __APPLE__
+    if (!SDL_IsMainThread()) { OnMainThread([&] { Close(window); }); return; }
+#endif
     if (window->textInput) SDL_StopTextInput(window->handle);
     host_input::Stop();
     SDL_DestroyWindow(window->handle);
@@ -134,6 +177,9 @@ Events Poll(Window* window)
     #if defined(_WIN32) || defined(TTT2_HOST_GAME_UI)
     const bool wantsText = SysUiTextEntryActive();
     if (wantsText != window->textInput) {
+#ifdef __APPLE__
+        OnMainThread([&] {
+#endif
         if (wantsText) {
             window->textInput = SDL_StartTextInput(window->handle);
             if (!window->textInput)
@@ -142,13 +188,16 @@ Events Poll(Window* window)
             SDL_StopTextInput(window->handle);
             window->textInput = false;
         }
+#ifdef __APPLE__
+        });
+#endif
     }
     #endif
     host_input::Tick();
     SDL_Event event;
-#ifdef __ANDROID__
-    // android_game_entry.cpp pumps SDL on its video thread. Draining the queue
-    // here avoids SDL_PollEvent's implicit off-thread SDL_PumpEvents call.
+#if defined(__ANDROID__) || defined(__APPLE__)
+    // android_game_entry.cpp / apple_game_entry.cpp pump SDL on the main thread. Draining the
+    // queue here avoids SDL_PollEvent's implicit off-thread SDL_PumpEvents call.
     while (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) > 0) {
 #else
     while (SDL_PollEvent(&event)) {
@@ -162,11 +211,25 @@ Events Poll(Window* window)
                    event.key.key == SDLK_RETURN && (event.key.mod & SDL_KMOD_ALT)) {
             result.toggleMode = true;
         }
+#ifdef __APPLE__
+        // Cmd+Return toggles too (Option+Return is the Alt+Enter above). Ctrl+Cmd+F stays the
+        // Window menu's own Spaces full screen, which SDL's Cocoa menu handles before any key event.
+        else if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+                 (event.key.mod & SDL_KMOD_GUI) && event.key.key == SDLK_RETURN) {
+            result.toggleMode = true;
+        }
+#endif
         #if defined(_WIN32) || defined(TTT2_HOST_GAME_UI)
         if (event.type == SDL_EVENT_KEY_DOWN) {
             const int key = host_input::LegacyKey(event.key.key);
             if (!event.key.repeat && SysUiKeyCaptureActive() && key) SysUiOnKey(key);
             if (SysUiTextEntryActive()) {
+#ifdef __APPLE__
+                // Cmd+V pastes (the text box takes CTRL+V as the Windows character 0x16).
+                if (!event.key.repeat && event.key.key == SDLK_V && (event.key.mod & SDL_KMOD_GUI))
+                    SysUiOnChar(0x16);
+                else
+#endif
                 if (key == 0x08 || (!event.key.repeat && key == 0x1B))
                     SysUiOnChar(uint32_t(key));
                 else if (!event.key.repeat && key == 0x0D) SysUiOnChar('\r');
@@ -191,6 +254,27 @@ void ApplyMode(Window* window, Mode mode, uint32_t width, uint32_t height)
     if (!SDL_SetWindowFullscreen(handle, true))
         std::fprintf(stderr, "[window] Android fullscreen: %s\n", SDL_GetError());
     return;
+#endif
+#ifdef __APPLE__
+    if (!SDL_IsMainThread()) {
+        OnMainThread([&] { ApplyMode(window, mode, width, height); });
+        return;
+    }
+    // A borderless window over the whole display would sit under the menu bar and the Dock, and
+    // macOS has no exclusive mode: both full-screen modes are SDL's desktop full screen (the
+    // display keeps its mode; the back buffer follows the window). apple_game_entry.cpp turns
+    // Spaces off, so the switch is immediate.
+    if (mode != Mode::Windowed) {
+        SDL_SetWindowFullscreenMode(handle, nullptr);
+        if (!SDL_SetWindowFullscreen(handle, true))
+            std::fprintf(stderr, "[window] fullscreen: %s\n", SDL_GetError());
+        SDL_SyncWindow(handle);
+        return;
+    }
+    if (SDL_GetWindowFlags(handle) & SDL_WINDOW_FULLSCREEN) {
+        SDL_SetWindowFullscreen(handle, false);
+        SDL_SyncWindow(handle);
+    }
 #endif
     const SDL_DisplayID display = SDL_GetDisplayForWindow(handle);
     SDL_Rect bounds{0, 0, int(width), int(height)};
@@ -225,6 +309,13 @@ void ApplyMode(Window* window, Mode mode, uint32_t width, uint32_t height)
 bool Blit(Window* window, const uint32_t* bgrx, uint32_t width, uint32_t height)
 {
     if (!window || !bgrx) return false;
+#ifdef __APPLE__
+    if (!SDL_IsMainThread()) {
+        bool copied = false;
+        OnMainThread([&] { copied = Blit(window, bgrx, width, height); });
+        return copied;
+    }
+#endif
     SDL_Surface* target = SDL_GetWindowSurface(window->handle);
     if (!target) return false;
     SDL_Surface* source = SDL_CreateSurfaceFrom(int(width), int(height),

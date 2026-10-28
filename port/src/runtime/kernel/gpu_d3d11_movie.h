@@ -7,7 +7,7 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include "../host_vm.h"
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include "dxvk_native_com_ptr.h"
 #else
 #include <wrl/client.h>

@@ -57,6 +57,11 @@ int ManagedEntry(void* raw) {
 }
 
 SDL_Thread* Create(size_t stackBytes, SDL_ThreadFunction entry, void* argument) {
+#if defined(__APPLE__)
+    // Darwin's pthread_attr_setstacksize refuses a size that is not a multiple of the page size
+    // (16 KiB on arm64) and SDL ignores the failure: the thread would get the 512 KiB default.
+    stackBytes = (stackBytes + 0x3FFF) & ~size_t(0x3FFF);
+#endif
     SDL_PropertiesID properties = SDL_CreateProperties();
     if (!properties) return nullptr;
     SDL_SetPointerProperty(properties, SDL_PROP_THREAD_CREATE_ENTRY_FUNCTION_POINTER,

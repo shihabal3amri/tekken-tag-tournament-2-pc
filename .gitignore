@@ -142,3 +142,10 @@ server/ttt2-server
 
 # Shared build helpers.
 !/port/cmake/
+
+# macOS (mac/): build trees, downloaded libraries and the app
+!/mac/
+/mac/deps/
+/mac/out/
+*.app/
+.DS_Store

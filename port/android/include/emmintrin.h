@@ -1,6 +1,6 @@
 #pragma once
 
-#if !defined(__ANDROID__) || !defined(__aarch64__)
+#if !(defined(__ANDROID__) || defined(__APPLE__)) || !defined(__aarch64__)
 #error "Android ARM64 SIMD compatibility header used on another target"
 #endif
 
