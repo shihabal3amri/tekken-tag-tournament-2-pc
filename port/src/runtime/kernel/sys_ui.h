@@ -81,3 +81,6 @@ uint16_t HostControllerButtons();
 bool HostTriggerHeld();
 void HostPulseStart();
 void HostPulseDown();
+
+// Front-end menu routing only; player-specific screens and fights must pass false.
+void HostSetSharedMenuInput(bool enabled);

@@ -13,11 +13,16 @@
 !/.gitignore
 !/README.md
 !/BUILDING.md
+!/CHANGELOG.md
 !/.github/
 !/port/
 !/tools/
 !/re/
 !/server/
+!/docs/
+/docs/*
+!/docs/graphics/
+!/docs/releases/
 
 /port/*
 !/port/CMakeLists.txt
@@ -140,5 +145,7 @@ server/dist/
 server/*.exe
 server/ttt2-server
 
+# Original generated artwork embedded in the native launcher.
+!/port/src/launcher/assets/*.png
 # Shared build helpers.
 !/port/cmake/

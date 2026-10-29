@@ -34,6 +34,7 @@
 #include "gpu_hw_dirty_tracker.h"
 #include "gpu_adapter.h"
 #include "display_settings.h"
+#include "smaa_d3d11.h"
 #include "../host_window.h"
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -207,7 +208,7 @@ inline uint32_t MipSampling(const Texture& t, uint32_t levels)
 
 // The D3D11 sampler for that state (mirror-clamp-to-halfway/border as mirror once, as Xenia).
 // userAniso: Options -> Display Settings' anisotropic filtering (0 off), for linear-minified mipped textures.
-inline D3D11_SAMPLER_DESC SamplerDesc(const uint32_t info[4], uint32_t mip = 0, uint32_t userAniso = 0)
+inline D3D11_SAMPLER_DESC SamplerDesc(const uint32_t info[4], uint32_t mip = 0, uint32_t userAniso = 0, uint32_t userMipBias = 0)
 {
     auto mode = [](uint32_t m) {
         switch (m)
@@ -231,7 +232,7 @@ inline D3D11_SAMPLER_DESC SamplerDesc(const uint32_t info[4], uint32_t mip = 0, 
     if (maxAniso > 1 && maxLevel > 0 && minLinear) { s.Filter = D3D11_FILTER_ANISOTROPIC; s.MaxAnisotropy = std::min<uint32_t>(maxAniso, 16); }
     s.AddressU = mode(info[0]); s.AddressV = mode(info[1]); s.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     s.MinLOD = float(std::min(minLevel, maxLevel)); s.MaxLOD = float(maxLevel);
-    s.MipLODBias = std::clamp(float(bias) / 32.0f, -16.0f, 15.99f);
+    s.MipLODBias = std::clamp(float(bias) / 32.0f + (maxLevel ? float(std::min(userMipBias,3u)) : 0.0f), -16.0f, 15.99f);
     s.ComparisonFunc = D3D11_COMPARISON_NEVER;
     for (float& c : s.BorderColor) c = info[3] == 1 ? 1.0f : 0.0f;
     return s;
@@ -1131,6 +1132,50 @@ public:
     // displaySwapRB: the front buffer's fetch-constant swizzle exchanges red and blue (TTT2's
     // .zyx1). The image shown is swizzle(stored bytes); a GPU-resolved front buffer holds the
     // unswapped render, so swap only when exactly one of the two exchanges applies.
+    std::chrono::steady_clock::time_point perfSince_{};
+    unsigned perfFrames_=0,perfCalls_=0;
+    double perfSubmitMs_=0,perfGpuIntervalMs_=0;
+    uint64_t perfCpu100ns_=0;
+    bool perfTitle_=false;
+    void PerformanceReadout(HWND window,double submitMs,bool accepted) {
+
+#ifdef _WIN32
+        const int mode=display_settings::GetPerformanceStats();
+        if(!mode){if(perfTitle_){SetWindowTextA(window,"Tekken Tag Tournament 2 (recomp)");perfTitle_=false;}perfSince_={};return;}
+        FILETIME created{},exited{},kernel{},user{};
+        GetThreadTimes(GetCurrentThread(),&created,&exited,&kernel,&user);
+        const uint64_t cpu=(uint64_t(kernel.dwHighDateTime)<<32|kernel.dwLowDateTime)+(uint64_t(user.dwHighDateTime)<<32|user.dwLowDateTime);
+        const auto now=std::chrono::steady_clock::now();
+        if(perfSince_==std::chrono::steady_clock::time_point{}){perfSince_=now;perfCpu100ns_=cpu;perfFrames_=perfCalls_=0;perfSubmitMs_=0;}
+        perfFrames_+=accepted; ++perfCalls_;perfSubmitMs_+=submitMs;
+        const double elapsed=std::chrono::duration<double>(now-perfSince_).count();
+        if(elapsed<1)return;
+        char title[400];
+        if(mode==1)std::snprintf(title,sizeof(title),"TTT2 | submitted %.1f FPS",perfFrames_/elapsed);
+        else {
+            double usage=0,budget=0;bool haveMemory=false;
+            ComPtr<IDXGIDevice> dxgi;ComPtr<IDXGIAdapter> adapter;ComPtr<IDXGIAdapter3> adapter3;
+            DXGI_QUERY_VIDEO_MEMORY_INFO memory{};
+            if(SUCCEEDED(device_.As(&dxgi))&&SUCCEEDED(dxgi->GetAdapter(&adapter))&&SUCCEEDED(adapter.As(&adapter3))&&
+               SUCCEEDED(adapter3->QueryVideoMemoryInfo(0,DXGI_MEMORY_SEGMENT_GROUP_LOCAL,&memory))){
+                usage=memory.CurrentUsage/1048576.0;budget=memory.Budget/1048576.0;haveMemory=true;
+            }
+            char memoryText[96];
+            if(haveMemory)std::snprintf(memoryText,sizeof(memoryText),"local video memory %.0f/%.0f MiB budget",usage,budget);
+            else std::snprintf(memoryText,sizeof(memoryText),"video memory unavailable");
+            char gpuText[64];
+            if(perfGpuIntervalMs_>0)std::snprintf(gpuText,sizeof(gpuText),"GPU interval %.2f ms",perfGpuIntervalMs_);
+            else std::snprintf(gpuText,sizeof(gpuText),"GPU timing unavailable");
+            std::snprintf(title,sizeof(title),"TTT2 | submitted %.1f FPS | render-thread CPU %.2f ms | submit wall %.2f ms | %s | %s",
+                perfFrames_/elapsed,(cpu-perfCpu100ns_)/10000.0/perfCalls_,perfSubmitMs_/perfCalls_,gpuText,memoryText);
+            std::fprintf(stderr,"[performance] %s\n",title);
+        }
+        SetWindowTextA(window,title);perfTitle_=true;perfSince_=now;perfCpu100ns_=cpu;perfFrames_=perfCalls_=0;perfSubmitMs_=0;
+#else
+        (void)window;(void)submitMs;(void)accepted;
+#endif
+    }
+
     bool Present(uint32_t frontBuffer, bool displaySwapRB, const uint32_t* gammaRamp, uint32_t gammaVersion)
     {
         using clock = std::chrono::steady_clock;
@@ -1246,6 +1291,7 @@ public:
         // present with no game draw since the last one skipped the bind, drew nowhere and showed only the black clear.
         targetBindingValid_ = false;
         GpuTimerFrameBegin();
+        const bool acceptedPresent=hr==S_OK && !(toggle_&16);
         const auto t4 = clock::now();
         frame_pacing_probe::Present(frame_pacing_probe::Ms(t4 - t3));
         if (hr == DXGI_ERROR_WAS_STILL_DRAWING) { ++presentHist_[7]; hr = S_OK; }
@@ -1289,6 +1335,7 @@ public:
                 std::fprintf(stderr, "[frame] present call %.1f ms: front texture %.1f, display %.1f, scaled copy %.1f, DXGI Present %.1f\n",
                              ms(t4 - t0).count(), ms(t1 - t0).count(), ms(t2 - t1).count(), ms(t3 - t2).count(), ms(t4 - t3).count());
         }
+        PerformanceReadout(w,std::chrono::duration<double,std::milli>(t4-t0).count(),acceptedPresent);
         buildBudgetMs_ =
 #if defined(__ANDROID__)
             0;
@@ -1528,6 +1575,7 @@ private:
     }
     std::atomic<bool> exclusive_{ false };
     std::chrono::steady_clock::time_point lastExclusiveTry_{};
+    int exclusiveRefresh_=0;
     display_settings::Resolution exclusiveRes_{ 0, 0 };     // display mode set for exclusive fullscreen
     HRESULT lastPresentHr_ = S_OK;
     uint32_t toggle_ = 0;                         // TTT2_HW_TOGGLE
@@ -1556,6 +1604,8 @@ private:
         const display_settings::Resolution r = display_settings::GetResolution();
         DXGI_MODE_DESC m{};
         m.Width = r.width; m.Height = r.height; m.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        const int hz=display_settings::GetRefreshRate();
+        if(hz){m.RefreshRate.Numerator=UINT(hz);m.RefreshRate.Denominator=1;}
         const bool foreground = HostWindowFocused(w);
         const uint32_t generation = display_settings::Generation();
         if ((foreground && !wasForeground_) || generation != exclusiveGeneration_)
@@ -1578,23 +1628,29 @@ private:
             // still 1280x720 switched the monitor to 1280x720 first, then to the chosen mode (MEASURED
             // 2026-10-20) - so the buffers take the chosen size before the switch.
             if (bufW_ != r.width || bufH_ != r.height) ResizeSwapBuffers(r.width, r.height);
-            swapchain_->ResizeTarget(&m);
+            const HRESULT targetResult=swapchain_->ResizeTarget(&m);
+            if(FAILED(targetResult)&&hz){
+                std::fprintf(stderr,"[display] exclusive refresh %d Hz refused (%08X); using automatic refresh\n",hz,unsigned(targetResult));
+                display_settings::SetRefreshRate(0);m.RefreshRate={0,0};swapchain_->ResizeTarget(&m);
+            }
             const HRESULT hr = swapchain_->SetFullscreenState(TRUE, nullptr);
             std::fprintf(stderr, "[gpu-hw] exclusive fullscreen %ux%u: %s (%08X)\n", r.width, r.height,
                          SUCCEEDED(hr) ? "on" : "refused", static_cast<unsigned>(hr));
             if (SUCCEEDED(hr))
             {
-                m.RefreshRate = {}; swapchain_->ResizeTarget(&m); fs = TRUE; exclusiveRes_ = r;
+                if(!hz)m.RefreshRate = {}; swapchain_->ResizeTarget(&m); fs = TRUE; exclusiveRes_ = r;exclusiveRefresh_=display_settings::GetRefreshRate();
                 exclusiveSince_ = std::chrono::steady_clock::now();
                 refreshHz_ = DisplayHz(w);
                 std::fprintf(stderr, "[gpu-hw] exclusive fullscreen refresh %u Hz\n", refreshHz_);
             }
         }
-        else if (want && fs && (r.width != exclusiveRes_.width || r.height != exclusiveRes_.height))
+        else if (want && fs && (r.width != exclusiveRes_.width || r.height != exclusiveRes_.height || hz!=exclusiveRefresh_))
         {
             // A new RESOLUTION while exclusive: switch the display mode in place (DXGI then resizes
             // the window; the buffers follow below).
-            const HRESULT hr = swapchain_->ResizeTarget(&m);
+            HRESULT hr = swapchain_->ResizeTarget(&m);
+            if(FAILED(hr)&&hz){display_settings::SetRefreshRate(0);m.RefreshRate={};hr=swapchain_->ResizeTarget(&m);std::fprintf(stderr,"[display] refresh selection refused; reverted to automatic\n");}
+            exclusiveRefresh_=display_settings::GetRefreshRate();
             std::fprintf(stderr, "[gpu-hw] exclusive fullscreen mode -> %ux%u (%08X)\n", r.width, r.height, static_cast<unsigned>(hr));
             exclusiveRes_ = r;
             resizeNeeded_ = true;
@@ -1678,9 +1734,10 @@ private:
     //   4. SHARPNESS: contrast adaptive sharpening (the filter of AMD FidelityFX CAS, MIT) at the
     //      window's resolution.
     // Sizes equal and both options off: step 1 alone writes the back buffer.
-    struct PresentCB { float srcW, srcH, dstW, dstH, originX, originY, sharp; uint32_t mode; };
+    struct PresentCB { float srcW, srcH, dstW, dstH, originX, originY, sharp; uint32_t mode; float brightness=1, gamma=1, contrast=1, reserved=0; };
     ComPtr<ID3D11VertexShader> presentVs_;
     ComPtr<ID3D11PixelShader> displayPs_[4], fxaaPs_, scalePs_, casPs_;
+    ttt2_smaa::Pass smaa_;
     ComPtr<ID3D11SamplerState> presentSampler_;
     ComPtr<ID3D11Buffer> presentCb_;
     struct PostTarget { ComPtr<ID3D11Texture2D> tex; ComPtr<ID3D11RenderTargetView> rtv; ComPtr<ID3D11ShaderResourceView> srv; UINT w = 0, h = 0; };
@@ -1702,7 +1759,7 @@ private:
     ComPtr<ID3D11PixelShader> PresentShader(const std::string& body, const char* name)
     {
         const std::string src =
-            "cbuffer P : register(b0) { float2 srcSize; float2 dstSize; float2 origin; float sharp; uint mode; };\n"
+            "cbuffer P : register(b0) { float2 srcSize; float2 dstSize; float2 origin; float sharp; uint mode; float brightness; float gamma; float contrast; float reserved; };\n"
             "Texture2D<float4> src : register(t0); Texture2D<float4> lut : register(t1); SamplerState lin : register(s0);\n" + body;
         auto code = Compile(src, "ps_5_0", name);
         ComPtr<ID3D11PixelShader> ps;
@@ -1736,6 +1793,14 @@ private:
             if (v & 2)
                 body += "  uint3 i = (uint3)round(saturate(c.rgb) * 255.0);\n"
                         "  c.rgb = float3(lut.Load(int3(i.r, 0, 0)).r, lut.Load(int3(i.g, 0, 0)).g, lut.Load(int3(i.b, 0, 0)).b);\n";
+            // Reference code values enter immediately before the same SDR transform
+            // as the game image. Side panels leave the guest dialog readable.
+            body += "  if(reserved>0.5) { float2 uv=(pos.xy-origin)/srcSize; "
+                    "if(uv.y>0.12 && uv.y<0.88) { float row=min(7.0,floor((uv.y-0.12)/0.76*8.0)); "
+                    "if(uv.x>0.02 && uv.x<0.18) c.rgb=(row*4.0)/255.0; "
+                    "if(uv.x>0.82 && uv.x<0.98) c.rgb=(227.0+row*4.0)/255.0; } "
+                    "if(uv.y>0.03 && uv.y<0.08 && uv.x>0.2 && uv.x<0.8) c.rgb=saturate((uv.x-0.2)/0.6); }\n";
+            body += "  if(brightness!=1 || gamma!=1 || contrast!=1) { c.rgb=saturate((c.rgb-0.5)*contrast+0.5); c.rgb=pow(saturate(c.rgb*brightness),1.0/gamma); }\n";
             body += "  return float4(c.rgb, 1); }\n";
             displayPs_[v] = PresentShader(body, "ttt2 present display ps");
         }
@@ -1864,7 +1929,12 @@ private:
     void PostPass(ID3D11RenderTargetView* rtv, const D3D11_VIEWPORT& vp, ID3D11PixelShader* ps, ID3D11ShaderResourceView* srv,
                   const PresentCB& cb)
     {
-        context_->UpdateSubresource(presentCb_.Get(), 0, nullptr, &cb, 0, 0);
+        PresentCB adjusted=cb;
+        adjusted.brightness=display_settings::GetBrightness()/100.0f;
+        adjusted.gamma=display_settings::GetGamma()/100.0f;
+        adjusted.contrast=display_settings::GetContrast()/100.0f;
+        adjusted.reserved=display_settings::GetCalibrationPattern()?1.0f:0.0f;
+        context_->UpdateSubresource(presentCb_.Get(), 0, nullptr, &adjusted, 0, 0);
         BindRenderTargets(rtv, nullptr);
         context_->RSSetViewports(1, &vp);
         const D3D11_RECT sc{ LONG(vp.TopLeftX), LONG(vp.TopLeftY), LONG(vp.TopLeftX + vp.Width), LONG(vp.TopLeftY + vp.Height) };
@@ -1921,7 +1991,20 @@ private:
         if (aa)
         {
             PostTarget& p1 = Post(1, sw, sh);
-            PostPass(p1.rtv.Get(), full, fxaaPs_.Get(), cur, at0);
+            bool applied = false;
+            if (aa == 2)
+            {
+                try {
+                    smaa_.Run(device_.Get(), context_.Get(), cur, p1.rtv.Get(), sw, sh);
+                    applied = true;
+                } catch (const std::exception& error) {
+                    std::fprintf(stderr, "[display] SMAA failed: %s; reverting anti-aliasing to FXAA\n", error.what());
+                    display_settings::SetAntiAliasing(1);
+                }
+                context_->VSSetShader(presentVs_.Get(), nullptr, 0);
+                context_->PSSetSamplers(0, 1, &s);
+            }
+            if (!applied) PostPass(p1.rtv.Get(), full, fxaaPs_.Get(), cur, at0);
             cur = p1.srv.Get();
         }
         cb.mode = !resample ? 0u : vw > sw ? 1u : 2u;
@@ -2516,11 +2599,12 @@ private:
     {
         static const uint32_t anisoFor[5] = { 0, 2, 4, 8, 16 };
         const uint32_t userAniso = anisoFor[std::clamp(display_settings::GetTextureFilter(), 0, 4)];
-        const uint64_t key = info[0] | (info[1] << 3) | (info[2] << 6) | (info[3] << 7) | (uint64_t(mip) << 9) | (uint64_t(userAniso) << 33);
+        const uint32_t userMipBias=uint32_t(display_settings::GetTextureMipBias());
+        const uint64_t key = info[0] | (info[1] << 3) | (info[2] << 6) | (info[3] << 7) | (uint64_t(mip) << 9) | (uint64_t(userAniso) << 33) | (uint64_t(userMipBias) << 38);
         ComPtr<ID3D11SamplerState>& s = samplers_[key];
         if (!s)
         {
-            const D3D11_SAMPLER_DESC d = SamplerDesc(info, mip, userAniso);
+            const D3D11_SAMPLER_DESC d = SamplerDesc(info, mip, userAniso, userMipBias);
             Check(device_->CreateSamplerState(&d, &s), "CreateSamplerState");
         }
         return s.Get();
@@ -3630,6 +3714,8 @@ private:
             return std::clamp(float(std::atof(e)), 1.0f, 4.0f);
 #endif
         }
+        const int percent=display_settings::GetRenderScale();
+        if(percent) return percent/100.0f;
         const display_settings::Resolution r = display_settings::GetResolution();
         return std::clamp(std::min(float(r.width) / 1280.0f, float(r.height) / 720.0f), 0.5f, 4.0f);
     }
@@ -4663,7 +4749,7 @@ private:
             if (context_->GetData(t.begin.Get(), &a, sizeof(a), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK ||
                 context_->GetData(t.end.Get(), &b, sizeof(b), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
             t.pending = false;
-            if (!dj.Disjoint && dj.Frequency && b > a && gpuFrameMs_.size() < 4096) gpuFrameMs_.push_back(float(double(b - a) * 1000.0 / double(dj.Frequency)));
+            if (!dj.Disjoint && dj.Frequency && b>a){perfGpuIntervalMs_=double(b-a)*1000.0/double(dj.Frequency);if(gpuFrameMs_.size()<4096)gpuFrameMs_.push_back(float(perfGpuIntervalMs_));}
         }
         GpuTimer& t = gpuTimers_[++gpuTimerAt_ & 3];
         if (t.pending || t.open) return;                // still unread: this frame goes untimed

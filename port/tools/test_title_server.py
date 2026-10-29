@@ -95,8 +95,8 @@ def parse(image):
 
 def main():
     source = SOURCE.read_text(encoding="utf-8")
-    helpers = source[source.index("namespace {"):source.index("bool TitleServerEnabled()")]
-    helpers = helpers.replace("extern \"C\" PPC_FUNC(__imp__sub_82853C28);", "")
+    helpers = "namespace gin_service { bool Enabled(){return true;} }\n"
+    helpers += body(source,"uint32_t Crc32NoFinalXor")+"\n"+body(source,"void Put32")+"\n"
     helpers += body(source, "std::vector<uint8_t> TitleStorageImage(uint32_t level, uint32_t bufferBytes)")
     guest = []
     for path in (ROOT / "re/ppc").glob("ppc_recomp.*.cpp"):

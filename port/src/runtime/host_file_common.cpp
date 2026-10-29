@@ -73,6 +73,7 @@ uint32_t DosErrorStatus(uint32_t error)
 {
     switch (error)
     {
+    case 0: return 0;             // successful host flush remains STATUS_SUCCESS
     case 38: return 0xC0000011u;   // ERROR_HANDLE_EOF
     case 6: return 0xC0000008u;    // ERROR_INVALID_HANDLE
     case 87: case 131: return 0xC000000Du; // invalid parameter / negative seek

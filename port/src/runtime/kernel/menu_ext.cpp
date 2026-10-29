@@ -22,6 +22,9 @@
 #include "sys_ui.h"
 #include "profiles.h"
 #include "keyboard_keys.h"
+#include "cheat_overlay.h"
+#include "persistent_unlocks.h"
+void DisplayChangeGuardFrame();
 #include "host_keycodes.h"
 #include "host_settings.h"
 #include "host_input_sdl.h"
@@ -42,6 +45,7 @@
 #include <mutex>
 #include <vector>
 
+extern "C" PPC_FUNC(__imp__sub_823749C0);
 extern "C" PPC_FUNC(__imp__sub_82346060);
 extern "C" PPC_FUNC(__imp__sub_826002C8);
 extern "C" PPC_FUNC(__imp__sub_82A8C170);
@@ -1247,6 +1251,24 @@ namespace {
 void UiFrame(PPCContext& ctx, uint8_t* base)
 {
     g_frameCount.fetch_add(1);
+    DisplayChangeGuardFrame();
+    const std::string inputFrame = menu_host::CurrentFrame(ctx, base);
+    if(EnvFlag("TTT2_MENU_FRAME_TRACE")){static std::string previousFrame;if(inputFrame!=previousFrame){std::fprintf(stderr,"[menu-frame] %s\n",inputFrame.c_str());previousFrame=inputFrame;}}
+    // Apply the launcher preference through the game's own option setter only after
+    // a signed-in profile reaches the main menu. Its normal save path owns serialization.
+    static uint64_t motionBlurProfile=0;
+    const uint64_t activeProfile=profiles::SignedIn()?profiles::ActiveXuid():0;
+    if(inputFrame=="FrameMainMenu" && activeProfile && activeProfile!=motionBlurProfile && display_settings::GetMotionBlur()>=0){
+        const PPCContext saved=ctx;
+        { GuestFrame frame(ctx,base,0x100);ctx.r3.u64=display_settings::GetMotionBlur();__imp__sub_823749C0(ctx,base); }
+        ctx=saved;motionBlurProfile=activeProfile;
+        std::fprintf(stderr,"[display] applied motion blur %d through guest option setter\n",display_settings::GetMotionBlur());
+    }
+    cheat_overlay::Frame(inputFrame);
+    persistent_unlocks::ProcessPending(ctx,base,inputFrame=="FrameMainMenu" || inputFrame.rfind("FrameMode007-",0)==0);
+    HostSetSharedMenuInput(inputFrame == "FrameMainMenu" ||
+        inputFrame.rfind("FrameMode007-", 0) == 0 ||
+        inputFrame == "FrameOnlineMenu" || inputFrame == "FrameOnlineServerList");
     sysui::Frame(ctx, base);
     keyui::Frame(ctx, base);
     server_ui::Frame(ctx, base);
@@ -1868,4 +1890,10 @@ PPC_FUNC(sub_82A8C170)
         SaveFile(host_settings::DiagnosticPath(path).c_str(), base + ctx.r4.u32, ctx.r5.u32);
     }
     __imp__sub_82A8C170(ctx, base);
+}
+
+PPC_FUNC(sub_823749C0) {
+    const bool on=ctx.r3.u8!=0;
+    __imp__sub_823749C0(ctx,base);
+    display_settings::SetMotionBlur(on?1:0);
 }

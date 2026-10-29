@@ -208,6 +208,18 @@ It works offline and online; the second player plays as a guest of the first pla
 
 ## Controls
 
+**Keyboard + controller (local VS):** in **TTT2 Launcher**, choose
+**Local player devices → Auto: first device is P1**, then **Save and play**.
+The first device to press its START binding becomes Player 1. Press Start on another device
+(keyboard or controller) to join as Player 2. Idle connected controllers do not join.
+This requires a game build containing the dynamic input feature; older executables ignore it.
+Mouse buttons are not mapped to fighting inputs.
+
+Without the launcher, set `SeparatePlayer=1` under `[Keyboard]` in
+`%LOCALAPPDATA%\TTT2Recomp\settings.ini` while the game is closed. Set it to `0`
+to restore the legacy shared Player 1 controls. Device assignments last for the game
+session and survive controller disconnect/reconnect. Restart to choose a new Player 1.
+
 **Controller:** works just like on Xbox 360. Whoever presses a button first is Player 1.
 
 **Keyboard** (Player 1):
@@ -224,7 +236,7 @@ left/right to switch it to `KEYBOARD`, then `A` to edit. Pick a button, press `A
 new key. `LB` / `RB` show the movement, START and BACK keys, plus `DEFAULTS` to undo everything.
 
 **Display settings** are in the game's own menu, `OPTIONS` → `DISPLAY SETTINGS`: window mode,
-resolution (360p to 4K), `VSYNC`, `SHARPNESS`, `ANTI-ALIASING` (FXAA), `TEXTURE FILTERING` and
+resolution (360p to 4K), `VSYNC`, `SHARPNESS`, `ANTI-ALIASING` (FXAA or SMAA 1x), `TEXTURE FILTERING` and
 `SHADOWS`. The picture options are off by default, so the game looks the way it did on the console.
 In borderless and full screen the mouse pointer is hidden.
 

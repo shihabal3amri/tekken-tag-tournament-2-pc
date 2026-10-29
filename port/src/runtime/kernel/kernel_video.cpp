@@ -39,6 +39,10 @@
 #include "frame_pacing_probe.h"
 #include "gpu_draw_skip_probe.h"
 #include "display_settings.h"
+#ifdef _WIN32
+#include "display_devices.h"
+#include "sys_ui.h"
+#endif
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -231,6 +235,16 @@ static void ApplyWindowMode(host_window::Window* window)
 {
     const int mode = display_settings::GetMode();
     const display_settings::Resolution r = display_settings::GetResolution();
+#ifdef _WIN32
+    // SDL remains the window owner. Position it on the configured native
+    // monitor before the shared mode code computes that display's bounds.
+    const HWND wnd=host_window_win32::Handle(window);
+    MONITORINFO mi{};mi.cbSize=sizeof(mi);
+    if(GetMonitorInfoA(display_devices::Resolve(display_settings::GetMonitorDevice(),wnd),&mi)) {
+        SDL_SetWindowPosition(host_window::SDLHandle(window),mi.rcMonitor.left+32,mi.rcMonitor.top+32);
+        SDL_SyncWindow(host_window::SDLHandle(window));
+    }
+#endif
     const host_window::Mode hostMode = mode == display_settings::Windowed
         ? host_window::Mode::Windowed
         : (mode == display_settings::Borderless ? host_window::Mode::Borderless

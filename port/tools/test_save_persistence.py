@@ -18,19 +18,34 @@ CHECKER = r'''
 #include "@CONTENT@"
 #include "@STORE@"
 #include "@IO@"
+#include "@HOST_FILE_COMMON@"
+#include "@HOST_FILE_WINDOWS@"
+#include "@HOST_STORAGE_WINDOWS@"
+#include "@HOST_THREAD@"
+#pragma comment(lib,"@SDL_LIB@")
 #include <fstream>
 #include <future>
 #undef OUT
 bool WTrace(){return false;}
+namespace host_vm { bool PrepareHostWrite(void*,size_t){return true;} }
+void RollbackNoteIo(bool,const char*,const PPCContext*){}
+void RollbackBeforeHostWrite(uint32_t,uint32_t){}
+void RollbackSaveOpen(bool){}
+void RollbackImportNote(const char*){}
+bool XLiveCloseHandle(uint32_t,uint32_t&){return false;}
+bool XLiveEnumerate(uint8_t*,uint32_t,uint32_t,uint32_t,uint32_t&,uint32_t&){return false;}
+int32_t RollbackSaveJournalFrame(){return -1;}
+namespace profiles { uint64_t ActiveXuid(){return 0xB13EBABEBABEBABEull;} }
+
 void KernelQueueGuestCall(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t){std::abort();}
 static void Reporter(PPCContext&,uint8_t*){std::abort();}
 PPCFunc* const g_unmappedReporter=Reporter;
 static unsigned checks=0;
 #define CHECK(x) do{++checks;if(!(x)){std::fprintf(stderr,"FAIL line%d: %s\n",__LINE__,#x);std::abort();}}while(0)
-alignas(16) std::array<uint8_t,8192> memory;
+alignas(16) std::array<uint8_t,0x12000> memory;
 uint8_t* base=memory.data();
-constexpr uint32_t ROOT_NAME=0x100,RECORD=0x200,OUT=0x400,IOS=0x420,OV=0x440;
-constexpr uint32_t OBJECT=0x500,ANSI=0x520,PATH=0x600,DATA=0x900,OFFSET=0xB00,STACK=0x1800;
+constexpr uint32_t ROOT_NAME=0x10100,RECORD=0x10200,OUT=0x10400,IOS=0x10420,OV=0x10440;
+constexpr uint32_t OBJECT=0x10500,ANSI=0x10520,PATH=0x10600,DATA=0x10900,OFFSET=0x10B00,STACK=0x11800;
 void Put64(uint32_t p,uint64_t v){GWrite32(base,p,uint32_t(v>>32));GWrite32(base,p+4,uint32_t(v));}
 uint64_t Get64(uint32_t p){return uint64_t(GRead32(base,p))<<32|GRead32(base,p+4);}
 void Reset(){memory.fill(0xA5);std::memcpy(base+ROOT_NAME,"tag25save",10);
@@ -80,16 +95,16 @@ void WriteOracle(const std::filesystem::path& folder){
  CHECK(native!=INVALID_HANDLE_VALUE);auto fn=reinterpret_cast<NativeWrite>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtWriteFile"));CHECK(fn);
  struct C{int64_t off;uint32_t len;bool ptr;};const C cases[]={{0,3,true},{7,3,true},{-2,2,true},{0,2,false},{-1,3,true},{0,0,true},{7,0,true},{-2,0,true},{-1,0,true},{-3,3,true},{-3,0,true}};
  for(const auto& v:cases){
-  SetPosition(native,0);SetPosition(file->handle,0);CHECK(SetEndOfFile(native)&&SetEndOfFile(file->handle));
-  DWORD n=0;CHECK(WriteFile(native,"0123456789",10,&n,nullptr)&&n==10);CHECK(WriteFile(file->handle,"0123456789",10,&n,nullptr)&&n==10);
-  SetPosition(native,2);SetPosition(file->handle,2);std::memcpy(base+DATA,"XYZ",3);GWrite32(base,IOS,0xA5A5A5A5);GWrite32(base,IOS+4,0xA5A5A5A5);
+  SetPosition(native,0);SetPosition(file->handle->handle,0);CHECK(SetEndOfFile(native)&&SetEndOfFile(file->handle->handle));
+  DWORD n=0;CHECK(WriteFile(native,"0123456789",10,&n,nullptr)&&n==10);CHECK(WriteFile(file->handle->handle,"0123456789",10,&n,nullptr)&&n==10);
+  SetPosition(native,2);SetPosition(file->handle->handle,2);std::memcpy(base+DATA,"XYZ",3);GWrite32(base,IOS,0xA5A5A5A5);GWrite32(base,IOS+4,0xA5A5A5A5);
   NativeIosb ios;std::memset(&ios,0xA5,sizeof(ios));LARGE_INTEGER off{};off.QuadPart=v.off;
   uint32_t wanted=uint32_t(fn(native,nullptr,nullptr,nullptr,&ios,base+DATA,v.len,v.ptr?&off:nullptr,nullptr));
   auto got=Write(handle,v.len,v.off,v.ptr);if(got!=wanted)std::fprintf(stderr,"write off%lld length%u got%08X want%08X\n",v.off,v.len,got,wanted);
   CHECK(got==wanted);CHECK(GRead32(base,IOS)==uint32_t(ios.status)&&GRead32(base,IOS+4)==uint32_t(ios.information));
-  CHECK(Position(native)==Position(file->handle));
-  SetPosition(native,0);SetPosition(file->handle,0);std::array<char,32>a{},b{};DWORD na=0,nb=0;
-  CHECK(ReadFile(native,a.data(),32,&na,nullptr)&&ReadFile(file->handle,b.data(),32,&nb,nullptr));CHECK(na==nb&&a==b);
+  CHECK(Position(native)==Position(file->handle->handle));
+  SetPosition(native,0);SetPosition(file->handle->handle,0);std::array<char,32>a{},b{};DWORD na=0,nb=0;
+  CHECK(ReadFile(native,a.data(),32,&na,nullptr)&&ReadFile(file->handle->handle,b.data(),32,&nb,nullptr));CHECK(na==nb&&a==b);
  }
  CloseHandle(native);Close(handle);file.reset();
  CHECK(DeleteFileW((folder/L"B13EBABEBABEBABE"/L"tag25savedata"/L"oracle.bin").c_str()));
@@ -196,11 +211,25 @@ def main():
     for key, name in [("OBJECTS", "kernel_objects.cpp"), ("CONTENT", "kernel_content.cpp"),
                       ("STORE", "save_store.cpp"), ("IO", "kernel_io.cpp")]:
         source = source.replace(f"@{key}@", (kernel / name).as_posix())
+    runtime=ROOT / "port/src/runtime"
+    for key,name in (("HOST_FILE_COMMON","host_file_common.cpp"),("HOST_FILE_WINDOWS","host_file_windows.cpp"),("HOST_STORAGE_WINDOWS","host_storage_windows.cpp"),("HOST_THREAD","host_thread_sdl.cpp")):
+        source=source.replace(f"@{key}@",(runtime/name).as_posix())
+    sdl=Path(os.environ['SDL3_DIR']).parent
+    source=source.replace('@SDL_LIB@',(sdl/'lib/x64/SDL3.lib').as_posix())
     with tempfile.TemporaryDirectory(prefix="ttt2-save-") as temp:
         folder = Path(temp)
         (folder / "ppc_recomp_shared.h").write_text(SHARED)
         includes = [folder, RECOMP / "XenonUtils", RECOMP / "thirdparty/simde",
-                    ROOT / "port/src/runtime", kernel]
+                    ROOT / "port/src/runtime", kernel, sdl/"include"]
+        # This harness unity-includes production modules to inspect file handles.
+        # Remove only the duplicate default-argument declaration in its IO copy.
+        io_path = folder / "kernel_io_test.cpp"
+        io_text = (kernel / "kernel_io.cpp").read_text(encoding="utf-8-sig")
+        declaration = 'void RollbackNoteIo(bool frameOnly, const char* op = "", const PPCContext* ctx = nullptr);'
+        assert declaration in io_text
+        io_text = io_text.replace(declaration, "", 1)
+        io_path.write_text(io_text, encoding="utf-8")
+        source = source.replace((kernel / "kernel_io.cpp").as_posix(), io_path.as_posix())
         exe = compile_one(folder, "save_persistence", source, includes)
         sentinel = folder / "sentinel.bin"
         sentinel.write_bytes(b"disc-must-stay-readonly")
@@ -213,7 +242,7 @@ def main():
         print("PASS new-process reopen and disc sentinel unchanged")
         # Removing either a real write or component validation must fail before
         # the harness can claim a persistent or confined save.
-        io = (kernel / "kernel_io.cpp").read_text(encoding="utf-8-sig")
+        io = io_text
         start = io.index("PPC_FUNC(__imp__NtWriteFile)\n{")
         end = io.index("\nPPC_FUNC(__imp__NtWriteFileGather)", start)
         no_write = io[:start] + "PPC_FUNC(__imp__NtWriteFile) {ctx.r3.u32=0;}\n" + io[end:]
@@ -221,7 +250,7 @@ def main():
         unchecked = store.replace("if(!tail.empty()&&!Component(tail))", "if(false)")
         assert unchecked != store
         for name, changed in [
-            ("false_write", source.replace(f'#include "{(kernel / "kernel_io.cpp").as_posix()}"', no_write)),
+            ("false_write", source.replace(f'#include "{io_path.as_posix()}"', no_write)),
             ("unchecked_path", source.replace(f'#include "{(kernel / "save_store.cpp").as_posix()}"', unchecked)),
         ]:
             run_folder = folder / name

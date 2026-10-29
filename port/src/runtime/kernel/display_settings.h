@@ -4,6 +4,7 @@
 #pragma once
 #include <cstdint>
 #include <vector>
+#include <string>
 
 namespace display_settings {
 
@@ -14,6 +15,8 @@ struct Resolution { uint32_t width, height; };
 // 16:9 render resolutions offered in the menu (fixed list; index = menu cursor).
 const std::vector<Resolution>& Resolutions();
 
+std::wstring GetMonitorDevice();
+void SetMonitorDevice(const std::wstring& device);
 int GetMode();
 int GetResolutionIndex();
 Resolution GetResolution();
@@ -25,12 +28,22 @@ uint32_t Generation();
 
 // Options -> Display Settings image options, applied live (the presenter, the texture samplers):
 //   SHARPNESS 0 (OFF) .. 10: contrast adaptive sharpening of the scaled image   [Display] Sharpness
-//   ANTI-ALIASING 0 OFF, 1 FXAA (at render resolution)                          [Display] AntiAliasing
+//   ANTI-ALIASING 0 OFF, 1 FXAA, 2 SMAA 1x (at render resolution)                          [Display] AntiAliasing
 //   TEXTURE FILTERING 0 STANDARD (the game's own filters, as on the console),
 //     1..4 anisotropic 2x / 4x / 8x / 16x for mipmapped textures             [Display] TextureFilter
 // All default to 0: the picture as the game draws it. Cheap to read (atomics): the renderer asks
 // every frame and every draw.
-constexpr int kMaxSharpness = 10, kMaxAntiAliasing = 1, kMaxTextureFilter = 4;
+constexpr int kMaxSharpness = 10, kMaxAntiAliasing = 2, kMaxTextureFilter = 4;
+// SDR calibration percentages, neutral 100. GPU selection applies next launch (-1 automatic).
+int GetMotionBlur();void SetMotionBlur(int mode);
+int GetRefreshRate();void SetRefreshRate(int hz);
+int GetTextureMipBias(); int GetRenderScale(); int GetPerformanceStats();
+void SetTextureMipBias(int value); void SetRenderScale(int percent); void SetPerformanceStats(int mode);
+int GetBrightness(); int GetGamma(); int GetContrast(); int GetGpuAdapter();
+void SetBrightness(int value); void SetGamma(int value); void SetContrast(int value); void SetGpuAdapter(int index);
+// Transient in-game reference panels, never persisted or enabled at startup.
+bool GetCalibrationPattern();
+void SetCalibrationPattern(bool enabled);
 int GetSharpness();
 int GetAntiAliasing();
 int GetTextureFilter();

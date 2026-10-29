@@ -6,6 +6,7 @@
 // exports NvOptimusEnablement / AmdPowerXpressRequestHighPerformance, main.cpp). TTT2_GPU_ADAPTER=<n>
 // picks DXGI's n-th adapter. Every adapter is listed in the log once.
 #include <dxgi1_6.h>
+#include "display_settings.h"
 #if defined(__linux__)
 #include "dxvk_native_com_ptr.h"
 #else
@@ -22,8 +23,12 @@ inline Microsoft::WRL::ComPtr<IDXGIAdapter1> PreferredGpuAdapter()
     ComPtr<IDXGIFactory1> factory;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return nullptr;
     ComPtr<IDXGIAdapter1> pick;
-    if (const char* e = std::getenv("TTT2_GPU_ADAPTER"); e && *e)
-        factory->EnumAdapters1(UINT(std::atoi(e)), &pick);
+    int requested=display_settings::GetGpuAdapter();
+    if (const char* e=std::getenv("TTT2_GPU_ADAPTER");e&&*e) requested=std::atoi(e);
+    if(requested>=0){
+        factory->EnumAdapters1(UINT(requested),&pick);
+        if(!pick) std::fprintf(stderr,"[gpu] requested adapter unavailable; using automatic selection\n");
+    }
     ComPtr<IDXGIFactory6> factory6;
     if (!pick && SUCCEEDED(factory.As(&factory6)))
         for (UINT i = 0;; ++i)

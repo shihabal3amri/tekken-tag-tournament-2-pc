@@ -61,6 +61,53 @@ void Save()
 
 } // namespace
 
+bool SeparatePlayer()
+{
+    static const bool separate = host_settings::ReadInt("Keyboard", "SeparatePlayer", 0) == 1;
+    return separate;
+}
+
+int PlayerOnePreference()
+{
+    static const int preference = [] {
+        const unsigned value = host_settings::ReadInt("Input", "PlayerOnePreference", 0);
+        return value <= 2 ? int(value) : 0;
+    }();
+    return preference;
+}
+
+int SOCD()
+{
+    static const int mode = [] {
+        const unsigned value = host_settings::ReadInt("Keyboard", "SOCD", 0);
+        return value <= 3 ? int(value) : 0;
+    }();
+    return mode;
+}
+
+bool DPadOnly()
+{
+    static const bool on = host_settings::ReadInt("Input", "DPadOnly", 0) == 1;
+    return on;
+}
+int StickDeadzone()
+{
+    static const int percent = [] {
+        const unsigned value = host_settings::ReadInt("Input", "StickDeadzone", 0);
+        return value <= 95 ? int(value) : 0;
+    }();
+    return percent;
+}
+
+int StickDiagonal()
+{
+    static const int percent = [] {
+        const unsigned value = host_settings::ReadInt("Input", "StickDiagonal", 0);
+        return value <= 100 ? int(value) : 0;
+    }();
+    return percent;
+}
+
 int Key(int control)
 {
     Load();
