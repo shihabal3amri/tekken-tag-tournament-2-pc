@@ -3,7 +3,7 @@
 // port/tools/stfs.py (which extracted the project's reference copy), same block addressing.
 #pragma once
 
-#include "setup/input_file.h"
+#include <windows.h>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -13,10 +13,7 @@ namespace ttt2::setup {
 class StfsPackage {
 public:
     ~StfsPackage() { Close(); }
-    bool Open(const std::filesystem::path& path, std::string& err);
-#ifndef _WIN32
-    bool OpenFd(int fd, std::string& err);
-#endif
+    bool Open(const wchar_t* path, std::string& err);
     void Close();
 
     uint32_t TitleId() const { return titleId_; }
@@ -33,8 +30,7 @@ private:
     uint32_t NextBlock(uint32_t block);
     bool ReadTable(std::string& err);
 
-    InputFile file_;
-    bool Parse(std::string& err);
+    HANDLE h_ = INVALID_HANDLE_VALUE;
     uint64_t size_ = 0;
     uint32_t titleId_ = 0, mediaId_ = 0, contentType_ = 0, headerSize_ = 0;
     uint32_t tableBlock0_ = 0, tableBlocks_ = 0, tableShift_ = 1;

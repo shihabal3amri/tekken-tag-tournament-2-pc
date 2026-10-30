@@ -1,8 +1,8 @@
 // Keyboard key settings (see keyboard_keys.h). The input poll thread reads the keys, the game's
 // main thread changes them: one atomic per control.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include "keyboard_keys.h"
-#include "host_keycodes.h"
-#include "host_settings.h"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -29,14 +29,27 @@ std::atomic<int> g_keys[Count];
 std::once_flag g_loaded;
 std::mutex g_writeMutex;
 
+std::string IniPath()
+{
+    if (const char* e = std::getenv("TTT2_SETTINGS_INI"); e && *e) return e;
+    char dir[MAX_PATH];
+    const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof(dir));
+    std::string path = (n && n < sizeof(dir)) ? std::string(dir) : std::string(".");
+    path += "\\TTT2Recomp";
+    CreateDirectoryA(path.c_str(), nullptr);
+    return path + "\\settings.ini";
+}
+
 void Load()
 {
     std::call_once(g_loaded, [] {
+        const std::string ini = IniPath();
         for (int c = 0; c < Count; ++c)
         {
-            const std::string value = host_settings::Read("Keyboard", kInfo[c].ini, "");
+            char value[32] = {};
+            GetPrivateProfileStringA("Keyboard", kInfo[c].ini, "", value, sizeof(value), ini.c_str());
             int vk = kInfo[c].defaultKey;
-            if (!value.empty()) vk = int(std::strtol(value.c_str(), nullptr, 0));
+            if (*value) vk = int(std::strtol(value, nullptr, 0));
             g_keys[c] = (vk >= 0 && vk < 256) ? vk : kInfo[c].defaultKey;
         }
         // Two controls on one key (an edited file): the later one loses the key.
@@ -45,17 +58,18 @@ void Load()
                 if (g_keys[c] && g_keys[c] == g_keys[d]) g_keys[c] = 0;
         std::string line = "[keyboard] keys:";
         for (int c = 0; c < Count; ++c) line += std::string(" ") + kInfo[c].name + "=" + KeyName(g_keys[c]);
-        std::fprintf(stderr, "%s\n", line.c_str());
+        std::fprintf(stderr, "%s (%s)\n", line.c_str(), ini.c_str());
     });
 }
 
 void Save()
 {
+    const std::string ini = IniPath();
     for (int c = 0; c < Count; ++c)
     {
         char value[16];
         std::snprintf(value, sizeof(value), "0x%02X", unsigned(g_keys[c].load()));
-        host_settings::Write("Keyboard", kInfo[c].ini, value);
+        WritePrivateProfileStringA("Keyboard", kInfo[c].ini, value, ini.c_str());
     }
 }
 

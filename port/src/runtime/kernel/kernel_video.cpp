@@ -14,36 +14,18 @@
 //   them, replacing the header with a PM4 NOP so they run once.
 #include "kernel_shared.h"
 #include "guest_heap.h"
-#include <immintrin.h>
+#include <intrin.h>
 #include "kernel_trace.h"
 #include "gpu_render.h"
-#include "gpu_alu_upload.h"
-#if defined(TTT2_GEOMETRY_AB_PROBE)
-#include "gpu_geometry_probe.h"
-#endif
-#include "../host_vm.h"
-#include "../host_window_sdl.h"
-#include "../host_process.h"
-#include "../host_window.h"
-#include "../host_thread.h"
-#include "../host_deadline_wait.h"
-#include "host_settings.h"
-#ifdef _WIN32
-#include "../host_window_win32.h"
-#endif
 #include "phys_mirror.h"
 #include "gpu_ring_reader.h"
 #include "bounded_format.h"
 #include "timeline.h"
-#include "frame_benchmark.h"
-#include "frame_pacing_probe.h"
-#include "gpu_draw_skip_probe.h"
 #include "display_settings.h"
+#include "sys_ui.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <filesystem>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,13 +35,16 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <process.h>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 // Guest ISR/DPC chains can run deep; give guest-executing host threads big stacks
 // (a silent process death with no fault output = stack overflow in a detached thread).
-static void StartBigStackThread(host_thread::Procedure fn)
+static void StartBigStackThread(unsigned (__stdcall* fn)(void*))
 {
-    if (!host_thread::StartDetached(8 * 1024 * 1024, fn, nullptr))
-        std::fprintf(stderr, "[vd] failed to start presentation worker\n");
+    uintptr_t h = _beginthreadex(nullptr, 8 * 1024 * 1024, fn, nullptr, 0, nullptr);
+    if (h) CloseHandle(reinterpret_cast<HANDLE>(h));
 }
 
 static std::atomic<uint32_t> g_intrCallback{0};
@@ -78,23 +63,17 @@ static constexpr uint32_t MMIO_SWAP_STATUS = 0x7FC86544u;   // reg 0x6544, bit0 
 // callback (the vblank / swap DPC tokens). Waiters on GPU-written values sleep on it
 // (WaitOnAddress) instead of spinning: guest_monitor.cpp's D3D wait, WaitRegMem below.
 std::atomic<uint32_t> g_gpuProgress{0};
-static std::mutex g_gpuProgressMutex;
-static std::condition_variable g_gpuProgressCv;
 void GpuProgress()
 {
-    {
-        std::lock_guard lock(g_gpuProgressMutex);
-        g_gpuProgress.fetch_add(1, std::memory_order_release);
-    }
-    g_gpuProgressCv.notify_all();
+    g_gpuProgress.fetch_add(1, std::memory_order_release);
+    WakeByAddressAll(&g_gpuProgress);
 }
 // Sleep until GpuProgress moves past `seen`, at most `ms` (true: it moved).
-bool WaitGpuProgress(uint32_t seen, uint32_t ms)
+bool WaitGpuProgress(uint32_t seen, DWORD ms)
 {
-    std::unique_lock lock(g_gpuProgressMutex);
-    return g_gpuProgressCv.wait_for(lock, std::chrono::milliseconds(ms), [seen] {
-        return g_gpuProgress.load(std::memory_order_acquire) != seen;
-    });
+    if (g_gpuProgress.load(std::memory_order_acquire) != seen) return true;
+    WaitOnAddress(&g_gpuProgress, &seen, sizeof(seen), ms);
+    return g_gpuProgress.load(std::memory_order_acquire) != seen;
 }
 
 // The D3D runtime hands the kernel PHYSICAL addresses (virtual & 0x1FFFFFFF). GPU-visible
@@ -104,39 +83,12 @@ static uint32_t PhysToGuest(uint32_t addr)
     return (addr && addr < 0x20000000u) ? (addr | 0xA0000000u) : addr;
 }
 
-// Keep the existing diagnostic names under a host-specific debug directory.
-static std::string DebugPath(const char* legacy)
-{
-    constexpr char prefix[] = "C:/ttt2/port/";
-    if (std::strncmp(legacy, prefix, sizeof(prefix) - 1) == 0)
-        return host_settings::DiagnosticPath(legacy + sizeof(prefix) - 1);
-    return legacy;
-}
-static FILE* DebugOpen(const char* path, const char* mode)
-{
-    return std::fopen(DebugPath(path).c_str(), mode);
-}
-static bool DebugExists(const char* path)
-{
-    std::error_code error;
-    return std::filesystem::exists(DebugPath(path), error);
-}
-static bool DebugRemove(const char* path)
-{
-    std::error_code error;
-    return std::filesystem::remove(DebugPath(path), error);
-}
-static void DebugDirectory(const char* path)
-{
-    std::error_code error;
-    std::filesystem::create_directories(DebugPath(path), error);
-}
-
 // ===================== Present pass: host window + frontbuffer blit =====================
 // The swap packet carries the frontbuffer TEXTURE FETCH BLOCK; we decode the surface
 // address from it and show the surface in a host window (and periodically dump a BMP
 // for headless verification). Even a black frame proves the flip chain end-to-end.
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "synchronization.lib")
 
 static std::atomic<uint32_t> g_frontBufferPhys{0};   // guest address of the displayed surface
@@ -183,7 +135,7 @@ static void ConvertFrontBuffer(uint32_t fbGuest, uint32_t* out)
 
 static void WriteBmpTo(const char* path, const uint32_t* px)
 {
-    FILE* f = DebugOpen(path, "wb");
+    FILE* f = std::fopen(path, "wb");
     if (!f) return;
     uint32_t imgSize = FB_W * FB_H * 4;
     uint8_t hdr[54] = {};
@@ -211,43 +163,159 @@ static void WriteFrontBufferBmp(const uint32_t* px)
     WriteBmpTo(path.c_str(), px);
 }
 
-// SDL owns the window and event loop. D3D11 receives only the native HWND from
-// its Windows adapter; window sizing and input events stay in SDL.
-static void PumpWindow(host_window::Window* window)
+// The mouse pointer over the game: the arrow in a window, none in borderless and fullscreen (the game
+// takes no mouse input; a pointer left over the picture covers it).
+static HCURSOR GameCursor()
 {
-    const host_window::Events events = host_window::Poll(window);
-    if (events.close)
-    {
-        std::fprintf(stderr, "[window] closed - quitting\n");
-        std::fflush(stderr);
-        LogDrain(); host_process::ExitNow(0);
-    }
-    if (events.toggleMode)
-        display_settings::SetMode(display_settings::GetMode() == display_settings::Windowed
-            ? display_settings::Borderless : display_settings::Windowed);
+    static const HCURSOR arrow = LoadCursorA(nullptr, reinterpret_cast<LPCSTR>(IDC_ARROW));
+    return display_settings::GetMode() == display_settings::Windowed ? arrow : nullptr;
 }
 
-static void ApplyWindowMode(host_window::Window* window)
+// The game window. Closing it quits (as the main menu's EXIT does); Alt+Enter switches between
+// windowed and borderless (Options -> Display Settings -> DISPLAY MODE offers all three).
+static LRESULT CALLBACK GameWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && SysUiKeyCaptureActive())
+    {
+        // Controller Setup -> KEYBOARD waits for a key: every key goes there (Alt+Enter too), with
+        // left / right SHIFT, CTRL and ALT told apart (WM_KEYDOWN reports them generically).
+        if (lp & (1 << 30)) return 0;           // auto-repeat
+        int vk = static_cast<int>(wp);
+        const bool extended = (lp & (1 << 24)) != 0;
+        if (vk == VK_SHIFT) vk = static_cast<int>(MapVirtualKeyA((lp >> 16) & 0xFF, MAPVK_VSC_TO_VK_EX));
+        else if (vk == VK_CONTROL) vk = extended ? VK_RCONTROL : VK_LCONTROL;
+        else if (vk == VK_MENU) vk = extended ? VK_RMENU : VK_LMENU;
+        SysUiOnKey(vk);
+        return 0;
+    }
+    static const bool focusLog = [] { const char* e = std::getenv("TTT2_FOCUS_LOG"); return e && *e == '1'; }();
+    if (focusLog && (msg == WM_ACTIVATEAPP || msg == WM_ACTIVATE || msg == WM_KILLFOCUS || msg == WM_SETFOCUS || msg == WM_DISPLAYCHANGE))
+    {
+        // Diagnostics (TTT2_FOCUS_LOG=1): who takes the foreground when the game loses it.
+        DWORD pid = 0;
+        if (HWND fg = GetForegroundWindow()) GetWindowThreadProcessId(fg, &pid);
+        char name[MAX_PATH] = "?";
+        if (HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid))
+        {
+            DWORD n = sizeof(name);
+            QueryFullProcessImageNameA(h, 0, name, &n);
+            CloseHandle(h);
+        }
+        std::string displays;
+        DISPLAY_DEVICEA dd{};
+        dd.cb = sizeof(dd);
+        for (DWORD i = 0; EnumDisplayDevicesA(nullptr, i, &dd, 0); ++i, dd.cb = sizeof(dd))
+        {
+            if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
+            DEVMODEA dm{};
+            dm.dmSize = sizeof(dm);
+            EnumDisplaySettingsA(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm);
+            char one[160];
+            std::snprintf(one, sizeof(one), " %s %lux%lu %lu Hz %lu bpp at %ld,%ld%s;", dd.DeviceName, dm.dmPelsWidth, dm.dmPelsHeight,
+                          dm.dmDisplayFrequency, dm.dmBitsPerPel, dm.dmPosition.x, dm.dmPosition.y,
+                          (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) ? " primary" : "");
+            displays += one;
+        }
+        std::fprintf(stderr, "[focus] %.1f ms: msg %04X wp %llX lp %llX; foreground pid %lu %s; displays:%s\n",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+                     msg, (unsigned long long)wp, (unsigned long long)lp, pid, std::strrchr(name, '\\') ? std::strrchr(name, '\\') + 1 : name,
+                     displays.c_str());
+    }
+    switch (msg)
+    {
+    case WM_CLOSE:
+        std::fprintf(stderr, "[window] closed - quitting\n");
+        std::fflush(stderr);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 0);
+        return 0;
+    case WM_SYSKEYDOWN:
+        if (wp == VK_RETURN && (lp & (1 << 29)))
+        {
+            display_settings::SetMode(display_settings::GetMode() == display_settings::Windowed ? display_settings::Borderless
+                                                                                              : display_settings::Windowed);
+            return 0;
+        }
+        break;
+    case WM_SYSCHAR:
+        return 0;                               // no beep for Alt+Enter or Alt+letter (Alt can be a game key)
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) { SetCursor(GameCursor()); return TRUE; }
+        break;
+    case WM_SYSCOMMAND:
+        // A lone Alt or F10 would put the window into menu mode (it has no menu): the next key
+        // then plays the error sound. Alt+F4 (SC_CLOSE) still closes.
+        if ((wp & 0xFFF0) == SC_KEYMENU) return 0;
+        break;
+    case WM_CHAR:
+        // Typed text for the system UI's profile name entry (sys_ui.h); ignored otherwise.
+        if (SysUiTextEntryActive()) { SysUiOnChar(static_cast<uint32_t>(wp)); return 0; }
+        break;
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE && SysUiTextEntryActive()) { SysUiOnChar(0x1B); return 0; }
+        break;
+    }
+    return DefWindowProcA(wnd, msg, wp, lp);
+}
+
+// Window style and size for the display mode: windowed = a framed window whose client area is the
+// chosen resolution (scaled down, keeping 16:9, when it does not fit the work area), centred;
+// borderless and fullscreen = a popup covering the monitor (the presenter makes fullscreen
+// exclusive at the chosen resolution).
+static void ApplyWindowMode(HWND wnd)
 {
     const int mode = display_settings::GetMode();
     const display_settings::Resolution r = display_settings::GetResolution();
-    const host_window::Mode hostMode = mode == display_settings::Windowed
-        ? host_window::Mode::Windowed
-        : (mode == display_settings::Borderless ? host_window::Mode::Borderless
-                                                : host_window::Mode::Fullscreen);
-    host_window::ApplyMode(window, hostMode, r.width, r.height);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoA(MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST), &mi);
+    if (mode == display_settings::Windowed)
+    {
+        const DWORD style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+        SetWindowLongA(wnd, GWL_STYLE, LONG(style));
+        RECT frame{ 0, 0, 0, 0 };
+        AdjustWindowRect(&frame, style, FALSE);
+        const int fw = frame.right - frame.left, fh = frame.bottom - frame.top;
+        const RECT& wa = mi.rcWork;
+        const int maxW = (wa.right - wa.left) - fw, maxH = (wa.bottom - wa.top) - fh;
+        int cw = int(r.width), ch = int(r.height);
+        if (cw > maxW || ch > maxH)
+        {
+            const double s = (std::min)(double(maxW) / cw, double(maxH) / ch);
+            cw = int(cw * s);
+            ch = int(ch * s);
+        }
+        const int w = cw + fw, h = ch + fh;
+        SetWindowPos(wnd, HWND_NOTOPMOST, wa.left + ((wa.right - wa.left) - w) / 2, wa.top + ((wa.bottom - wa.top) - h) / 2,
+                     w, h, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    }
+    else
+    {
+        SetWindowLongA(wnd, GWL_STYLE, LONG(WS_POPUP | WS_VISIBLE));
+        const RECT& m = mi.rcMonitor;
+        SetWindowPos(wnd, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    }
     std::fprintf(stderr, "[window] mode %d, resolution %ux%u\n", mode, r.width, r.height);
 }
 
-static unsigned PresentThread(void*)
+static unsigned __stdcall PresentThread(void*)
 {
-    host_window::Window* window = host_window::Open(FB_W, FB_H);
-    if (!window) return 0;
-#ifdef _WIN32
-    host_window_win32::InstallMessageHook(window);
-#endif
-    if (!host_window::GetNativeSurface(window).window) { host_window::Close(window); return 0; }
-    GpuHwSetWindow(window);
+    WNDCLASSA wc = {};
+    wc.lpfnWndProc = GameWndProc;
+    wc.hInstance = GetModuleHandleA(nullptr);
+    wc.lpszClassName = "TTT2Recomp";
+    wc.hCursor = LoadCursorA(nullptr, reinterpret_cast<LPCSTR>(IDC_ARROW));
+    wc.hIcon = LoadIconA(wc.hInstance, MAKEINTRESOURCEA(1));   // game.rc.in
+    RegisterClassA(&wc);
+    RECT rc = { 0, 0, (LONG)FB_W, (LONG)FB_H };
+    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+    int atX = CW_USEDEFAULT, atY = CW_USEDEFAULT;           // TTT2_WINDOW_AT=x,y (tests): start on another monitor
+    if (const char* e = std::getenv("TTT2_WINDOW_AT")) std::sscanf(e, "%d,%d", &atX, &atY);
+    HWND wnd = CreateWindowA("TTT2Recomp", "Tekken Tag Tournament 2 (recomp)",
+                             WS_OVERLAPPEDWINDOW | WS_VISIBLE, atX, atY,
+                             rc.right - rc.left, rc.bottom - rc.top,
+                             nullptr, nullptr, wc.hInstance, nullptr);
+    if (!wnd) return 0;
+    GpuHwSetWindow(wnd);
     if (GpuHwMode())
     {
         // The hardware backend presents through a DXGI swap chain from the CP thread at the
@@ -256,7 +324,12 @@ static unsigned PresentThread(void*)
         uint32_t applied = ~0u;
         for (;;)
         {
-            PumpWindow(window);
+            MSG msg;
+            while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(&msg);
+                DispatchMessageA(&msg);
+            }
             const uint32_t generation = display_settings::Generation();
             // Leaving exclusive fullscreen: the presenter switches back first, or DXGI would
             // restore the window it saved over the new style. While exclusive fullscreen stays on
@@ -266,21 +339,41 @@ static unsigned PresentThread(void*)
             const bool fullscreen = display_settings::GetMode() == display_settings::Fullscreen;
             if (generation != applied && !(exclusive && !fullscreen))
             {
-                if (!exclusive) ApplyWindowMode(window);
+                if (!exclusive) ApplyWindowMode(wnd);
                 applied = generation;
+                // The pointer changes at once for the new mode, not at the next mouse move.
+                POINT at{};
+                if (GetCursorPos(&at) && WindowFromPoint(at) == wnd) SetCursor(GameCursor());
             }
-            host_window::Idle(5);
+            static const bool msgWait = [] { const char* e = std::getenv("TTT2_WINDOW_MSGWAIT"); return e && *e == '1'; }();
+            if (msgWait) MsgWaitForMultipleObjects(0, nullptr, FALSE, 5, QS_ALLINPUT);
+            else std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
     static uint32_t staging[FB_W * FB_H];
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = FB_W;
+    bmi.bmiHeader.biHeight = -(int32_t)FB_H;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
     uint32_t frames = 0;
     for (;;)
     {
-        PumpWindow(window);
+        MSG msg;
+        while (PeekMessageA(&msg, nullptr, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&msg);
+            DispatchMessageA(&msg);
+        }
         if (uint32_t fb = g_frontBufferPhys.load())
         {
             ConvertFrontBuffer(fb, staging);
-            host_window::Blit(window, staging, FB_W, FB_H);
+            HDC dc = GetDC(wnd);
+            StretchDIBits(dc, 0, 0, FB_W, FB_H, 0, 0, FB_W, FB_H,
+                          staging, &bmi, DIB_RGB_COLORS, SRCCOPY);
+            ReleaseDC(wnd, dc);
             // TTT2_FBSEQ=<n>: also keep every n-th presented frame as its own numbered file, so a
             // run produces a filmstrip. A single overwritten dump cannot tell a black screen
             // from an animation caught mid-fade.
@@ -290,7 +383,7 @@ static unsigned PresentThread(void*)
             }();
             if (seqEvery > 0 && frames % seqEvery == 0)
             {
-                DebugDirectory("C:/ttt2/port/fb");
+                CreateDirectoryA("C:/ttt2/port/fb", nullptr);
                 char fp[128];
                 BoundedSnprintf(fp, sizeof(fp), "C:/ttt2/port/fb/frame_%04u.bmp",
                               frames / (uint32_t)seqEvery);
@@ -307,7 +400,7 @@ static unsigned PresentThread(void*)
                     staging[(FB_H / 2) * FB_W + FB_W / 2], nz);
             }
         }
-        host_window::Idle(33);
+        std::this_thread::sleep_for(std::chrono::milliseconds(33));
     }
     return 0;
 }
@@ -467,8 +560,8 @@ static void RetireQueuedFlips()
 {
     const uint32_t dev = g_intrContext.load();
     if (!dev) return;
-    std::atomic_ref<uint32_t> lock(*reinterpret_cast<uint32_t*>(g_base + dev + kFlipLock));
-    while (lock.exchange(1, std::memory_order_acquire) != 0) _mm_pause();
+    volatile long* lock = reinterpret_cast<volatile long*>(g_base + dev + kFlipLock);
+    while (_InterlockedCompareExchange(lock, 1, 0) != 0) _mm_pause();
     const uint32_t tail = GRead32(g_base, dev + kFlipTail), shadow = GRead32(g_base, dev + kScratchShadow);
     uint32_t head = GRead32(g_base, dev + kFlipHead);
     for (; head != tail; ++head)
@@ -481,7 +574,7 @@ static void RetireQueuedFlips()
     GWrite32(g_base, dev + kFlipHead, head);
     const uint32_t now = GRead32(g_base, dev + kVblanks);
     if (int32_t(GRead32(g_base, dev + kLastDue) - now) > 0) GWrite32(g_base, dev + kLastDue, now);   // next swap: next vblank
-    lock.store(0, std::memory_order_release);
+    _InterlockedExchange(lock, 0);
 }
 
 bool GpuRingDrained();
@@ -504,7 +597,7 @@ void GpuUnpaceInFlight()
     const uint32_t through = g_markerSwaps.load();
     g_noPacingThrough.store(through);
     g_retireAt.store(through ? through : 1, std::memory_order_seq_cst);
-    GpuProgress();
+    WakeByAddressAll(&g_gpuProgress);
     if (g_cpMarkers >= through && g_retireAt.exchange(0) != 0) RetireQueuedFlips();
 }
 // `discardInFlight`: the frames already handed over but not executed yet are dropped instead of drawn -
@@ -524,7 +617,7 @@ bool GpuFinishInFlight(int maxMs, bool discardInFlight)
         }
     }
     g_noPacingThrough.store(g_markerSwaps.load());
-    GpuProgress();
+    WakeByAddressAll(&g_gpuProgress);
     const auto start = std::chrono::steady_clock::now();
     const uint32_t pendingAtStart = GpuRingPendingBytes();
     const uint32_t markersAtStart = g_cpMarkers, swapsAtStart = g_markerSwaps.load();
@@ -570,7 +663,7 @@ static void HwPresentFrame(uint32_t fb)
     g_cpPresents.fetch_add(1, std::memory_order_relaxed);
     const auto presentStart = std::chrono::steady_clock::now();
     if (InputTimingOn())
-        std::fprintf(stderr, "[present] #%llu at %.1f ms\n", (unsigned long long)g_cpPresents.load(),
+        std::fprintf(stderr, "[present] #%u at %.1f ms\n", g_cpPresents.load(),
                      std::chrono::duration<double, std::milli>(presentStart.time_since_epoch()).count());
     static uint32_t ramp[256], rampVersion = ~0u;
     if (const uint32_t v = g_gammaVersion.load(); v != rampVersion)
@@ -580,8 +673,6 @@ static void HwPresentFrame(uint32_t fb)
         rampVersion = v;
     }
     if (!fb || !GpuHwPresent(fb, SwizzleSwapsRB(g_frontBufferSwizzle.load()), ramp, rampVersion)) return;
-    frame_benchmark::Present();
-    ttt2_hw::draw_skip_probe::Present();
     if (FrameTimeLog())
     {
         static FrameTimer presents{ "present" };
@@ -610,16 +701,16 @@ static void HwPresentFrame(uint32_t fb)
         return std::string("C:/ttt2/port/fbdump") + (tag ? tag : "") + ".request";
     }();
     bool dump = fbdump == 1 && frames % 60 == 0;
-    if (fbdump == 2 && frames % 10 == 0 && DebugExists(request.c_str()))
+    if (fbdump == 2 && frames % 10 == 0 && GetFileAttributesA(request.c_str()) != INVALID_FILE_ATTRIBUTES)
     {
         unsigned count = 0, every = 1;
-        if (FILE* f = DebugOpen(request.c_str(), "r"))
+        if (FILE* f = std::fopen(request.c_str(), "r"))
         {
             if (std::fscanf(f, "seq %u %u", &count, &every) != 2) count = 0;
             std::fclose(f);
         }
-        if (count) { burstLeft = count; burstEvery = (std::max)(1u, every); burstIndex = 0; DebugRemove(request.c_str()); }
-        else dump = DebugRemove(request.c_str());
+        if (count) { burstLeft = count; burstEvery = (std::max)(1u, every); burstIndex = 0; DeleteFileA(request.c_str()); }
+        else dump = DeleteFileA(request.c_str()) != 0;
     }
     if (seq || dump)
     {
@@ -628,7 +719,7 @@ static void HwPresentFrame(uint32_t fb)
         {
             if (seq)
             {
-                DebugDirectory("C:/ttt2/port/fb");
+                CreateDirectoryA("C:/ttt2/port/fb", nullptr);
                 char fp[128];
                 if (burst)
                 {
@@ -693,7 +784,7 @@ static int EnvInt(const char* name, int dflt)
 static void InitGpuTrace()
 {
     if (g_pm4Trace < 0) g_pm4Trace = EnvInt("TTT2_PM4TRACE", 0);
-    if (g_drawDump < 0) g_drawDump = EnvInt("TTT2_DRAWDUMP", 0);
+    if (g_drawDump < 0) g_drawDump = EnvInt("TTT2_DRAWDUMP", 8);
 }
 
 // TTT2_SHADER_DUMP=1: write each new shader's microcode to port/shaders (bring-up). Off by
@@ -712,11 +803,11 @@ static void DumpShaderBlob(uint32_t type, uint32_t addr, uint32_t sizeDwords)
     static std::unordered_map<uint64_t, bool> seen;
     if (seen.count(h)) return;
     seen[h] = true;
-    DebugDirectory("C:/ttt2/port/shaders");
+    CreateDirectoryA("C:/ttt2/port/shaders", nullptr);
     char path[128];
     BoundedSnprintf(path, sizeof(path), "C:/ttt2/port/shaders/%s_%016llX.bin",
                   type == 0 ? "vs" : "ps", (unsigned long long)h);
-    if (FILE* f = DebugOpen(path, "wb"))
+    if (FILE* f = std::fopen(path, "wb"))
     {
         for (uint32_t i = 0; i < sizeDwords; ++i)
         {
@@ -738,8 +829,8 @@ static void DumpShaderBlob(uint32_t type, uint32_t addr, uint32_t sizeDwords)
 // (big-endian, as they sit in guest memory) because that is what XenosRecomp parses.
 static void SweepShaderContainers()
 {
-    DebugDirectory("C:/ttt2/port/shaders");
-    DebugDirectory("C:/ttt2/port/shaders/containers");
+    CreateDirectoryA("C:/ttt2/port/shaders", nullptr);
+    CreateDirectoryA("C:/ttt2/port/shaders/containers", nullptr);
     struct { uint32_t lo, hi; } ranges[] = {
         { VHEAP_BEGIN, VHEAP_END }, { PHEAP_BEGIN, PHEAP_END } };
     uint32_t found = 0;
@@ -756,7 +847,7 @@ static void SweepShaderContainers()
             char path[160];
             BoundedSnprintf(path, sizeof(path),
                           "C:/ttt2/port/shaders/containers/gc_%08X.bin", a);
-            if (FILE* f = DebugOpen(path, "wb"))
+            if (FILE* f = std::fopen(path, "wb"))
             {
                 std::fwrite(g_base + a, 1, (size_t)dataSize, f);
                 std::fclose(f);
@@ -891,11 +982,11 @@ static void FrameLogSwap()
         std::fprintf(stderr, "[framelog] frame %u written\n", frame - 1);
     }
     if (++check % 30) return;                          // poll the trigger twice a second
-    if (!DebugExists("C:/ttt2/port/framelog.trigger")) return;
-    DebugRemove("C:/ttt2/port/framelog.trigger");
+    if (GetFileAttributesA("C:/ttt2/port/framelog.trigger") == INVALID_FILE_ATTRIBUTES) return;
+    DeleteFileA("C:/ttt2/port/framelog.trigger");
     char path[96];
     BoundedSnprintf(path, sizeof(path), "C:/ttt2/port/framelog_%u.txt", frame);
-    g_frameLog = DebugOpen(path, "w");
+    g_frameLog = std::fopen(path, "w");
     g_frameLogDraws = 0;
     g_gpuFrameNote = g_frameLog ? FrameLogNote : nullptr;
     if (g_frameLog) std::fprintf(g_frameLog, "== frame %u\n", frame);
@@ -936,8 +1027,8 @@ static void FrameLogDraw(uint32_t init)
         std::fprintf(g_frameLog, "    ps hash %016llX\n", (unsigned long long)h);
         char path[128];
         BoundedSnprintf(path, sizeof(path), "C:/ttt2/port/shaders/ps_%016llX.bin", (unsigned long long)h);
-        if (!DebugExists(path))
-            if (FILE* f = DebugOpen(path, "wb"))
+        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+            if (FILE* f = std::fopen(path, "wb"))
             {
                 for (uint32_t i = 0; i < g_curPsSize; ++i)
                 {
@@ -1030,9 +1121,9 @@ static void IssueResolve()
         static int traceLeft = 0;
         traceDumpDest = 0;
         static uint32_t checkTick = 0;
-        if ((++checkTick & 63) == 0 && DebugExists("C:/ttt2/port/resolvelog.trigger"))
+        if ((++checkTick & 63) == 0 && GetFileAttributesA("C:/ttt2/port/resolvelog.trigger") != INVALID_FILE_ATTRIBUTES)
         {
-            DebugRemove("C:/ttt2/port/resolvelog.trigger");
+            DeleteFileA("C:/ttt2/port/resolvelog.trigger");
             traceLeft = 400;
         }
         if (traceLeft > 0)
@@ -1075,7 +1166,7 @@ static void IssueResolve()
             static uint32_t traceDumps = 0;
             if (traceDumps < 40)
             {
-                DebugDirectory("C:/ttt2/port/resolve_trace");
+                CreateDirectoryA("C:/ttt2/port/resolve_trace", nullptr);
                 char path[128];
                 BoundedSnprintf(path, sizeof(path), "C:/ttt2/port/resolve_trace/%03u_%08X_%ux%u_ps%u.bmp",
                                 traceDumps++, destBase, pitch, height, g_curPsSize);
@@ -1085,7 +1176,7 @@ static void IssueResolve()
         if (g_frameLog)
         {
             static uint32_t dumpIndex = 0;
-            DebugDirectory("C:/ttt2/port/framelog_dump");
+            CreateDirectoryA("C:/ttt2/port/framelog_dump", nullptr);
             char path[128];
             BoundedSnprintf(path, sizeof(path), "C:/ttt2/port/framelog_dump/%03u_draw%u_src%u_%08X_%ux%u.bmp",
                             dumpIndex++, g_frameLogDraws, ctrl & 7, destBase, pitch, height);
@@ -1145,11 +1236,11 @@ static void IssueResolve()
             }
             if (worthDumping)
             {
-                DebugDirectory("C:/ttt2/port/tex");
+                CreateDirectoryA("C:/ttt2/port/tex", nullptr);
                 char rp[160];
                 BoundedSnprintf(rp, sizeof(rp), "C:/ttt2/port/tex/resolve_%03X_%08X_%ux%u.bmp",
                               colorBase, destBase, pitch, height);
-                if (FILE* rf = DebugOpen(rp, "wb"))
+                if (FILE* rf = std::fopen(rp, "wb"))
                 {
                     uint32_t isz = pitch * height * 4;
                     uint8_t rh[54] = {};
@@ -1303,24 +1394,6 @@ static void WriteReg(uint32_t reg, uint32_t value)
     if (reg >= 0x1922 && reg <= 0x1925) GammaRegisterWritten(reg, value);
 }
 
-static void WriteRegisterRange(uint32_t reg, uint32_t source, uint32_t count)
-{
-#if defined(TTT2_GEOMETRY_AB_PROBE) && defined(TTT2_ALU_BATCH_EXPERIMENT)
-    // Explicitly opted-in diagnostic experiment only: the downstairs Linux
-    // comparison showed no throughput gain. All default builds use per-word writes.
-    const bool force = (ttt2_hw::geometry_probe::ReferenceMask() & 65536) != 0;
-    // Constant-watch diagnostics need the original per-word sequence/logging.
-    // A wrapping guest source also needs the original uint32_t address arithmetic.
-    if (!force && !CwOn() && uint64_t(source) + uint64_t(count) * 4 <= 0x100000000ull &&
-        ttt2_hw::UploadAluConstants(g_regFile, g_aluEver, g_regSeq, g_regWrites[1], reg,
-            reinterpret_cast<const uint32_t*>(g_base + source),
-            reinterpret_cast<uint32_t*>(g_base + 0x7FC80000u), count))
-        return;
-#endif
-    for (uint32_t i = 0; i < count; ++i)
-        WriteReg(reg + i, GRead32(g_base, source + i * 4));
-}
-
 static void GammaRegisterWritten(uint32_t reg, uint32_t value)
 {
     const auto advance = [] {
@@ -1405,7 +1478,6 @@ struct CpWaitClock
     ~CpWaitClock()
     {
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        frame_pacing_probe::Wait(unsigned(kind), ms, address);
         g_cpTimes.waitMs[kind] += ms;
         ++g_cpTimes.waits[kind];
         if (kind == 1 && FrameTimeLog())
@@ -1435,7 +1507,6 @@ static void TryEarlyPresent(uint32_t waitInfo, uint32_t pollOn)
         return;
     const uint32_t fbSurf = g_markerFb[pending & 15].load();
     if (!fbSurf || g_frontArgsAt + 1 != g_cpMarkers || g_frontArgs.dest != (fbSurf & ~0xFFFu)) return;
-    frame_pacing_probe::Ready(pending);
     const FrontResolveArgs& a = g_frontArgs;
     GpuHwResolve(a.key, a.dest, a.pitch, a.height, a.hasLatch, a.latch, a.swap, a.src, a.depthBase, a.depthFloat, a.format);
     g_earlyArgs = a;
@@ -1657,7 +1728,7 @@ static uint32_t LatchImmediateShader(uint32_t stage, uint32_t source, uint32_t w
         std::fprintf(stderr, "[pm4-fault] invalid immediate shader upload stage=%u source=%08X words=%u\n",
                      stage, source, words);
         std::fflush(stderr);
-        LogDrain(); host_process::ExitNow(6);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
         std::abort();
     }
     uint32_t& destination = programs[stage == 0 ? 0 : 1];
@@ -1668,7 +1739,7 @@ static uint32_t LatchImmediateShader(uint32_t stage, uint32_t source, uint32_t w
         {
             std::fputs("[pm4-fault] cannot allocate shader program storage\n", stderr);
             std::fflush(stderr);
-            LogDrain(); host_process::ExitNow(6);
+            LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
             std::abort();
         }
         destination = GuestAddr(g_base, allocation);
@@ -1703,7 +1774,7 @@ static void CheckPacketBoundary(uint32_t address, uint32_t header, uint32_t star
                      GRead32(g_base, uint32_t(p)), GRead32(g_base, uint32_t(p + 4)),
                      GRead32(g_base, uint32_t(p + 8)), GRead32(g_base, uint32_t(p + 12)));
     std::fflush(stderr);
-    LogDrain(); host_process::ExitNow(6);
+    LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
     std::abort();
 }
 
@@ -1717,7 +1788,7 @@ static bool CpProfileOn()
 }
 static int64_t g_cpOpTicks[129] = {};
 static uint64_t g_cpOpCount[129] = {};
-static int64_t CpQpc() { return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static int64_t CpQpc() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 struct CpOpTimer
 {
     int op; int64_t t0;
@@ -1728,19 +1799,19 @@ static void CpProfileReport()
 {
     static uint32_t swaps = 0;
     if (!CpProfileOn() || ++swaps % 600 != 0) return;
-    constexpr double ticksPerSecond = 1e9;
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
     std::vector<std::pair<int64_t, int>> order;
     int64_t total = 0;
     for (int i = 0; i < 129; ++i) if (g_cpOpCount[i]) { order.push_back({ g_cpOpTicks[i], i }); total += g_cpOpTicks[i]; }
     std::sort(order.rbegin(), order.rend());
     char line[1024];
-    int n = std::snprintf(line, sizeof(line), "[cp-profile] %.2f ms per frame in packets:", double(total) * 1000.0 / ticksPerSecond / 600.0);
+    int n = std::snprintf(line, sizeof(line), "[cp-profile] %.2f ms per frame in packets:", double(total) * 1000.0 / double(f.QuadPart) / 600.0);
     for (size_t k = 0; k < order.size() && k < 12 && n < 900; ++k)
     {
         const int i = order[k].second;
         n += std::snprintf(line + n, sizeof(line) - n, " %s%02X=%.2fms(%llu/f,%.1fus)", i == 128 ? "swap" : "op", i == 128 ? 0 : i,
-                           double(g_cpOpTicks[i]) * 1000.0 / ticksPerSecond / 600.0, (unsigned long long)(g_cpOpCount[i] / 600),
-                           double(g_cpOpTicks[i]) * 1e6 / ticksPerSecond / double(g_cpOpCount[i]));
+                           double(g_cpOpTicks[i]) * 1000.0 / double(f.QuadPart) / 600.0, (unsigned long long)(g_cpOpCount[i] / 600),
+                           double(g_cpOpTicks[i]) * 1e6 / double(f.QuadPart) / double(g_cpOpCount[i]));
     }
     std::fprintf(stderr, "%s\n", line);
     std::memset(g_cpOpTicks, 0, sizeof(g_cpOpTicks));
@@ -1900,7 +1971,7 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
         std::fprintf(stderr, "[pm4-fault] invalid stream range %08X+%X d=%d\n",
                      addr, sizeBytes, depth);
         std::fflush(stderr);
-        LogDrain(); host_process::ExitNow(6);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
         std::abort();
     }
     uint32_t start = addr;
@@ -1950,14 +2021,9 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                 std::fprintf(stderr, "[vd] early present off: marker %u surface %08X, recorded %08X\n",
                              g_cpMarkers, fbSurf, g_markerFb[g_cpMarkers & 15].load());
             }
-            if (GpuHwMode() && !early && !discarded)
-            {
-                frame_pacing_probe::Ready(g_cpMarkers);
-                HwPresentFrame(g_frontBufferPhys.load());
-            }
+            if (GpuHwMode() && !early && !discarded) HwPresentFrame(g_frontBufferPhys.load());
             FrameLogSwap();
             PhysMirrorInvalidateAll();                           // frame boundary
-            frame_pacing_probe::TraceFrame(g_cpMarkers, frame_pacing_probe::lastTickUs.load());
             static int slog = 0;
             if (slog < 8)
             {
@@ -2044,7 +2110,8 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                     reg = (bank < 5 ? base[bank] : 0x2000) + idx;
                 }
                 else reg = d0 & 0xFFFF;
-                WriteRegisterRange(reg, addr + 4, cnt - 1);
+                for (uint32_t i = 1; i < cnt; ++i)
+                    WriteReg(reg + i - 1, GRead32(g_base, addr + i * 4));
                 static int sclog = 0;
                 if (sclog < 40)
                 {
@@ -2062,7 +2129,8 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                 GpuNoteMemory(3, src, n * 4);
                 static const uint32_t base[5] = { 0x4000, 0x4800, 0x4900, 0x4908, 0x2000 };
                 uint32_t reg = (bank < 5 ? base[bank] : 0x2000) + idx;
-                WriteRegisterRange(reg, src, n);
+                for (uint32_t i = 0; i < n && i < 4096; ++i)
+                    WriteReg(reg + i, GRead32(g_base, src + i * 4));
                 static int lalog = 0;
                 if (lalog < 20)
                 {
@@ -2247,7 +2315,7 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                 // Continuing previously called the intentionally disarmed callback.
                 std::fputs("[pm4-fault] fence wait failed; stopping command execution\n", stderr);
                 std::fflush(stderr);
-                LogDrain(); host_process::ExitNow(6);
+                LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
                 std::abort();
             }
             }
@@ -2311,9 +2379,8 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                 std::fprintf(stderr, "[cw] c128 payload at guest %08X (T0 reg=%04X cnt=%u)\n",
                              addr + (0x4200 - reg) * 4, reg, cnt);
             }
-            if (!oneReg) WriteRegisterRange(reg, addr, cnt);
-            else for (uint32_t i = 0; i < cnt; ++i)
-                WriteReg(reg, GRead32(g_base, addr + i * 4));
+            for (uint32_t i = 0; i < cnt; ++i)
+                WriteReg(oneReg ? reg : reg + i, GRead32(g_base, addr + i * 4));
             addr += cnt * 4;
         }
         else if (type == 1)                                      // two independent registers
@@ -2357,7 +2424,7 @@ static void ConsumeRing()
                 {
                     std::fputs("[pm4-fault] cannot allocate wrapped-packet staging\n", stderr);
                     std::fflush(stderr);
-                    LogDrain(); host_process::ExitNow(6);
+                    LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
                     std::abort();
                 }
                 staging = GuestAddr(g_base, allocation);
@@ -2374,7 +2441,7 @@ static void ConsumeRing()
             rb + result.offset, result.header, result.required, result.remaining,
             rb, rs, g_ringRptr.load(), wptrOff);
         std::fflush(stderr);
-        LogDrain(); host_process::ExitNow(6);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
         std::abort();
     }
     g_ringRptr.store(result.offset);
@@ -2491,10 +2558,14 @@ static void ScanOrthoPattern(uint32_t lo, uint32_t hi, const char* tag)
         // null guard, stack guards) fault on a raw read - and this runs on the vblank thread
         // with no SEH net (measured: the first version killed the thread at exactly the scan
         // tick). Walk regions and only touch plainly readable ones.
-        size_t regionBytes = 0;
-        bool readable = false;
-        if (!host_vm::QueryReadRegion(g_base + a, hi - a, regionBytes, readable)) break;
-        uint32_t regEnd = a + static_cast<uint32_t>(regionBytes);
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(g_base + a, &mbi, sizeof(mbi))) break;
+        uint32_t regEnd = (uint32_t)std::min<uint64_t>(
+            (uint64_t)((uint8_t*)mbi.BaseAddress - g_base) + mbi.RegionSize, hi);
+        bool readable = mbi.State == MEM_COMMIT &&
+                        !(mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) &&
+                        (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE |
+                                        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE));
         if (!readable || regEnd <= a + 64) { a = regEnd ? regEnd : hi; continue; }
         const void* f = std::memchr(g_base + a, 0x3A, (size_t)(regEnd - a - 60));
         if (!f) break;
@@ -2521,48 +2592,21 @@ void VideoSetVblankStretch(int32_t us) { g_vblankStretchUs.store(us < 0 ? 0 : us
 static void VideoTick()
 {
     using clock = std::chrono::steady_clock;
-    // Development throughput probe: keep the normal 60 Hz clock unless a
-    // caller explicitly requests a higher guest vblank rate. This accelerates
-    // guest frame pacing; it does not provide normal-speed high-refresh play.
-    int refreshHz = std::clamp(EnvInt("TTT2_VIDEO_HZ", 60), 1, 10000);
-    auto period = std::chrono::microseconds((1000000 + refreshHz / 2) / refreshHz);
-    auto spinMargin = (std::min)(std::chrono::microseconds(1500), period / 8);
-    host_deadline::Waiter deadlineWaiter;
-    if (refreshHz != 60)
-        std::fprintf(stderr, "[vd] throughput probe: guest vblank %d Hz; simulation pacing may accelerate\n", refreshHz);
-    const char* refreshFile = std::getenv("TTT2_VIDEO_HZ_FILE");
-    auto next = clock::now(), lastRefreshPoll = next;
+    auto next = clock::now();
+    // TTT2_TEST_VBLANK_US=<period> (tests): another vblank period - an instance that runs slower than 60 Hz
+    // for good (the time sync's two-instance tests).
+    static const int periodUs = [] { const char* e = std::getenv("TTT2_TEST_VBLANK_US"); const int v = e ? std::atoi(e) : 0; return v >= 8000 && v <= 40000 ? v : 16667; }();
     for (;;)
     {
-        // Optional live probe control lets menu navigation run at normal speed.
-        // Poll by wall time so high refresh rates do not amplify file I/O.
-        if (refreshFile && clock::now() - lastRefreshPoll >= std::chrono::seconds(1))
-        {
-            lastRefreshPoll = clock::now();
-            int requested = refreshHz;
-            if (FILE* f = std::fopen(refreshFile, "r"))
-            {
-                if (std::fscanf(f, "%d", &requested) != 1) requested = refreshHz;
-                std::fclose(f);
-            }
-            if (requested >= 1 && requested <= 10000 && requested != refreshHz)
-            {
-                refreshHz = requested;
-                period = std::chrono::microseconds((1000000 + refreshHz / 2) / refreshHz);
-                spinMargin = (std::min)(std::chrono::microseconds(1500), period / 8);
-                next = clock::now();
-                std::fprintf(stderr, "[vd] throughput probe: guest vblank changed to %d Hz\n", refreshHz);
-            }
-        }
-        // Keep a fixed vblank schedule: work and sleep overshoot must not extend
-        // the frame period. Learn a conservative sleep margin, then yield until
-        // the original deadline.
-        next += period + std::chrono::microseconds(g_vblankStretchUs.load(std::memory_order_relaxed));
-        const auto pacingDeadline = next;
-        deadlineWaiter.Wait(next, spinMargin);
-        const auto pacingWoke = clock::now();
-        int pacingStalls = 0;
-        bool pacingReanchored = false;
+        // A FIXED 59.94/60 Hz schedule: the game paces its frames to these vblanks, so the
+        // period must not stretch. (Measured 2026-10-11: re-anchoring to now() on every tick
+        // added the tick's own work plus the ~1 ms sleep overshoot to each period, so the
+        // "60 Hz" vblank ran slow and capped the game below 60 fps.) Sleep coarsely to ~1.5 ms
+        // before the deadline, then yield-spin to it. Only a session's time sync stretches it.
+        next += std::chrono::microseconds(periodUs + g_vblankStretchUs.load(std::memory_order_relaxed));
+        if (next - clock::now() > std::chrono::microseconds(1500))
+            std::this_thread::sleep_until(next - std::chrono::microseconds(1500));
+        while (clock::now() < next) std::this_thread::yield();
         if (FrameTimeLog())
         {
             static FrameTimer vblanks{ "vblank" };
@@ -2609,9 +2653,7 @@ static void VideoTick()
             }
             // Re-anchor only after a stall (or if this thread fell more than a frame behind):
             // otherwise keep the fixed schedule.
-            pacingStalls = stalls;
-            pacingReanchored = stalls || clock::now() - next > period;
-            if (pacingReanchored) next = clock::now();
+            if (stalls || clock::now() - next > std::chrono::microseconds(16667)) next = clock::now();
         }
 
         // Segment retirement and rptr writeback are handled by the CP thread executing
@@ -2642,12 +2684,8 @@ static void VideoTick()
             // raised exclusively by CP_INTERRUPT packets (the ISR calls [shadow+16]
             // unconditionally, which holds 0x0BADF00D between fence sequences).
             GuestSetCurrentCpu(0);
-            const auto pacingDispatch = clock::now();
-            frame_pacing_probe::Dispatch(pacingDispatch);
             GuestCall2(cb, 0, ctxArg);
             GpuProgress();
-            frame_pacing_probe::Tick(pacingDeadline, pacingWoke, pacingDispatch, clock::now(),
-                                     refreshHz, pacingStalls, pacingReanchored);
             if (ticks % 600 == 0)
             {
                 uint32_t rb2 = g_ringBase.load(), rs2 = g_ringSize.load(), dev2 = g_intrContext.load();
@@ -2966,7 +3004,7 @@ PPC_FUNC(__imp__VdSwap)
     {
         static FrameTimer swaps{ "swap" };
         swaps.Mark();
-        static const bool once = (std::fprintf(stderr, "[frame] VdSwap thread %u\n", host_thread::CurrentId()), true);
+        static const bool once = (std::fprintf(stderr, "[frame] VdSwap thread %lu\n", GetCurrentThreadId()), true);
         (void)once;
     }
     static int swaps = 0;
@@ -2997,7 +3035,6 @@ PPC_FUNC(__imp__VdSwap)
         for (int i = 5; i < 64; ++i) GWrite32(base, p + i * 4, 0x80000000u);
         const uint32_t n = g_markerSwaps.load() + 1;
         g_markerFb[n & 15].store(surface);
-        frame_pacing_probe::Published(n);
         g_markerSwaps.store(n);
         GpuProgress();                                  // a CP waiting for the vblank can present it now
     }
@@ -3104,11 +3141,11 @@ PPC_FUNC(__imp__VdPersistDisplay)
 // Timeline dump (TTT2_TIMELINE=1): the last 3 seconds of events to C:/ttt2/port/timeline.txt.
 void timeline::PollDumpTrigger()
 {
-    if (!DebugExists("C:/ttt2/port/timeline.trigger")) return;
-    DebugRemove("C:/ttt2/port/timeline.trigger");
+    if (GetFileAttributesA("C:/ttt2/port/timeline.trigger") == INVALID_FILE_ATTRIBUTES) return;
+    DeleteFileA("C:/ttt2/port/timeline.trigger");
     const uint64_t end = Next().load(), now = NowUs();
     const uint64_t first = end > kEntries ? end - kEntries : 0;
-    FILE* f = DebugOpen("C:/ttt2/port/timeline.txt", "w");
+    FILE* f = std::fopen("C:/ttt2/port/timeline.txt", "w");
     if (!f) return;
     uint64_t start = first;
     while (start < end && Ring()[start & (kEntries - 1)].us + 3000000 < now) ++start;

@@ -4,11 +4,7 @@
 // texture tracker blind (MEASURED 2026-10-18: fighters drawn with garbage textures). So every
 // consumer publishes the pages it read, and the others drain those along with their own reads.
 #include "kernel_shared.h"
-#include "host_thread.h"
-#include "host_vm.h"
-#if defined(_WIN32)
 #include <windows.h>
-#endif
 #include <atomic>
 #include <vector>
 
@@ -20,7 +16,7 @@ std::atomic<bool> g_any[kConsumers];
 } // namespace
 
 // Pages consumer `self` just read (and reset) with GetWriteWatch: flagged for the other consumers.
-void WriteWatchPublish(int self, void* const* pages, size_t count)
+void WriteWatchPublish(int self, const PVOID* pages, size_t count)
 {
     if (!count) return;
     for (int c = 0; c < kConsumers; ++c)

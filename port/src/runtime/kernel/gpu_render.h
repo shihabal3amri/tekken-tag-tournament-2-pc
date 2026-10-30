@@ -8,8 +8,6 @@
 // where the game's own front-buffer texture fetch constant points.
 #include <cstdint>
 
-namespace host_window { struct Window; }
-
 // One bound shader: guest address of its microcode plus its length in dwords.
 struct GpuShader
 {
@@ -32,8 +30,8 @@ bool GpuReadEdram(uint32_t colorBase, uint32_t pitch, uint32_t height, uint32_t*
 uint64_t GpuLitDraws();
 void GpuFillEdram(uint32_t colorBase, uint32_t pitch, uint32_t height, uint32_t argb);
 
-// Optional hardware backend (currently D3D11 on Windows). TTT2_GPU_HW=1 renders
-// on the GPU, while TTT2_GPU_HW=compare also runs the CPU renderer.
+// Hardware (D3D11) backend - gpu_hw_d3d11.h. TTT2_GPU_HW=1 renders on the GPU,
+// TTT2_GPU_HW=compare also runs the CPU renderer and compares every resolve.
 // GpuHwMode: 0 off (CPU renderer), 1 hardware, 2 compare.
 int GpuHwMode();
 // srcSelect: RB_COPY_CONTROL.copy_src_select (4 = depth from depthBase, RB_DEPTH_INFO base);
@@ -48,7 +46,7 @@ bool GpuHwPresent(uint32_t frontBuffer, bool displaySwapRB, const uint32_t* gamm
 bool GpuHwReadFrontBuffer(uint32_t* bgrx1280x720);
 // The swap chain is in exclusive fullscreen (display_settings Fullscreen, window in front).
 bool GpuHwIsExclusiveFullscreen();
-void GpuHwSetWindow(host_window::Window* window);
+void GpuHwSetWindow(void* window);
 bool GpuHwDumpResolved(uint32_t destBase, const char* bmpPath);   // diagnostics
 // Write GPU-only resolves overlapping [start, start + size) into guest memory before the CPU
 // reads them (callable from any thread; the backend serialises itself).

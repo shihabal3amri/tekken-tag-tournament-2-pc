@@ -54,7 +54,7 @@ def main():
         ha, hb = sha1(a), sha1(b)
         print(f"{'OK      ' if ha == hb else 'DIFFER  '} {rel}  {ha}")
         bad += ha != hb
-    for n in ("Tekken Tag Tournament 2.exe", "steam_api64.dll", "SDL3.dll", "msvcp140.dll", "msvcp140_atomic_wait.dll",
+    for n in ("Tekken Tag Tournament 2.exe", "steam_api64.dll", "msvcp140.dll", "msvcp140_atomic_wait.dll",
               "vcruntime140.dll", "vcruntime140_1.dll", "README.txt"):
         if not os.path.isfile(os.path.join(install, n)):
             print(f"MISSING  {n}"); bad += 1

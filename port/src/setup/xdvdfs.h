@@ -7,7 +7,7 @@
 // (0xFD90000), or a rebuilt / trimmed one (0).
 #pragma once
 
-#include "setup/input_file.h"
+#include <windows.h>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -26,10 +26,7 @@ public:
     ~XdvdfsImage() { Close(); }
 
     // Opens the image and enumerates the whole tree. `err` gets a user-facing reason on failure.
-    bool Open(const std::filesystem::path& path, std::string& err);
-#ifndef _WIN32
-    bool OpenFd(int fd, std::string& err);
-#endif
+    bool Open(const wchar_t* isoPath, std::string& err);
     void Close();
 
     uint64_t PartitionBase() const { return base_; }
@@ -43,8 +40,7 @@ public:
 private:
     bool WalkDir(uint32_t sector, uint32_t bytes, const std::string& prefix, int depth, std::string& err);
 
-    InputFile file_;
-    bool Parse(std::string& err);
+    HANDLE   h_ = INVALID_HANDLE_VALUE;
     uint64_t imageSize_ = 0;
     uint64_t base_ = 0;
     std::vector<IsoEntry> entries_;

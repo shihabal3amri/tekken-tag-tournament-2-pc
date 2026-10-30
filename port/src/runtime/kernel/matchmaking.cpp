@@ -1,5 +1,6 @@
 // Session discovery (matchmaking.h): the folder backend.
-#include "host_settings.h"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include "matchmaking.h"
 #include "community_net.h"
 #include "net_transport.h"
@@ -31,7 +32,9 @@ std::shared_ptr<community::Client> Server() { return net::Community(); }
 
 std::filesystem::path Folder()
 {
-    return host_settings::Path().parent_path() / "net" / "sessions";
+    const wchar_t* local = _wgetenv(L"LOCALAPPDATA");
+    std::filesystem::path p = local && *local ? std::filesystem::path(local) : std::filesystem::temp_directory_path();
+    return p / L"TTT2Recomp" / L"net" / L"sessions";
 }
 std::filesystem::path FileOf(uint64_t id)
 {

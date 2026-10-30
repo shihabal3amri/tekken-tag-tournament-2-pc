@@ -10,7 +10,7 @@
 // the order and the cancel in re/srv_tools traces, TTT2_GIN_TRACE=1). So the ghost task also waits for this match's
 // ghost step, at most kGhostStepWaitMs (the close-game state waits for the uploads, so never longer).
 #include "kernel_shared.h"
-#include "community_platform.h"
+#include <windows.h>
 #include <atomic>
 #include <cstdio>
 

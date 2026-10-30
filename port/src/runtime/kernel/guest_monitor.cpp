@@ -19,7 +19,7 @@
 #include "timeline.h"
 #include <atomic>
 #include <cstdlib>
-#include <immintrin.h>
+#include <intrin.h>
 
 bool KernelEventHasWaiters(uint32_t handle);   // kernel_objects.cpp
 void RollbackNoteJobObject(uint32_t addr, uint32_t size);   // rollback.cpp: never rewound
@@ -73,7 +73,7 @@ PPC_FUNC(sub_82AE4438)
 // caller last looked, at most 1 ms (the game's own hang check still runs every step).
 // TTT2_GPU_WAIT=0 runs the game's spin.
 extern std::atomic<uint32_t> g_gpuProgress;
-bool WaitGpuProgress(uint32_t seen, uint32_t ms);   // kernel_video.cpp
+bool WaitGpuProgress(uint32_t seen, unsigned long ms);   // kernel_video.cpp
 
 extern "C" PPC_FUNC(__imp__sub_8273D4A0);
 PPC_FUNC(sub_8273D4A0)

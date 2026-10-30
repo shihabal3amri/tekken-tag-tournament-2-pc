@@ -4,16 +4,18 @@
 // exclusion; no-op locking let the GC zero live objects out from under other threads.
 #include "kernel_shared.h"
 #include "kernel_trace.h"
-#include "../host_thread.h"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <intrin.h>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 PPC_FUNC(__imp__KeGetCurrentProcessType)
 {
@@ -124,7 +126,7 @@ PPC_FUNC(__imp__RtlEnterCriticalSection)
     if (!cs.m.try_lock())
     {
         auto t0 = std::chrono::steady_clock::now();
-        const unsigned long self = host_thread::CurrentId();
+        const unsigned long self = GetCurrentThreadId();
         {
             std::lock_guard l(g_csWaitLock);
             g_csWaiting[self] = CsWait{ &cs, t0, false };
@@ -153,8 +155,8 @@ PPC_FUNC(__imp__RtlEnterCriticalSection)
         }
     }
     cs.ownerLr.store((uint32_t)ctx.lr, std::memory_order_relaxed);
-    cs.ownerTid.store(host_thread::CurrentId(), std::memory_order_relaxed);
-    cs.holder.store(host_thread::CurrentId(), std::memory_order_relaxed);
+    cs.ownerTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    cs.holder.store(GetCurrentThreadId(), std::memory_order_relaxed);
     ++cs.depth;
 }
 // Is host thread `tid` blocked on a critical section that host thread `owner` holds?
@@ -175,7 +177,7 @@ bool CsThreadBlockedBy(unsigned long tid, unsigned long owner, uint32_t* section
 int CsLend(uint32_t ga, uint32_t& lr)
 {
     CsEntry& cs = CsFor(ga);
-    if (cs.holder.load(std::memory_order_relaxed) != host_thread::CurrentId()) return 0;
+    if (cs.holder.load(std::memory_order_relaxed) != GetCurrentThreadId()) return 0;
     const int depth = cs.depth;
     lr = cs.ownerLr.load(std::memory_order_relaxed);
     cs.depth = 0;
@@ -196,12 +198,12 @@ void CsReclaim(uint32_t ga, int depth, uint32_t lr)
             std::fprintf(stderr, "[cs] section %08X lent by rollback's job wait: still held by thread %lu after 100 ms\n", ga,
                          cs.holder.load(std::memory_order_relaxed));
         }
-        std::this_thread::yield();
+        SwitchToThread();
     }
     for (int i = 1; i < depth; ++i) cs.m.lock();
     cs.depth = depth;
-    cs.holder.store(host_thread::CurrentId(), std::memory_order_relaxed);
-    cs.ownerTid.store(host_thread::CurrentId(), std::memory_order_relaxed);
+    cs.holder.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    cs.ownerTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
     cs.ownerLr.store(lr, std::memory_order_relaxed);
 }
 PPC_FUNC(__imp__RtlLeaveCriticalSection)
@@ -223,8 +225,8 @@ PPC_FUNC(__imp__RtlTryEnterCriticalSection)
     if (got)
     {
         cs.ownerLr.store((uint32_t)ctx.lr, std::memory_order_relaxed);
-        cs.ownerTid.store(host_thread::CurrentId(), std::memory_order_relaxed);
-        cs.holder.store(host_thread::CurrentId(), std::memory_order_relaxed);
+        cs.ownerTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        cs.holder.store(GetCurrentThreadId(), std::memory_order_relaxed);
         ++cs.depth;
     }
     ctx.r3.u32 = got ? 1 : 0;
@@ -240,22 +242,12 @@ PPC_FUNC(__imp__KeLeaveCriticalRegion)
 // Inlined game code uses lwarx/stwcx on the same word; both sides agree on 0/nonzero. ---
 static void SpinAcquire(uint8_t* base, uint32_t ga)
 {
-    // The first 64 KiB are the guarded null region, not a usable lock word.
-    if (ga <= 0x10000u - sizeof(uint32_t)) return;
-    std::atomic_ref<uint32_t> lock(*reinterpret_cast<uint32_t*>(base + ga));
-    uint32_t expected = 0;
-    while (!lock.compare_exchange_weak(expected, 1, std::memory_order_acquire,
-                                       std::memory_order_relaxed))
-    {
-        expected = 0;
-        host_thread::Pause();
-    }
+    volatile long* p = reinterpret_cast<volatile long*>(base + ga);
+    while (_InterlockedCompareExchange(p, 1, 0) != 0) _mm_pause();
 }
 static void SpinRelease(uint8_t* base, uint32_t ga)
 {
-    if (ga <= 0x10000u - sizeof(uint32_t)) return;
-    std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(base + ga))
-        .store(0, std::memory_order_release);
+    _InterlockedExchange(reinterpret_cast<volatile long*>(base + ga), 0);
 }
 
 PPC_FUNC(__imp__KfAcquireSpinLock)

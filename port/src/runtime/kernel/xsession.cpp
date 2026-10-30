@@ -2,8 +2,9 @@
 // (port/ONLINE_PLAN.md). Host sessions that use matchmaking or the peer network are published
 // through matchmaking.h; searches and searches by id read them back. Stats stay in memory.
 // Layouts: scratch xenia_netplay_reference.md section 2 / 4 (all guest structs big-endian).
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include "kernel_shared.h"
-#include <cstdarg>
 #include "kernel_trace.h"
 #include "profiles.h"
 #include "xlive.h"
@@ -47,9 +48,13 @@ void Write64(uint8_t* base, uint32_t a, uint64_t v) { GWrite32(base, a, uint32_t
 
 void Log(const std::string& key, const char* fmt, ...)
 {
-    static const bool trace = std::getenv("TTT2_XLIVE_TRACE") != nullptr;
-    if (!trace) return;
-    (void)key;
+    static std::mutex m;
+    static std::set<std::string> seen;
+    static const bool all = std::getenv("TTT2_XLIVE_TRACE") != nullptr;
+    {
+        std::lock_guard l(m);
+        if (!all && !seen.insert(key).second) return;
+    }
     char line[512];
     va_list args;
     va_start(args, fmt);

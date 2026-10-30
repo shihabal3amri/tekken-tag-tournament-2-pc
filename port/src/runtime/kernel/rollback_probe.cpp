@@ -6,11 +6,7 @@
 // treats every range as written (it shares the write-watch bits), so textures re-upload on every
 // use - slower, but the picture stays right.
 #include "kernel_shared.h"
-#include "host_thread.h"
-#include "host_vm.h"
-#if defined(_WIN32)
 #include <windows.h>
-#endif
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -33,8 +29,6 @@ bool InputBacktraceOn()
     static const bool on = [] { const char* e = std::getenv("TTT2_INPUT_BT"); return e && *e == '1'; }();
     return on;
 }
-
-void WriteWatchPublish(int self, void* const* pages, size_t count);
 
 namespace {
 std::atomic<uint32_t> g_inputCalls{ 0 };
@@ -63,7 +57,7 @@ void InputBacktrace(PPCContext& ctx, uint32_t player)
     std::lock_guard l(m);
     if (!seen.insert(key).second || seen.size() > 2000) return;
     char line[600];
-    int n = std::snprintf(line, sizeof(line), "[inputbt] tid %u player %u swap %u obj %08X:", host_thread::CurrentId(), player, g_swapCount, ctx.r3.u32);
+    int n = std::snprintf(line, sizeof(line), "[inputbt] tid %lu player %u swap %u obj %08X:", GetCurrentThreadId(), player, g_swapCount, ctx.r3.u32);
     for (int i = 0; i < depth; ++i) n += std::snprintf(line + n, sizeof(line) - n, " %08X", chain[i]);
     std::fprintf(stderr, "%s\n", line);
 }
@@ -75,7 +69,7 @@ void LogGuestAlloc(const char* what, uint32_t addr, uint32_t size, PPCContext& c
     static const bool on = [] { const char* e = std::getenv("TTT2_ALLOC_LOG"); return e && *e == '1'; }();
     if (!on) return;
     char line[400];
-    int n = std::snprintf(line, sizeof(line), "[alloc] %s %08X+%X tid %u:", what, addr, size, host_thread::CurrentId());
+    int n = std::snprintf(line, sizeof(line), "[alloc] %s %08X+%X tid %lu:", what, addr, size, GetCurrentThreadId());
     n += std::snprintf(line + n, sizeof(line) - n, " %08X", uint32_t(ctx.lr));
     uint32_t frame = ctx.r1.u32;
     for (int i = 0; i < 10 && frame && frame < 0xFFFFFFF0u; ++i)
@@ -99,16 +93,16 @@ void DirtyMeasureFrame()
         lastCalls = calls;
     }
     if (!DirtyMeasureOn() || !g_base) return;
-    static std::vector<void*> pages(1u << 20);
+    static std::vector<PVOID> pages(1u << 20);
     static uint64_t frames = 0;
     static double sum[16] = {}, peak[16] = {};
     static std::map<uint32_t, uint64_t> blocks;      // 1 MB block -> pages written (summed)
-    size_t count = pages.size();
-    if (!host_vm::TakeWriteWatch(g_base, 0x100000000ull, pages.data(), pages.size(), count, true)) return;
-    WriteWatchPublish(1, pages.data(), count);
+    ULONG_PTR count = pages.size();
+    DWORD granularity = 0;
+    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, g_base, 0x100000000ull, pages.data(), &count, &granularity) != 0) return;
     if (frames++ == 0) return;                       // the first read covers everything since boot
     uint32_t perRegion[16] = {};
-    for (size_t i = 0; i < count; ++i)
+    for (ULONG_PTR i = 0; i < count; ++i)
     {
         const uint32_t guest = uint32_t(static_cast<uint8_t*>(pages[i]) - g_base);
         ++perRegion[guest >> 28];

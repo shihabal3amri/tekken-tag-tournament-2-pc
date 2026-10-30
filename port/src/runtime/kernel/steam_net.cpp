@@ -4,6 +4,8 @@
 // the frame, routes call results to waiters (by SteamAPICall_t), accepts peer sessions, turns
 // "Join Game" requests into pending invites, and drains SteamNetworkingMessages to the receiver.
 // Other threads only issue requests and wait on the results it stores.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include "steam_net.h"
 #include "net_transport.h"
 #include <algorithm>
@@ -21,9 +23,6 @@
 #include <unordered_map>
 
 #if TTT2_HAVE_STEAM
-#if defined(_WIN32)
-#include <windows.h>
-#endif
 #include "steam/steam_api.h"
 #include "steam/isteamnetworkingmessages.h"
 #include "steam/isteamnetworkingutils.h"
@@ -183,7 +182,7 @@ void ReportPeers()
 
 void WriteLobbyData(uint64_t lobby, const std::vector<uint8_t>& record)
 {
-    CSteamID id(static_cast<uint64>(lobby));
+    CSteamID id(lobby);
     SteamMatchmaking()->SetLobbyData(id, "proto", Protocol());
     SteamMatchmaking()->SetLobbyData(id, "rec", Hex(record).c_str());
 }
@@ -210,9 +209,7 @@ void Service()
                     std::lock_guard l(g_mutex);
                     // A hosted lobby being created: store its id and write the data.
                     bool hostedCall = false;
-                    for (auto& entry : g_hosted)
-                    {
-                        auto& h = entry.second;
+                    for (auto& [sid, h] : g_hosted)
                         if (h.pending == done->m_hAsyncCall)
                         {
                             hostedCall = true;
@@ -221,14 +218,14 @@ void Service()
                             if (created->m_eResult == k_EResultOK)
                             {
                                 h.lobby = created->m_ulSteamIDLobby;
-                                if (h.removed) SteamMatchmaking()->LeaveLobby(CSteamID(static_cast<uint64>(h.lobby)));
+                                if (h.removed) SteamMatchmaking()->LeaveLobby(CSteamID(h.lobby));
                                 else WriteLobbyData(h.lobby, h.record);
-                                std::fprintf(stderr, "[steam] lobby hosts session\n");
+                                std::fprintf(stderr, "[steam] lobby %016llX hosts session %016llX\n",
+                                             (unsigned long long)h.lobby, (unsigned long long)sid);
                             }
                             else
                                 std::fprintf(stderr, "[steam] CreateLobby failed (%d)\n", int(created->m_eResult));
                         }
-                    }
                     if (!hostedCall) g_results[done->m_hAsyncCall] = std::move(result);
                     g_cv.notify_all();
                 }
@@ -276,7 +273,7 @@ void Service()
                 g_joinLobby = j->m_steamIDLobby.ConvertToUint64();
                 g_joinReady = false;
                 SteamMatchmaking()->RequestLobbyData(j->m_steamIDLobby);
-                std::fprintf(stderr, "[steam] Join Game request received\n");
+                std::fprintf(stderr, "[steam] Join Game request: lobby %016llX\n", (unsigned long long)g_joinLobby);
             }
             else if (cb.m_iCallback == LobbyDataUpdate_t::k_iCallback)
             {
@@ -285,7 +282,7 @@ void Service()
                 g_lobbyData[u->m_ulSteamIDLobby] = u->m_bSuccess != 0;
                 if (u->m_ulSteamIDLobby == g_joinLobby && u->m_bSuccess)
                 {
-                    const CSteamID lobby(static_cast<uint64>(g_joinLobby));
+                    const CSteamID lobby(g_joinLobby);
                     const char* proto = SteamMatchmaking()->GetLobbyData(lobby, "proto");
                     if (proto && std::strcmp(proto, Protocol()) == 0)
                     {
@@ -321,7 +318,7 @@ void Service()
             lastReport = now;
             ReportPeers();
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Sleep(1);
     }
 }
 
@@ -347,7 +344,6 @@ bool Start(Receiver receiver)
     static bool tried = false;
     if (tried) return false;
     tried = true;
-#if defined(_WIN32)
     if (!LoadLibraryW(L"steam_api64.dll"))
     {
         std::fprintf(stderr, "[steam] steam_api64.dll not found - Steam online unavailable\n");
@@ -355,12 +351,6 @@ bool Start(Receiver receiver)
     }
     SetEnvironmentVariableW(L"SteamAppId", L"480");
     SetEnvironmentVariableW(L"SteamGameId", L"480");
-#else
-    // The Linux Steam build links libsteam_api.so. Set the development App ID
-    // before initializing the API.
-    setenv("SteamAppId", "480", 1);
-    setenv("SteamGameId", "480", 1);
-#endif
     SteamErrMsg error = {};
     if (SteamAPI_InitEx(&error) != k_ESteamAPIInitResult_OK)
     {
@@ -380,7 +370,8 @@ bool Start(Receiver receiver)
     g_local = SteamUser()->GetSteamID().ConvertToUint64();
     g_running = true;
     std::thread(Service).detach();
-    std::fprintf(stderr, "[steam] initialized (app 480)\n");
+    std::fprintf(stderr, "[steam] running as %s (%016llX), app 480\n", SteamFriends()->GetPersonaName(),
+                 (unsigned long long)g_local.load());
     return true;
 }
 
@@ -420,7 +411,7 @@ void RemoveLobby(uint64_t sessionId)
     std::lock_guard l(g_mutex);
     const auto it = g_hosted.find(sessionId);
     if (it == g_hosted.end()) return;
-    if (it->second.lobby) { SteamMatchmaking()->LeaveLobby(CSteamID(static_cast<uint64>(it->second.lobby))); g_hosted.erase(it); }
+    if (it->second.lobby) { SteamMatchmaking()->LeaveLobby(CSteamID(it->second.lobby)); g_hosted.erase(it); }
     else it->second.removed = true;                       // leave once the creation completes
 }
 
@@ -527,7 +518,7 @@ bool InviteToSession(uint64_t sessionId, uint64_t friendId)
         std::fprintf(stderr, "[steam] invite: no Steam lobby known for session %016llX\n", (unsigned long long)sessionId);
         return false;
     }
-    const bool ok = SteamMatchmaking()->InviteUserToLobby(CSteamID(static_cast<uint64>(lobby)), CSteamID(static_cast<uint64>(friendId)));
+    const bool ok = SteamMatchmaking()->InviteUserToLobby(CSteamID(lobby), CSteamID(friendId));
     std::fprintf(stderr, "[steam] invite of %016llX to lobby %016llX (session %016llX): %s\n", (unsigned long long)friendId,
                  (unsigned long long)lobby, (unsigned long long)sessionId, ok ? "sent" : "refused by Steam");
     return ok;

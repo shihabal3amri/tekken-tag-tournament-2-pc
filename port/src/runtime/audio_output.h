@@ -43,12 +43,8 @@ struct AudioOutputStats
 
 struct AudioOutputState;
 
-// Call on the host main thread before guest code registers audio clients.
-// A failed device still allows silent callback pacing so the game can advance.
-bool InitializeHostAudio();
-
-// The output worker owns SDL streams. Submit copies guest PCM synchronously;
-// Close waits for SDL to release every frame used by its device callback.
+// The output worker owns all device calls. Submit copies synchronously; Close
+// waits for DestroyVoice to finish before releasing storage used by callbacks.
 class AudioOutputClient
 {
 public:
@@ -57,8 +53,8 @@ public:
     AudioOutputClient(const AudioOutputClient&) = delete;
     AudioOutputClient& operator=(const AudioOutputClient&) = delete;
     void Submit(const uint8_t* guest);
-    // One initial prefill credit per frame, then one when SDL finishes reading
-    // a frame. Failed devices fall back to a monotonic 48kHz silent clock.
+    // One initial prefill credit per frame, then one credit per device buffer
+    // completion. Failed devices fall back to a monotonic 48kHz silent clock.
     bool TryAcquireRenderCredit(uint64_t nowNs);
     void Close();
     AudioOutputStats Stats() const;

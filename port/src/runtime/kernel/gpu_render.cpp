@@ -6,41 +6,18 @@
 // decodes with this layout to "tiled 8_8_8_8 1280x720 at 0xA44A9000", which is exactly the
 // surface the present path shows.
 #include "kernel_shared.h"
-#include "../host_fault.h"
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#else
-#include "../host_thread.h"
-#endif
-#include "../host_window.h"
 #include "gpu_render.h"
-#include "gpu_hw_texture_upload.h"
-#include "gpu_hw_indices.h"
-#if defined(__ANDROID__)
-#include "gpu_cpu_vertex_profile.h"
-#endif
-#include "gpu_draw_skip_probe.h"
-#include "gpu_index_decode.h"
-#include "gpu_index_geometry_cache.h"
-#if defined(TTT2_GEOMETRY_AB_PROBE)
-#include "gpu_geometry_reference.h"
-#include "gpu_geometry_probe.h"
-#endif
-#if !defined(_WIN32)
-#include "host_settings.h"
-#endif
 #include <atomic>
 #include <emmintrin.h>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
 #include <thread>
+// windows.h only for the SEH guard + GetCurrentThreadId; NOMINMAX or its min/max macros
+// clobber std::min/std::max all over this file (the classic session-8 build breaker).
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <filesystem>
 #include <map>
 #include <set>
@@ -164,37 +141,10 @@ public:
 private:
     RasterPool()
     {
-        const unsigned n =
-#if defined(_WIN32)
-            std::thread::hardware_concurrency();
-#else
-            host_thread::AvailableProcessors();
-#endif
-        const unsigned wanted =
-#if defined(_WIN32)
-            n > 3 ? n - 2 : 1; // preserve the existing Windows worker count
-#else
-            n > 3 ? n - 2 : n > 1 ? 1 : 0; // leave lanes for the game's own threads
-#endif
-        for (unsigned i = 0; i < wanted; ++i)
-        {
-#if defined(_WIN32)
+        unsigned n = std::thread::hardware_concurrency();
+        m_count = n > 3 ? n - 2 : 1;             // leave lanes for the game's own threads
+        for (unsigned i = 0; i < m_count; ++i)
             std::thread([this] { Worker(); }).detach();
-#else
-            if (!host_thread::StartDetached(8 * 1024 * 1024, WorkerEntry, this))
-            {
-                std::fprintf(stderr, "[raster] started %u of %u helpers\n", m_count, wanted);
-                break;
-            }
-#endif
-            ++m_count;
-        }
-    }
-
-    static unsigned WorkerEntry(void* arg)
-    {
-        static_cast<RasterPool*>(arg)->Worker();
-        return 0;
     }
 
     static constexpr int RowsPerChunk = 4;
@@ -211,15 +161,16 @@ private:
         }
     }
 
-    // Host fault net around the row work: a fault in a worker used to kill the whole process with
+    // SEH net around the row work: a fault in a worker used to kill the whole process with
     // no log at all (run_user1 died silently mid logo fade). Log-and-drop-the-rows beats
     // vanishing; the CP thread's own guards handle everything else.
     void DrainGuarded()
     {
-        if (!host_fault::Run([](void* arg) {
-                static_cast<RasterPool*>(arg)->Drain();
-            }, this))
+        __try { Drain(); }
+        __except (GuestFaultReport(GetExceptionInformation()))
+        {
             std::fputs("[raster] worker faulted; dropping its remaining rows this job\n", stderr);
+        }
     }
 
     void Worker()
@@ -239,7 +190,7 @@ private:
         }
     }
 
-    unsigned m_count = 0;
+    unsigned m_count = 1;
     std::mutex m_m;
     std::condition_variable m_cv, m_doneCv;
     uint64_t m_gen = 0;                          // guarded by m_m
@@ -638,7 +589,32 @@ namespace
 // --------------------------------------------------------------------------------------
 // texture sampling
 // --------------------------------------------------------------------------------------
-using Texture = ttt2_hw::TextureInfo;
+struct Texture
+{
+    bool valid = false;
+    uint32_t base = 0, width = 1, height = 1, format = 0, pitch = 0;
+    bool tiled = false;
+    uint32_t swizzle = 0;
+    uint32_t endian = 0;
+    // Sampler state from the fetch constant: ClampMode per axis (dword 0 bits 10-12 / 13-15),
+    // mag filter (dword 3 bits 19-20: 0 point, 1 linear), border colour (dword 5 bits 0-1).
+    uint32_t clampX = 2, clampY = 2, magFilter = 1, border = 0;
+    uint32_t dimension = 1;          // dword5 bits 9-10: 0 1D, 1 2D, 2 3D/stacked, 3 cube
+    // dword0 bits 2-9: per-component sign x,y,z,w (2 bits each): 0 unsigned, 1 signed,
+    // 2 unsigned biased, 3 gamma (Xenia TextureSign). Recorded for the format census.
+    uint32_t signs = 0;
+    // Mip levels and minification (Xenia xenos.h xe_gpu_texture_fetch_t): dword 3 bits 21-22 min
+    // filter, 23-24 mip filter (0 point, 1 linear, 2 base level only), 25-27 anisotropic filter
+    // (0 off, 1..5 = 1:1..16:1); dword 4 bits 2-5 / 6-9 the first / last level, 12-21 the LOD bias
+    // (signed, 1/32 steps); dword 5 bit 11 packed mips, bits 12-31 the mip levels' physical page.
+    uint32_t minFilter = 1, mipFilter = 2, aniso = 0, mipMin = 0, mipMax = 0;
+    int32_t lodBias = 0;
+    bool packedMips = false;
+    uint32_t mipBase = 0;
+    // Where the image starts inside the storage at `base` (texels): a packed mip level's offset in
+    // its tile (TextureMipLevel). 0 for every fetch-constant texture.
+    uint32_t originX = 0, originY = 0;
+};
 
 // Bytes from one cube face (array slice) to the next: each face is a whole 2D surface - block
 // rows/columns padded to 32 when tiled - starting on a 4 KB boundary. Matches TTT2's battle
@@ -904,38 +880,23 @@ void DumpTextureBmp(const Texture& t)
         }
     if (!any) return;
     n = -1;                                   // captured; never dump this base again
-    const std::string directory =
-#if defined(_WIN32)
-        "C:/ttt2/port/tex";
-#else
-        host_settings::DiagnosticPath("tex");
-#endif
-    std::error_code directoryError;
-    std::filesystem::create_directories(directory, directoryError);
-    if (directoryError) return;
-    char name[96];
-    std::snprintf(name, sizeof(name), "%08X_%ux%u_f%u.bmp", t.base,
+    std::filesystem::create_directories("C:/ttt2/port/tex");
+    char path[160];
+    std::snprintf(path, sizeof(path), "C:/ttt2/port/tex/%08X_%ux%u_f%u.bmp", t.base,
                   t.width, t.height, t.format);
-    const std::string path = (std::filesystem::path(directory) / name).string();
-    FILE* f = std::fopen(path.c_str(), "wb");
+    FILE* f = std::fopen(path, "wb");
     if (!f) return;
     uint32_t imgSize = t.width * t.height * 4;
     uint8_t hdr[54] = {};
-    auto put16 = [&](size_t at, uint16_t value) {
-        hdr[at] = uint8_t(value); hdr[at + 1] = uint8_t(value >> 8);
-    };
-    auto put32 = [&](size_t at, uint32_t value) {
-        put16(at, uint16_t(value)); put16(at + 2, uint16_t(value >> 16));
-    };
     hdr[0] = 'B'; hdr[1] = 'M';
-    put32(2, 54 + imgSize);
-    put32(10, 54);
-    put32(14, 40);
-    put32(18, t.width);
-    put32(22, uint32_t(-int32_t(t.height)));
-    put16(26, 1);
-    put16(28, 32);
-    put32(34, imgSize);
+    *reinterpret_cast<uint32_t*>(hdr + 2) = 54 + imgSize;
+    *reinterpret_cast<uint32_t*>(hdr + 10) = 54;
+    *reinterpret_cast<uint32_t*>(hdr + 14) = 40;
+    *reinterpret_cast<int32_t*>(hdr + 18) = (int32_t)t.width;
+    *reinterpret_cast<int32_t*>(hdr + 22) = -(int32_t)t.height;
+    *reinterpret_cast<uint16_t*>(hdr + 26) = 1;
+    *reinterpret_cast<uint16_t*>(hdr + 28) = 32;
+    *reinterpret_cast<uint32_t*>(hdr + 34) = imgSize;
     std::fwrite(hdr, 1, sizeof(hdr), f);
     std::vector<uint32_t> row(t.width);
     for (uint32_t y = 0; y < t.height; ++y)
@@ -949,7 +910,7 @@ void DumpTextureBmp(const Texture& t)
         std::fwrite(row.data(), 4, t.width, f);
     }
     std::fclose(f);
-    std::fprintf(stderr, "[tex] dumped %s pitch=%u tiled=%d\n", path.c_str(), t.pitch, (int)t.tiled);
+    std::fprintf(stderr, "[tex] dumped %s pitch=%u tiled=%d\n", path, t.pitch, (int)t.tiled);
 }
 
 V4 SampleTexture(const Texture& t, float u, float vv, bool bilinear)
@@ -1553,195 +1514,6 @@ float BlendFactor(uint32_t f, float src, float dst, float srcA, float dstA, floa
 
 } // namespace
 
-namespace ttt2_hw {
-
-bool DecodeTextureUploadSurface(const TextureInfo& t, TextureUploadSurface& out)
-{
-    const uint32_t guestBytes = TextureGuestBytes(t, 1);
-    if (!guestBytes || uint64_t(t.base) + guestBytes > (1ull << 32)) return false;
-    TextureUploadSurface decoded{};
-    decoded.width = t.width;
-    decoded.height = t.height;
-    if (t.format == FMT_8_8_8_8)
-    {
-        decoded.format = TextureUploadFormat::Rgba8;
-        decoded.rowPitch = decoded.width * 4;
-        decoded.bytes.resize(size_t(decoded.rowPitch) * decoded.height);
-        for (uint32_t y = 0; y < t.height; ++y)
-            for (uint32_t x = 0; x < t.width; ++x)
-            {
-                const uint32_t sx = x + t.originX, sy = y + t.originY;
-                const uint32_t ti = t.tiled ? GpuTiledOffset2D(sx, sy, t.pitch, 2) : (sy * t.pitch + sx);
-                const uint32_t word = GRead32(g_base, t.base + ti * 4);
-                std::memcpy(decoded.bytes.data() + size_t(y) * decoded.rowPitch + size_t(x) * 4,
-                            &word, 4);
-            }
-    }
-    else if (t.format == FMT_8)
-    {
-        decoded.format = TextureUploadFormat::R8;
-        decoded.rowPitch = decoded.width;
-        decoded.remapMode = 1;
-        decoded.bytes.resize(size_t(decoded.rowPitch) * decoded.height);
-        for (uint32_t y = 0; y < t.height; ++y)
-        {
-            if (!t.tiled)
-                std::memcpy(decoded.bytes.data() + size_t(y) * decoded.rowPitch,
-                            g_base + t.base + size_t(y + t.originY) * t.pitch + t.originX, t.width);
-            else
-                for (uint32_t x = 0; x < t.width; ++x)
-                    decoded.bytes[size_t(y) * decoded.rowPitch + x] =
-                        GRead8(g_base, t.base + GpuTiledOffset2D(x + t.originX, y + t.originY, t.pitch, 0));
-        }
-    }
-    else if (t.format == FMT_DXT1 || t.format == FMT_DXT2_3 || t.format == FMT_DXT4_5)
-    {
-        const uint32_t blockBytes = t.format == FMT_DXT1 ? 8 : 16;
-        const uint32_t logBpb = blockBytes == 8 ? 3 : 4;
-        decoded.format = t.format == FMT_DXT1 ? TextureUploadFormat::Bc1 :
-                         t.format == FMT_DXT2_3 ? TextureUploadFormat::Bc2 :
-                                                  TextureUploadFormat::Bc3;
-        decoded.width = (t.width + 3) & ~3u;
-        decoded.height = (t.height + 3) & ~3u;
-        const uint32_t blocksX = decoded.width / 4, blocksY = decoded.height / 4;
-        const uint32_t guestBlocksX = (t.pitch + 3) / 4;
-        decoded.rowPitch = blocksX * blockBytes;
-        decoded.bytes.resize(size_t(decoded.rowPitch) * blocksY);
-        for (uint32_t by = 0; by < blocksY; ++by)
-            for (uint32_t bx = 0; bx < blocksX; ++bx)
-            {
-                const uint32_t sx = bx + t.originX / 4, sy = by + t.originY / 4;
-                const uint32_t bi = t.tiled ? GpuTiledOffset2D(sx, sy, guestBlocksX, logBpb)
-                                            : (sy * guestBlocksX + sx);
-                const uint32_t addr = t.base + bi * blockBytes;
-                uint8_t* dst = decoded.bytes.data() + size_t(by) * decoded.rowPitch +
-                               size_t(bx) * blockBytes;
-                for (uint32_t k = 0; k < blockBytes / 4; ++k)
-                {
-                    const uint32_t word = TextureWord(addr + k * 4, t.endian);
-                    std::memcpy(dst + k * 4, &word, 4);
-                }
-            }
-    }
-    else
-    {
-        decoded.format = TextureUploadFormat::Rgba32Float;
-        decoded.rowPitch = decoded.width * 16;
-        decoded.genericSwizzled = true;
-        decoded.bytes.resize(size_t(decoded.rowPitch) * decoded.height);
-        Texture storage = t;
-        storage.width += t.originX;
-        storage.height += t.originY;
-        for (uint32_t y = 0; y < t.height; ++y)
-            for (uint32_t x = 0; x < t.width; ++x)
-            {
-                const V4 value = SampleTexel(storage, int(x + t.originX), int(y + t.originY));
-                std::memcpy(decoded.bytes.data() + size_t(y) * decoded.rowPitch +
-                            size_t(x) * 16, value.c, 16);
-            }
-    }
-    out = std::move(decoded);
-    return true;
-}
-
-bool DecodeTextureUploadFaces(const TextureInfo& texture, uint32_t layers,
-                              std::vector<TextureUploadSurface>& out)
-{
-    const uint32_t guestBytes = TextureGuestBytes(texture, layers);
-    if (!guestBytes || uint64_t(texture.base) + guestBytes > (1ull << 32))
-        return false;
-    const uint32_t stride = layers == 6 ? TextureFaceStride(texture) : 0;
-    std::vector<TextureUploadSurface> decoded;
-    decoded.reserve(layers);
-    for (uint32_t layer = 0; layer < layers; ++layer)
-    {
-        TextureInfo face = texture;
-        face.base += layer * stride;
-        TextureUploadSurface surface;
-        if (!DecodeTextureUploadSurface(face, surface)) return false;
-        if (!decoded.empty() &&
-            (surface.format != decoded[0].format ||
-             surface.width != decoded[0].width ||
-             surface.height != decoded[0].height ||
-             surface.rowPitch != decoded[0].rowPitch)) return false;
-        decoded.push_back(std::move(surface));
-    }
-    out = std::move(decoded);
-    return true;
-}
-
-bool DecodeFrontBufferUploadSurface(uint8_t* guestMemory, uint32_t guestAddress,
-                                    uint32_t width, uint32_t height,
-                                    TextureUploadSurface& out)
-{
-    if (!guestMemory || !guestAddress || !width || !height ||
-        width > 16384 || height > 16384) return false;
-    const uint64_t alignedWidth = (uint64_t(width) + 31) & ~31ull;
-    const uint64_t alignedHeight = (uint64_t(height) + 31) & ~31ull;
-    const uint64_t guestBytes = alignedWidth * alignedHeight * 4;
-    if (guestBytes > (64ull << 20) ||
-        uint64_t(guestAddress) + guestBytes > (1ull << 32)) return false;
-    TextureUploadSurface decoded{};
-    decoded.format = TextureUploadFormat::Bgra8;
-    decoded.width = width;
-    decoded.height = height;
-    decoded.rowPitch = width * 4;
-    decoded.bytes.resize(size_t(decoded.rowPitch) * height);
-    for (uint32_t y = 0; y < height; ++y)
-        for (uint32_t x = 0; x < width; ++x)
-        {
-            const uint32_t word = GRead32(guestMemory, guestAddress +
-                GpuTiledOffset2D(x, y, width, 2) * 4);
-            std::memcpy(decoded.bytes.data() + size_t(y) * decoded.rowPitch +
-                        size_t(x) * 4, &word, 4);
-        }
-    out = std::move(decoded);
-    return true;
-}
-
-uint32_t TextureGuestBytes(const TextureInfo& t, uint32_t layers)
-{
-    const uint64_t right = uint64_t(t.originX) + t.width;
-    const uint64_t bottom = uint64_t(t.originY) + t.height;
-    if (!t.valid || !t.width || !t.height || right > t.pitch ||
-        bottom > INT32_MAX || (layers != 1 && layers != 6)) return 0;
-    if (layers == 6)
-    {
-        const uint32_t faceBytes = TextureGuestBytes(t, 1);
-        if (!faceBytes) return 0;
-        const uint64_t bytes = 5ull * TextureFaceStride(t) + faceBytes;
-        return bytes <= UINT32_MAX ? uint32_t(bytes) : 0;
-    }
-    uint64_t elementBytes, columns, rows;
-    if (IsBlockCompressed(t.format))
-    {
-        elementBytes = (t.format == FMT_DXT1 || t.format == FMT_DXT3A ||
-                        t.format == FMT_DXT5A || t.format == FMT_CTX1) ? 8 : 16;
-        columns = (uint64_t(t.pitch) + 3) / 4;
-        rows = (bottom + 3) / 4;
-    }
-    else
-    {
-        elementBytes = std::max<uint32_t>(FormatBpp(t.format) / 8, 1);
-        columns = t.pitch;
-        rows = bottom;
-    }
-    if (t.tiled)
-    {
-        columns = (columns + 31) & ~31ull;
-        rows = (rows + 31) & ~31ull;
-    }
-    if (columns > (64ull << 20) / elementBytes ||
-        rows > (64ull << 20) / (columns * elementBytes)) return 0;
-    uint64_t bytes = columns * rows * elementBytes;
-    // One- and two-byte tiled elements can occupy discontiguous portions of the
-    // final 4 KB tile. Include that whole tile when validating the guest range.
-    if (t.tiled) bytes = (bytes + 4095) & ~4095ull;
-    return bytes && bytes <= (64ull << 20) ? uint32_t(bytes) : 0;
-}
-
-} // namespace ttt2_hw
-
 // --------------------------------------------------------------------------------------
 // public entry points
 // --------------------------------------------------------------------------------------
@@ -1825,9 +1597,8 @@ bool DepthCompare(uint32_t func, float src, float dst)
 #if defined(TTT2_D3D11_MOVIE_BACKEND)
 #include "gpu_d3d11_movie.h"
 #endif
-#include "gpu_hw_translate.h" // shared Xenos shader analysis
 #if defined(TTT2_GPU_HW_BACKEND)
-#include "gpu_hw_backend.h"
+#include "gpu_hw_d3d11.h"
 #endif
 
 // main.cpp --build-shaders: the game's shaders into the disk cache ahead of time (gpu_hw_d3d11.h).
@@ -1898,10 +1669,6 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
                prim == PRIM_QUAD_LIST;
     if (prim != PRIM_RECT_LIST && !tri) return false;             // points and lines: later
 
-    // Keep rectangle clears and resolve packets intact during draw ablation.
-    ttt2_hw::draw_skip_probe::DrawScope skipScope(tri);
-    if (skipScope.early) return true;
-
     std::vector<uint32_t> vsCode = LoadUcode(vsRef), psCode = LoadUcode(psRef);
     if (vsCode.empty()) return false;
 #if defined(TTT2_DRAW_CAPTURE_DIAGNOSTICS)
@@ -1925,38 +1692,27 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
     const uint32_t restartIdx = index32 ? regs[0x2103] : (regs[0x2103] & 0xFFFF);
     const uint32_t indexOffset = regs[0x2102];
     const uint32_t minIndex = regs[0x2101] & 0xFFFFFF, maxIndex = regs[0x2100] & 0xFFFFFF;
+    const bool clampIndex = maxIndex != 0 && maxIndex >= minIndex;
+    std::vector<uint32_t> idx(numIdx);
+    std::vector<uint8_t> cut(numIdx, 0);
+    bool anyCut = false;
     extern void GpuNoteMemory(int kind, uint32_t addr, uint32_t bytes);
     if (srcSel != 2 && indexAddr) GpuNoteMemory(2, indexAddr, numIdx * (index32 ? 4 : 2));
-    thread_local ttt2_hw::IndexDecodeStorage indexStorage;
-    thread_local ttt2_hw::IndexGeometryCache indexGeometry;
-    bool cacheIndices = srcSel != 2 && indexAddr;
-#if defined(TTT2_GEOMETRY_AB_PROBE)
-    // Reference assembly/decoding paths must run every draw when requested.
-    cacheIndices &= !(ttt2_hw::geometry_probe::ReferenceMask() & (1 | 4 | 8 | 32 | 128));
-#endif
-    const auto* cachedGeometry = cacheIndices ? indexGeometry.Get(g_base, {
-        indexAddr, numIdx, indexOffset, minIndex, maxIndex, restartIdx,
-        uint32_t(index32), uint32_t(restartOn), prim}) : nullptr;
-    ttt2_hw::DecodedIndices decoded;
-#if defined(TTT2_GEOMETRY_AB_PROBE)
-    ttt2_hw::IndexDecodeStorage referenceIndexStorage;
-#endif
-    if (cachedGeometry) decoded = cachedGeometry->decoded;
-#if defined(TTT2_GEOMETRY_AB_PROBE)
-    else if (ttt2_hw::geometry_probe::ReferenceMask() & 8)
-        decoded = ttt2_hw::reference::DecodeIndices(g_base, indexAddr, numIdx,
-            srcSel == 2 || !indexAddr, index32, restartOn, restartIdx, indexOffset,
-            minIndex, maxIndex, referenceIndexStorage);
-#endif
-    else decoded = ttt2_hw::DecodeIndices(g_base, indexAddr, numIdx,
-            srcSel == 2 || !indexAddr, index32, restartOn, restartIdx, indexOffset,
-            minIndex, maxIndex, indexStorage);
-    const auto idx = decoded.indices;
-    const auto cut = decoded.cuts;
-    const bool anyCut = decoded.anyCut;
-    const uint32_t maxIdx = decoded.highest;
+    for (uint32_t i = 0; i < numIdx; ++i)
+    {
+        uint32_t raw;
+        if (srcSel == 2 || !indexAddr) raw = i;                   // auto index
+        else if (index32) raw = GRead32(g_base, indexAddr + i * 4);
+        else raw = GRead16(g_base, indexAddr + i * 2);
+        if (restartOn && raw == restartIdx) { cut[i] = 1; anyCut = true; idx[i] = 0; continue; }
+        uint32_t v = (raw + indexOffset) & 0xFFFFFF;
+        if (clampIndex) v = std::min(std::max(v, minIndex), maxIndex);
+        idx[i] = v;
+    }
 
     // ---- vertex stage (one shader run per distinct index) ----
+    uint32_t maxIdx = 0;
+    for (uint32_t i = 0; i < numIdx; ++i) if (!cut[i]) maxIdx = std::max(maxIdx, idx[i]);
     if (maxIdx > (1u << 20)) return false;
 
     uint32_t vte = regs[0x2206];
@@ -2024,16 +1780,9 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
     thread_local std::vector<Vertex> shaded;
     thread_local std::vector<uint8_t> shadedInterp;
     bool shadedReady = false;
-#if defined(__ANDROID__)
-    const char* cpuVsReason = prim == PRIM_RECT_LIST ? "rectangle" : "shader-unavailable";
-#endif
     auto ensureShaded = [&] {
         if (shadedReady) return;
         shadedReady = true;
-#if defined(__ANDROID__)
-        const bool profileCpuVs = cpu_vertex_profile::On();
-        const auto profileBegin = profileCpuVs ? cpu_vertex_profile::Clock::now() : cpu_vertex_profile::Clock::time_point{};
-#endif
         slotOfIndex.assign(size_t(maxIdx) + 1, -1);
         uniqueIdx.clear();
         for (uint32_t i = 0; i < numIdx; ++i)
@@ -2063,9 +1812,6 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
         }
         else for (size_t i = 0; i < n; ++i) one(i, true);
         for (size_t i = 0; i < n; ++i) interpCount = std::max<uint32_t>(interpCount, shadedInterp[i]);
-#if defined(__ANDROID__)
-        if (profileCpuVs) cpu_vertex_profile::Record(vsCode, prim, cpuVsReason, n, profileBegin);
-#endif
     };
     auto fetchVertex = [&](uint32_t index) -> const Vertex& {
         ensureShaded();
@@ -2577,52 +2323,55 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
     // (A frame being logged keeps the CPU vertex stage so its STREAK diagnostics can run.)
     if (hwDraw && !cpuRaster && prim != PRIM_RECT_LIST && !g_gpuFrameNote)
     {
-        ttt2_hw::VertexShaderHandle* vsEntry = nullptr;
+        ttt2_hw::Backend::VsEntry* vsEntry = nullptr;
         ttt2_hw::Guarded("vs", [&] { vsEntry = ttt2_hw::Get().VertexShader(vsCode); });
         if (vsEntry)
         {
-            thread_local std::vector<uint32_t> triangleScratch;
-            bool nativeStrip = prim == PRIM_TRI_STRIP;
-#if defined(TTT2_GEOMETRY_AB_PROBE)
-            nativeStrip &= (ttt2_hw::geometry_probe::ReferenceMask() & 5) == 0;
-#endif
-            ttt2_hw::TriangleIndices assembled;
-            uint32_t stripTriangles = 0;
-            if (cachedGeometry)
+            thread_local std::vector<uint32_t> tri;
+            tri.clear();
+            auto emit = [&](uint32_t a, uint32_t b, uint32_t c) {
+                tri.push_back(idx[a]); tri.push_back(idx[b]); tri.push_back(idx[c]);
+            };
+            if (prim == PRIM_TRI_LIST)
             {
-                assembled = cachedGeometry->assembled;
-                stripTriangles = cachedGeometry->stripTriangles;
+                for (uint32_t i = 0; i + 2 < numIdx; i += 3)
+                    if (!(cut[i] | cut[i + 1] | cut[i + 2])) emit(i, i + 1, i + 2);
             }
-            else if (nativeStrip)
+            else if (prim == PRIM_TRI_STRIP || prim == PRIM_TRI_FAN)
             {
-                const auto strip = ttt2_hw::BuildNativeStripIndices(idx,
-                    anyCut ? std::span<const uint8_t>(cut) : std::span<const uint8_t>{}, triangleScratch);
-                assembled = strip;
-                stripTriangles = strip.triangles;
+                for (uint32_t s = 0; s < numIdx;)
+                {
+                    if (cut[s]) { ++s; continue; }
+                    uint32_t e = s;
+                    while (e < numIdx && !cut[e]) ++e;
+                    if (prim == PRIM_TRI_STRIP)
+                        for (uint32_t i = s; i + 2 < e; ++i)
+                        {
+                            if ((i - s) & 1) emit(i + 1, i, i + 2);
+                            else             emit(i, i + 1, i + 2);
+                        }
+                    else
+                        for (uint32_t i = s + 1; i + 1 < e; ++i) emit(s, i, i + 1);
+                    s = e;
+                }
             }
-            else
+            else if (prim == PRIM_QUAD_LIST)
             {
-#if defined(TTT2_GEOMETRY_AB_PROBE)
-                if (ttt2_hw::geometry_probe::ReferenceMask() & 1)
-                    assembled = ttt2_hw::reference::BuildTriangleIndices(
-                        static_cast<ttt2_hw::IndexPrimitive>(prim), idx, cut, triangleScratch);
-                else
-#endif
-                    assembled = ttt2_hw::BuildTriangleIndices(
-                        static_cast<ttt2_hw::IndexPrimitive>(prim), idx,
-                        anyCut ? std::span<const uint8_t>(cut) : std::span<const uint8_t>{}, triangleScratch);
+                for (uint32_t i = 0; i + 3 < numIdx; i += 4)
+                {
+                    if (cut[i] | cut[i + 1] | cut[i + 2] | cut[i + 3]) continue;
+                    emit(i, i + 1, i + 2);
+                    emit(i, i + 2, i + 3);
+                }
             }
-            const auto tri = assembled.values;
-            const uint32_t lowest = assembled.lowest, highest = assembled.highest;
+            uint32_t lowest = tri.empty() ? 0 : 0xFFFFFFFFu, highest = 0;
+            for (uint32_t v : tri) { lowest = std::min(lowest, v); highest = std::max(highest, v); }
             const ttt2_hw::DrawState st = makeHwState();
-            auto result = ttt2_hw::GpuVsResult::Fallback;
+            auto result = ttt2_hw::Backend::GpuVsResult::Fallback;
             ttt2_hw::Guarded("draw", [&] {
-                result = ttt2_hw::Get().DrawGpuVs(regs, psCode, *vsEntry, tri, lowest, highest, st, nativeStrip, stripTriangles, cachedGeometry ? cachedGeometry->identity : 0);
+                result = ttt2_hw::Get().DrawGpuVs(regs, psCode, *vsEntry, tri, lowest, highest, st);
             });
-#if defined(__ANDROID__)
-            if (result == ttt2_hw::GpuVsResult::Fallback) cpuVsReason = "fetch-range";
-#endif
-            if (result != ttt2_hw::GpuVsResult::Fallback)
+            if (result != ttt2_hw::Backend::GpuVsResult::Fallback)
             {
                 if (g_gpuFrameNote)
                 {
@@ -2775,23 +2524,8 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
                 g_gpuFrameNote(note);
             }
         }
-        thread_local std::vector<ttt2_hw::CpuVertex> hwVertices;
-        hwVertices.clear();
-        if (!hwSlots.empty())
-        {
-            hwVertices.reserve(uniqueIdx.size() + hwExtra.size());
-            auto packVertex = [&](const Vertex& v) {
-                ttt2_hw::CpuVertex packed{};
-                packed.x = v.x; packed.y = v.y; packed.z = v.z; packed.invW = v.invW;
-                for (uint32_t a = 0; a < 16; ++a)
-                    for (int c = 0; c < 4; ++c) packed.attr[a][c] = v.attr[a][c];
-                hwVertices.push_back(packed);
-            };
-            for (size_t i = 0; i < uniqueIdx.size(); ++i) packVertex(shaded[i]);
-            for (const Vertex& v : hwExtra) packVertex(v);
-        }
         ttt2_hw::Guarded("draw", [&] {
-            ttt2_hw::Get().Draw(regs, psCode, hwVertices, hwSlots, interpCount, st);
+            ttt2_hw::Get().Draw(regs, psCode, shaded.data(), uniqueIdx.size(), hwExtra, hwSlots, interpCount, st);
         });
         if (!cpuRaster)
         {
@@ -2868,8 +2602,13 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
 // control-flow walk as the hardware translator; 0 when it cannot be analysed.
 uint32_t GpuPixelShaderTextureSlots(uint32_t addr, uint32_t sizeDwords)
 {
+#if defined(TTT2_GPU_HW_BACKEND)
     std::vector<uint32_t> code = LoadUcode(GpuShader{ addr, sizeDwords });
     return ttt2_hw::TranslatePixelShader(code).textureSlots;
+#else
+    (void)addr; (void)sizeDwords;
+    return 0;
+#endif
 }
 
 // ---- hardware backend entry points (no-ops when it is compiled out or disabled) ----
@@ -2958,43 +2697,36 @@ void GpuHwWriteBackRange(uint32_t start, uint32_t size)
     for (bool pending = GpuHwMode(); pending;)
     {
         const bool block = polls > 2000;
-        std::function<bool()> waitForCopy;
+        Microsoft::WRL::ComPtr<ID3D11Fence> fence;
+        uint64_t fenceValue = 0;
         if (!ttt2_hw::Guarded("writeback", [&] {
                 pending = ttt2_hw::Get().WriteBackRange(start, size, block);
-                if (pending) waitForCopy = ttt2_hw::Get().PendingCopyWaiter();
+                if (pending) fence = ttt2_hw::Get().PendingFence(fenceValue);
             })) break;
         if (!pending) break;
         ++polls;
         // Wait for exactly the copy (the GPU signals the fence after it); otherwise poll: yield
         // first, then 1 ms sleeps.
-        if (!waitForCopy || !waitForCopy())
-        {
-            if (polls < 64) std::this_thread::yield();
-            else std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
+        static thread_local HANDLE copied = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (fence && copied && SUCCEEDED(fence->SetEventOnCompletion(fenceValue, copied))) WaitForSingleObject(copied, 100);
+        else if (polls < 64) SwitchToThread();
+        else Sleep(1);
     }
     if (timing)
     {
         const double total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         static std::atomic<int> logged{ 0 };
         if (total > 1.0 && logged++ < 200)
-            std::fprintf(stderr, "[frame] cpu-read fault %08X: %.2f ms (%u polls) thread %u\n",
-                         start, total, polls,
-#if defined(_WIN32)
-                         GetCurrentThreadId());
-#else
-                         host_thread::CurrentId());
-#endif
+            std::fprintf(stderr, "[frame] cpu-read fault %08X: %.2f ms (%u polls) thread %lu\n", start, total, polls, GetCurrentThreadId());
     }
 #else
     (void)start; (void)size;
 #endif
 }
 
-void GpuHwSetWindow(host_window::Window* window)
+void GpuHwSetWindow(void* window)
 {
 #if defined(TTT2_GPU_HW_BACKEND)
-    if (GpuHwMode())
-        ttt2_hw::Get().SetWindow(window);
+    if (GpuHwMode()) ttt2_hw::Get().SetWindow(static_cast<HWND>(window));
 #endif
 }

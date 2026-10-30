@@ -5,10 +5,8 @@
 #include "kernel_objects.h"
 #include "save_store.h"
 #include "kernel_content.h"
-#include "../host_vm.h"
-#include "../guest_memory.h"
-#include "../host_thread.h"
-#include "../host_file.h"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <atomic>
 #include <string>
 #include <unordered_map>
@@ -18,18 +16,6 @@
 #include <chrono>
 #include <vector>
 #include <algorithm>
-#include <cctype>
-#include <cstdlib>
-#include <cstring>
-
-static bool IoTrace()
-{
-    static const bool enabled = [] {
-        const char* value = std::getenv("TTT2_IO_TRACE");
-        return value && std::strcmp(value, "1") == 0;
-    }();
-    return enabled;
-}
 
 void RollbackBeforeHostWrite(uint32_t addr, uint32_t size);   // rollback.cpp
 void RollbackNoteIo(bool frameOnly, const char* op = "", const PPCContext* ctx = nullptr);   // rollback.cpp: no rewind across I/O
@@ -37,19 +23,19 @@ void RollbackNoteIo(bool frameOnly, const char* op = "", const PPCContext* ctx =
 // Where the extracted disc lives. TTT2_VFS_ROOT overrides it, which is how a tree of
 // EXPANDED archives is selected (26 of the 42 dataNNN.bin are LZX containers on the disc and
 // have to be expanded before the game can read them - see PROJECT_STATUS session 8).
-static const std::filesystem::path& VfsRoot()
+static const char* VfsRoot()
 {
-    static const std::filesystem::path root = [] {
-        const char* path = std::getenv("TTT2_VFS_ROOT");
-        return std::filesystem::path(path && *path ? path : "C:/ttt2/re/game_files");
+    static const std::string root = [] {
+        const char* e = std::getenv("TTT2_VFS_ROOT");
+        return std::string(e && *e ? e : "C:/ttt2/re/game_files");
     }();
-    return root;
+    return root.c_str();
 }
 #define VFS_ROOT VfsRoot()
 
 struct FileRecord
 {
-    host_file::File* handle;
+    HANDLE handle;
     const std::string path;
     std::filesystem::path saveContainer;
     bool writable=false, directory=false;
@@ -57,10 +43,11 @@ struct FileRecord
     std::string guestPath;            // as opened; the base for RootDirectory-relative opens
     bool directoryScanned=false;
     size_t directoryCursor=0;
-    std::vector<host_file::DirectoryEntry> directoryItems;
+    struct DirectoryItem { std::string name; uint64_t size; };
+    std::vector<DirectoryItem> directoryItems;
     std::mutex mutex;
-    FileRecord(host_file::File* h, std::string name) : handle(h), path(std::move(name)) {}
-    ~FileRecord() { host_file::Close(handle); }
+    FileRecord(HANDLE h, std::string name) : handle(h), path(std::move(name)) {}
+    ~FileRecord() { CloseHandle(handle); }
 };
 
 static std::mutex g_fmutex;
@@ -77,8 +64,8 @@ uint32_t FlushSaveFiles(const std::filesystem::path& container,bool requireClose
           else it=g_saveFiles.erase(it);
       }
     }
-    if(requireClosed && !files.empty())return 170; // ERROR_BUSY
-    for(auto& f:files){std::lock_guard lock(f->mutex);if(f->writable){uint32_t error=host_file::Flush(f->handle);if(error)return error;}}
+    if(requireClosed && !files.empty())return ERROR_BUSY;
+    for(auto& f:files){std::lock_guard lock(f->mutex);if(f->writable && !FlushFileBuffers(f->handle))return GetLastError();}
     return 0;
 }
 
@@ -94,7 +81,29 @@ static constexpr uint32_t IO_STATUS_NAME_NOT_FOUND = 0xC0000034u;
 static constexpr uint32_t IO_STATUS_INVALID_HANDLE        = 0xC0000008u;
 static constexpr uint32_t IO_STATUS_INVALID_PARAMETER = 0xC000000Du;
 
-static uint32_t FileErrorStatus(uint32_t error) { return host_file::DosErrorStatus(error); }
+static uint32_t FileErrorStatus(DWORD error)
+{
+    switch (error)
+    {
+    case ERROR_HANDLE_EOF: return STATUS_END_OF_FILE;
+    case ERROR_INVALID_HANDLE: return IO_STATUS_INVALID_HANDLE;
+    case ERROR_INVALID_PARAMETER:
+    case ERROR_NEGATIVE_SEEK: return IO_STATUS_INVALID_PARAMETER;
+    case ERROR_ACCESS_DENIED: return 0xC0000022u; // STATUS_ACCESS_DENIED
+    case ERROR_FILE_NOT_FOUND: return 0xC0000034u;
+    case ERROR_PATH_NOT_FOUND: return 0xC000003Au;
+    case ERROR_INVALID_NAME: return 0xC0000033u;
+    case ERROR_SHARING_VIOLATION: return 0xC0000043u;
+    case ERROR_DISK_FULL: return 0xC000007Fu;
+    case ERROR_LOCK_VIOLATION: return 0xC0000054u; // STATUS_FILE_LOCK_CONFLICT
+    case ERROR_CRC: return 0xC000009Cu; // STATUS_DEVICE_DATA_ERROR
+    case ERROR_IO_DEVICE: return 0xC0000185u; // STATUS_IO_DEVICE_ERROR
+    case ERROR_OPERATION_ABORTED: return 0xC0000120u; // STATUS_CANCELLED
+    case ERROR_NOT_ENOUGH_MEMORY:
+    case ERROR_OUTOFMEMORY: return 0xC000009Au; // STATUS_INSUFFICIENT_RESOURCES
+    default: return STATUS_UNSUCCESSFUL;
+    }
+}
 
 static std::string ReadObjAttrPath(uint8_t* base, uint32_t objAttrPtr)
 {
@@ -121,7 +130,7 @@ static std::string ReadObjAttrPath(uint8_t* base, uint32_t objAttrPtr)
     return s;
 }
 
-static std::filesystem::path ResolvePath(std::string p)
+static std::string ResolvePath(std::string p)
 {
     // Strip a drive ("game:\", "d:\") or device ("\Device\Cdrom0\") prefix, then look under VFS_ROOT.
     auto colon = p.find(':');
@@ -129,14 +138,12 @@ static std::filesystem::path ResolvePath(std::string p)
     // data100.bin - expanded - and data100.ofs). TTT2 probes update:\nrfo.bin first; serving the
     // disc's nrfo there made it index data100.bin with the disc table and never read
     // data100.ofs, so every TU3-overridden asset read garbage (the main menu never built).
-    if (colon == 6 && std::equal(p.begin(), p.begin() + colon, "update",
-        [](unsigned char a, unsigned char b) { return std::tolower(a) == b; }))
+    if (colon != std::string::npos && _strnicmp(p.c_str(), "update", colon) == 0 && colon == 6)
     {
         std::string rest = p.substr(colon + 1);
         for (auto& c : rest) if (c == '\\') c = '/';
         while (!rest.empty() && rest[0] == '/') rest.erase(0, 1);
-        return host_file::ResolveDiscPath(VFS_ROOT,
-            std::filesystem::path("update") / rest, false);
+        return std::string(VFS_ROOT) + "/update" + (rest.empty() ? "/" : "/" + rest);
     }
     if (colon != std::string::npos)
         p = p.substr(colon + 1);
@@ -149,14 +156,37 @@ static std::filesystem::path ResolvePath(std::string p)
     for (auto& c : p) if (c == '\\') c = '/';
     while (!p.empty() && p[0] == '/') p.erase(0, 1);
 
-    // The game also names some root data files through a disc subdirectory.
-    return host_file::ResolveDiscPath(VFS_ROOT, p, true);
+    std::error_code ec;
+    std::string full = std::string(VFS_ROOT) + "/" + p;
+    if (std::filesystem::exists(full, ec)) return full;
+
+    // Fall back to the basename, case-insensitively (the game's data*.bin live at the root).
+    auto slash = p.find_last_of('/');
+    std::string bn = (slash == std::string::npos) ? p : p.substr(slash + 1);
+    for (auto& e : std::filesystem::directory_iterator(VFS_ROOT, ec))
+        if (_stricmp(e.path().filename().string().c_str(), bn.c_str()) == 0)
+            return e.path().string();
+    return full;
 }
 
-static std::string HostPathForLog(const std::filesystem::path& path)
+// Final (OS-resolved) path of an open handle, without the \\\\?\\ prefix; empty on failure.
+static std::wstring FinalPath(HANDLE h)
 {
-    const auto utf8=path.u8string();
-    return std::string(reinterpret_cast<const char*>(utf8.data()),utf8.size());
+    std::wstring path(32768, L'\0');
+    const DWORD n=GetFinalPathNameByHandleW(h,path.data(),DWORD(path.size()),FILE_NAME_NORMALIZED);
+    if(!n||n>=path.size())return L"";
+    path.resize(n);
+    if(path.rfind(L"\\\\?\\",0)==0)path.erase(0,4);
+    return path;
+}
+static std::wstring FinalPathOf(const std::filesystem::path& directory)
+{
+    HANDLE h=CreateFileW(directory.c_str(),FILE_TRAVERSE,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                         nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,nullptr);
+    if(h==INVALID_HANDLE_VALUE)return L"";
+    std::wstring path=FinalPath(h);
+    CloseHandle(h);
+    return path;
 }
 
 static void DoOpen(PPCContext& ctx, uint8_t* base,bool create)
@@ -190,51 +220,94 @@ static void DoOpen(PPCContext& ctx, uint8_t* base,bool create)
     }
     std::filesystem::path savePath,container;uint32_t saveError=0;
     bool save=ResolveSaveFile(guestPath,savePath,container,saveError);
-    std::filesystem::path host = save?savePath:ResolvePath(guestPath);
-    const std::string hostLabel=HostPathForLog(host);
-    host_file::File* h=nullptr;uint32_t status=STATUS_SUCCESS,information=1;
+    std::string host = save?savePath.string():ResolvePath(guestPath);
+    HANDLE h=INVALID_HANDLE_VALUE;uint32_t status=STATUS_SUCCESS,information=1;
     const uint32_t writeMask=0x50010116u; // generic write/all, delete, write/append/EA/attributes
     const bool writable=(ctx.r4.u32&writeMask)!=0;
     bool directory=false;
-    const char* stage="";
+    const char* stage="";                                  // save-path diagnostics: failing check
     if(saveError){status=FileErrorStatus(saveError);stage="resolve";}
     else if(!save) {
         if(writable || (create && ctx.r10.u32!=1))status=0xC0000022u;
-        else {
-            auto opened=host_file::OpenDisc(host);
-            h=opened.file;status=opened.status;information=opened.information;stage=opened.stage;
-        }
+        else {h=CreateFileA(host.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+              if(h==INVALID_HANDLE_VALUE)status=IO_STATUS_NAME_NOT_FOUND;}
     } else {
-        // NtCreateFile's ninth argument lives on the guest stack.
+        // TTT2's actual NtOpenFile caller supplies r7=share/r8=options. Create
+        // supplies r9=share/r10=disposition and its ninth argument at SP+0x54.
         if(create&&(!XamGuestRange(ctx.r1.u32,0x58)||(ctx.r7.u32&&!XamGuestRange(ctx.r7.u32,8)))) {
             ctx.r3.u32=IO_STATUS_INVALID_PARAMETER;return;
         }
         uint32_t options=create?GRead32(base,ctx.r1.u32+0x54):ctx.r8.u32;
         const uint32_t disposition=create?ctx.r10.u32:1;
         directory=(options&1)!=0;
-        if(disposition>5 || (options&0x1000)){status=0xC0000002u;stage="options";}
+        if(disposition>5 || (options&0x1000)){status=0xC0000002u;stage="options";} // delete-on-close not implemented
         else {
-            const bool hasAllocation=create&&ctx.r7.u32;
-            const uint64_t allocation=hasAllocation ?
-                (uint64_t(GRead32(base,ctx.r7.u32))<<32)|GRead32(base,ctx.r7.u32+4) : 0;
-            auto opened=host_file::OpenSave(savePath,container,ctx.r4.u32,
-                create?ctx.r9.u32:ctx.r7.u32,disposition,options,
-                create?ctx.r8.u32:0x80u,hasAllocation,allocation);
-            h=opened.file;status=opened.status;information=opened.information;stage=opened.stage;
+            // Open a verified container handle first; the flat child lookup is
+            // relative to that handle, not a reparsable parent path.
+            HANDLE parent=CreateFileW(container.c_str(),FILE_LIST_DIRECTORY|FILE_TRAVERSE,
+                FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+            if(parent==INVALID_HANDLE_VALUE){status=FileErrorStatus(GetLastError());stage="container";}
+            else {
+                BY_HANDLE_FILE_INFORMATION pi{};
+                const std::wstring actual=FinalPath(parent);
+                // The container must be exactly <save root>\\<name> as the OS resolves the root. The
+                // root's own final path can legitimately differ from its logical one: a packaged
+                // (MSIX) launcher, e.g. the Claude desktop app, redirects %LOCALAPPDATA% writes to
+                // ...\\Packages\\<app>\\LocalCache\\Local. Reparse points in the logical root were
+                // already rejected (save_store NoReparse); the container itself must be none.
+                const std::wstring expected=FinalPathOf(container.parent_path())+L"\\"+container.filename().wstring();
+                if(!GetFileInformationByHandle(parent,&pi) || (pi.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT) ||
+                   actual.empty() || _wcsicmp(actual.c_str(),expected.c_str())) {
+                    status=0xC0000022u;stage="final-path";
+                    std::fprintf(stderr,"[io] save container final path '%ls' != '%ls'\n",actual.c_str(),expected.c_str());
+                }
+                else if(savePath==container) {
+                    if(!directory||disposition!=1||writable){status=0xC0000022u;stage="root-access";}
+                    else {h=parent;parent=INVALID_HANDLE_VALUE;}
+                } else if(directory){status=0xC0000002u;stage="nested";} // TTT2 save files are flat.
+                else {
+                    struct NativeString {USHORT length,maximum;PWSTR buffer;};
+                    struct NativeAttributes {ULONG length;HANDLE root;NativeString* name;ULONG attributes;void* security;void* qos;};
+                    struct NativeStatus {union {LONG status;void* pointer;};ULONG_PTR information;};
+                    using OpenNative=LONG (NTAPI*)(PHANDLE,ACCESS_MASK,NativeAttributes*,NativeStatus*,LARGE_INTEGER*,ULONG,ULONG,ULONG,ULONG,void*,ULONG);
+                    static auto ntCreate=reinterpret_cast<OpenNative>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtCreateFile"));
+                    auto name=savePath.filename().wstring();NativeString text{USHORT(name.size()*2),USHORT(name.size()*2),name.data()};
+                    NativeAttributes oa{sizeof(NativeAttributes),parent,&text,0x40,nullptr,nullptr};NativeStatus ios{};
+                    LARGE_INTEGER allocation{};LARGE_INTEGER* allocationPtr=nullptr;
+                    if(create&&ctx.r7.u32){allocation.QuadPart=(uint64_t(GRead32(base,ctx.r7.u32))<<32)|GRead32(base,ctx.r7.u32+4);allocationPtr=&allocation;}
+                    // Host reads/writes use synchronous handles; guest options and
+                    // access still control permission, sharing and disposition. The guest's
+                    // FILE_NO_INTERMEDIATE_BUFFERING (0x8, TTT2's save writes use 0x48) is dropped:
+                    // on the host it demands sector-aligned sizes and buffers, failing small writes.
+                    ULONG hostOptions=(options&~0x18u)|0x20u|0x00200000u;
+                    if(!ntCreate)status=0xC0000002u;
+                    // FILE_READ_ATTRIBUTES lets the reparse check below query a handle the guest
+                    // opened for DELETE only (TTT2's safe-save probes the old slot that way).
+                    else status=uint32_t(ntCreate(&h,ctx.r4.u32|SYNCHRONIZE|FILE_READ_ATTRIBUTES,&oa,&ios,allocationPtr,
+                        create?ctx.r8.u32:FILE_ATTRIBUTE_NORMAL,create?ctx.r9.u32:ctx.r7.u32,disposition,hostOptions,nullptr,0));
+                    information=uint32_t(ios.information);
+                    if(status&0x80000000u)stage="host-NtCreateFile";
+                    if(!(status&0x80000000u)) {
+                        BY_HANDLE_FILE_INFORMATION fi{};
+                        if(!GetFileInformationByHandle(h,&fi)||(fi.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)) {CloseHandle(h);h=INVALID_HANDLE_VALUE;status=0xC0000022u;}
+                    }
+                }
+                if(parent!=INVALID_HANDLE_VALUE)CloseHandle(parent);
+            }
         }
     }
-    if (IoTrace())
     {
         char line[1200];
         if (save)   // save paths: the reason matters (mount state, access, disposition, options)
             std::snprintf(line, sizeof(line), "[io] open '%s' -> %s status=%08X stage=%s access=%08X disp=%u opts=%08X%s\n",
-                          guestPath.c_str(), h == nullptr ? "FAILED" : hostLabel.c_str(), status, stage,
+                          guestPath.c_str(), h == INVALID_HANDLE_VALUE ? "FAILED" : host.c_str(), status, stage,
                           ctx.r4.u32, create ? ctx.r10.u32 : 1u,
                           create ? (XamGuestRange(ctx.r1.u32, 0x58) ? GRead32(base, ctx.r1.u32 + 0x54) : 0u) : ctx.r8.u32,
                           saveError ? " (not mounted / invalid)" : "");
         else
             std::snprintf(line, sizeof(line), "[io] open '%s' -> %s\n", guestPath.c_str(),
-                          h == nullptr ? "NOT FOUND" : hostLabel.c_str());
+                          h == INVALID_HANDLE_VALUE ? "NOT FOUND" : host.c_str());
         std::fputs(line, stderr);
     }
     if (status&0x80000000u)
@@ -247,8 +320,9 @@ static void DoOpen(PPCContext& ctx, uint8_t* base,bool create)
     {
         std::lock_guard l(g_fmutex);
         handle = g_nextFile++;
+        auto slash = host.find_last_of("/\\");
         g_files[handle] = std::make_shared<FileRecord>(h,
-            HostPathForLog(host.filename()));
+            (slash == std::string::npos) ? host : host.substr(slash + 1));
         auto& file=g_files[handle];file->writable=save&&(ctx.r4.u32&0x50000006u);file->directory=directory;
         file->guestPath=guestPath;
         file->deleteAccess=save&&(ctx.r4.u32&0x10010000u);
@@ -266,7 +340,7 @@ bool TryCloseGuestFile(uint32_t handle)
     std::lock_guard l(g_fmutex);
     auto it = g_files.find(handle);
     // An operation that already looked up this file retains the host handle until it
-    // completes. Otherwise closing the host file could race a read or handle reuse.
+    // completes. Otherwise CloseHandle could race a read, or the HANDLE could be reused.
     if (it != g_files.end()) g_files.erase(it);
     return true;
 }
@@ -285,7 +359,7 @@ static void LogSlowIo(const char* what, std::chrono::steady_clock::time_point st
     g_threadIo.bytes += length;
     g_threadIo.ms += ms;
     static std::atomic<int> logged{ 0 };
-    if (ms > 5.0 && logged++ < 300) std::fprintf(stderr, "[frame] slow %s %.1f ms (%u bytes) thread %u\n", what, ms, length, host_thread::CurrentId());
+    if (ms > 5.0 && logged++ < 300) std::fprintf(stderr, "[frame] slow %s %.1f ms (%u bytes) thread %lu\n", what, ms, length, GetCurrentThreadId());
 }
 PPC_FUNC(__imp__NtCreateFile) { KTrace("NtCreateFile"); RollbackNoteIo(true, "NtCreateFile", &ctx); const auto t = std::chrono::steady_clock::now(); DoOpen(ctx, base,true); LogSlowIo("open", t, 0); }
 PPC_FUNC(__imp__NtOpenFile)   { KTrace("NtOpenFile");   RollbackNoteIo(true, "NtOpenFile", &ctx); const auto t = std::chrono::steady_clock::now(); DoOpen(ctx, base,false); LogSlowIo("open", t, 0); }
@@ -309,7 +383,7 @@ PPC_FUNC(__imp__NtReadFile)
         // position. Other negative offsets fail before an I/O is submitted.
         if (effOff < 0 && effOff != -2) { ctx.r3.u32 = IO_STATUS_INVALID_PARAMETER; return; }
     }
-    uint32_t read = 0;
+    DWORD read = 0;
     uint32_t status = STATUS_SUCCESS;
     const auto ioStart = std::chrono::steady_clock::now();
     {
@@ -318,37 +392,37 @@ PPC_FUNC(__imp__NtReadFile)
         std::lock_guard fileLock(file->mutex);
         if (length != 0)
         {
-            uint64_t original = 0, position = 0;
-            status = host_file::Seek(file->handle, 0, host_file::Origin::Current, original);
-            if (status == STATUS_SUCCESS)
+            LARGE_INTEGER zero{}, original{};
+            if (!SetFilePointerEx(file->handle, zero, &original, FILE_CURRENT))
+                status = FileErrorStatus(GetLastError());
+            else
             {
                 const bool explicitOffset = byteOffPtr && effOff != -2;
                 if (explicitOffset)
-                    status = host_file::Seek(file->handle, effOff,
-                                             host_file::Origin::Begin, position);
-                else effOff = int64_t(original);
+                {
+                    LARGE_INTEGER offset; offset.QuadPart = effOff;
+                    if (!SetFilePointerEx(file->handle, offset, nullptr, FILE_BEGIN))
+                        status = FileErrorStatus(GetLastError());
+                }
+                else effOff = original.QuadPart;
                 if (status == STATUS_SUCCESS)
                 {
-                    RollbackBeforeHostWrite(buffer, length);
-                    if (!host_vm::PrepareHostWrite(base + buffer, length))
-                        status = STATUS_UNSUCCESSFUL;
-                    else status = host_file::Read(file->handle, base + buffer, length, read);
-                    if (status == STATUS_SUCCESS && read == 0) status = STATUS_END_OF_FILE;
-                    // NT preserves the old file position on EOF or failure for
-                    // explicit-offset reads. Partial reads still succeed.
-                    if (explicitOffset && (read == 0 || status != STATUS_SUCCESS))
-                    {
-                        const uint32_t restore = host_file::Seek(file->handle,
-                            int64_t(original), host_file::Origin::Begin, position);
-                        if (restore) status = restore;
-                    }
+                    RollbackBeforeHostWrite(buffer, length);   // rollback.cpp: write-protected pages
+                    if (!ReadFile(file->handle, base + buffer, length, &read, nullptr))
+                        status = FileErrorStatus(GetLastError());
+                    else if (read == 0)
+                        status = STATUS_END_OF_FILE;
+                    // Native NtReadFile preserves the old position on EOF (including a
+                    // request beyond EOF) and failed reads. Partial reads still succeed.
+                    if (explicitOffset && (read == 0 || status != STATUS_SUCCESS) &&
+                        !SetFilePointerEx(file->handle, original, nullptr, FILE_BEGIN))
+                        status = FileErrorStatus(GetLastError());
                 }
             }
         }
         // A valid zero-length read succeeds without changing the file position.
     }
     LogSlowIo("read", ioStart, length);
-    if (IoTrace())
     {
         static std::atomic<uint64_t> dlog{0};
         uint64_t dn = ++dlog;
@@ -356,7 +430,7 @@ PPC_FUNC(__imp__NtReadFile)
             std::fprintf(stderr, "[io] read h=%08X '%s' off=%lld len=%u got=%lu status=%08X\n",
                          ctx.r3.u32, file->path.c_str(), (long long)effOff, length, (unsigned long)read, status);
     }
-    if (IoTrace() && status == STATUS_END_OF_FILE)
+    if (status == STATUS_END_OF_FILE)
     {
         static std::atomic<uint32_t> eoflog{0};
         if (++eoflog <= 40)
@@ -385,7 +459,7 @@ PPC_FUNC(__imp__NtReadFile)
     if (n <= 5 || n % 200 == 0)
     {
         char line[160];
-        std::snprintf(line, sizeof(line), "[io] read #%llu h=%08X len=%u got=%u total=%lluKB\n",
+        std::snprintf(line, sizeof(line), "[io] read #%llu h=%08X len=%u got=%lu total=%lluKB\n",
                       (unsigned long long)n, ctx.r3.u32, length, read, (unsigned long long)(bytes / 1024));
         std::fputs(line, stderr);
     }
@@ -406,26 +480,27 @@ PPC_FUNC(__imp__NtSetInformationFile)
         uint64_t pos = ((uint64_t)GRead32(base, ctx.r5.u32) << 32) | GRead32(base, ctx.r5.u32 + 4);
         if ((int64_t)pos < 0) { ctx.r3.u32 = IO_STATUS_INVALID_PARAMETER; return; }
         std::lock_guard fileLock(file->mutex);
-        uint64_t position=0;
-        status=host_file::Seek(file->handle,int64_t(pos),host_file::Origin::Begin,position);
+        LARGE_INTEGER li; li.QuadPart = (LONGLONG)pos;
+        if (!SetFilePointerEx(file->handle, li, nullptr, FILE_BEGIN))
+            status = FileErrorStatus(GetLastError());
     }
     else if(ctx.r7.u32==20 && file->writable && !file->saveContainer.empty()) {
         if(!XamGuestRange(ctx.r5.u32,8)||ctx.r6.u32<8){ctx.r3.u32=IO_STATUS_INVALID_PARAMETER;return;}
-        const uint64_t size=(uint64_t(GRead32(base,ctx.r5.u32))<<32)|GRead32(base,ctx.r5.u32+4);
-        if(int64_t(size)<0){ctx.r3.u32=IO_STATUS_INVALID_PARAMETER;return;}
+        FILE_END_OF_FILE_INFO info{};info.EndOfFile.QuadPart=(uint64_t(GRead32(base,ctx.r5.u32))<<32)|GRead32(base,ctx.r5.u32+4);
+        if(info.EndOfFile.QuadPart<0){ctx.r3.u32=IO_STATUS_INVALID_PARAMETER;return;}
         std::lock_guard fileLock(file->mutex);
-        status=host_file::SetSize(file->handle,size);
+        if(!SetFileInformationByHandle(file->handle,FileEndOfFileInfo,&info,sizeof(info)))status=FileErrorStatus(GetLastError());
     }
     else if(ctx.r7.u32==13 && !file->saveContainer.empty()) {
         // FileDispositionInformation { BOOLEAN DeleteFile }: removed when the last handle closes.
         if(!XamGuestRange(ctx.r5.u32,1)||ctx.r6.u32<1){ctx.r3.u32=IO_STATUS_INVALID_PARAMETER;return;}
         if(!file->deleteAccess||file->directory)status=0xC0000022u;
         else {
-            const bool remove=GRead8(base,ctx.r5.u32)!=0;
+            FILE_DISPOSITION_INFO info{};info.DeleteFile=GRead8(base,ctx.r5.u32)!=0;
             std::lock_guard fileLock(file->mutex);
-            status=host_file::SetDeleteDisposition(file->handle,remove);
+            if(!SetFileInformationByHandle(file->handle,FileDispositionInfo,&info,sizeof(info)))status=FileErrorStatus(GetLastError());
         }
-        if (IoTrace()) std::fprintf(stderr,"[io] delete-disposition '%s' -> %08X\n",file->path.c_str(),status);
+        std::fprintf(stderr,"[io] delete-disposition '%s' -> %08X\n",file->path.c_str(),status);
     }
     else if(ctx.r7.u32==10 && !file->saveContainer.empty()) {
         // FileRenameInformation (Xenia X_FILE_RENAME_INFORMATION): +0 ReplaceIfExists, +4 root
@@ -442,10 +517,16 @@ PPC_FUNC(__imp__NtSetInformationFile)
         else if(target.empty()||!ResolveSaveFile(target,host,container,error)||error||
                 container!=file->saveContainer||host==container)status=error?FileErrorStatus(error):0xC0000033u;
         else {
+            const std::wstring name=host.wstring();
+            std::vector<uint8_t> buf(sizeof(FILE_RENAME_INFO)+name.size()*sizeof(wchar_t));
+            auto* info=reinterpret_cast<FILE_RENAME_INFO*>(buf.data());
+            info->ReplaceIfExists=replace;info->RootDirectory=nullptr;
+            info->FileNameLength=DWORD(name.size()*sizeof(wchar_t));
+            std::memcpy(info->FileName,name.data(),name.size()*sizeof(wchar_t));
             std::lock_guard fileLock(file->mutex);
-            status=host_file::Rename(file->handle,host,replace);
+            if(!SetFileInformationByHandle(file->handle,FileRenameInfo,info,DWORD(buf.size())))status=FileErrorStatus(GetLastError());
         }
-        if (IoTrace()) std::fprintf(stderr,"[io] rename '%s' -> '%s' replace=%d -> %08X\n",file->path.c_str(),target.c_str(),replace?1:0,status);
+        std::fprintf(stderr,"[io] rename '%s' -> '%s' replace=%d -> %08X\n",file->path.c_str(),target.c_str(),replace?1:0,status);
     }
     else if(!file->saveContainer.empty())status=0xC0000002u;
     if (ctx.r4.u32) { GWrite32(base, ctx.r4.u32 + 0, status); GWrite32(base, ctx.r4.u32 + 4, 0); }
@@ -461,21 +542,21 @@ PPC_FUNC(__imp__NtQueryInformationFile)
     uint32_t out = ctx.r5.u32, cls = ctx.r7.u32;
     uint32_t status = STATUS_SUCCESS;
     bool handled = false;
-    uint64_t size=0;
+    LARGE_INTEGER size{};
     std::lock_guard fileLock(file->mutex);
-    if (!file->directory) status=host_file::Size(file->handle,size);
+    if (!file->directory && !GetFileSizeEx(file->handle, &size)) status = FileErrorStatus(GetLastError());
     if (status == STATUS_SUCCESS && out)
     {
         switch (cls)
         {
         case 4:  // FileBasicInformation: 4 timestamps(8) + FileAttributes(4)
             for (int i = 0; i < 0x20; i += 4) GWrite32(base, out + i, 0);
-            GWrite32(base, out + 0x20, file->directory?0x10u:0x80u);
+            GWrite32(base, out + 0x20, file->directory?FILE_ATTRIBUTE_DIRECTORY:FILE_ATTRIBUTE_NORMAL);
             handled = true;
             break;
         case 5:  // FileStandardInformation: AllocationSize @0, EndOfFile @8, links/delete/dir
-            GWrite32(base, out + 0, (uint32_t)(size >> 32)); GWrite32(base, out + 4, (uint32_t)size);
-            GWrite32(base, out + 8, (uint32_t)(size >> 32)); GWrite32(base, out + 12, (uint32_t)size);
+            GWrite32(base, out + 0, (uint32_t)(size.QuadPart >> 32)); GWrite32(base, out + 4, (uint32_t)size.QuadPart);
+            GWrite32(base, out + 8, (uint32_t)(size.QuadPart >> 32)); GWrite32(base, out + 12, (uint32_t)size.QuadPart);
             GWrite32(base, out + 16, 1); GWrite32(base, out + 20, 0);
             if(file->directory)GWrite8(base,out+21,1);
             handled = true;
@@ -495,29 +576,28 @@ PPC_FUNC(__imp__NtQueryInformationFile)
         case 14: // FilePositionInformation
         {
             if (ctx.r6.u32 < 8) { status = IO_STATUS_INVALID_PARAMETER; break; }
-            uint64_t current=0;
-            status=host_file::Seek(file->handle,0,host_file::Origin::Current,current);
-            if(status)break;
-            GWrite32(base, out + 0, (uint32_t)(current >> 32)); GWrite32(base, out + 4, (uint32_t)current);
+            LARGE_INTEGER z{}, cur{};
+            if (!SetFilePointerEx(file->handle, z, &cur, FILE_CURRENT))
+            { status = FileErrorStatus(GetLastError()); break; }
+            GWrite32(base, out + 0, (uint32_t)(cur.QuadPart >> 32)); GWrite32(base, out + 4, (uint32_t)cur.QuadPart);
             handled = true;
             break;
         }
         case 34: // FileNetworkOpenInformation: times @0..0x18, AllocationSize @0x20, EndOfFile @0x28, Attributes @0x30
             for (int i = 0; i < 0x20; i += 4) GWrite32(base, out + i, 0);
-            GWrite32(base, out + 0x20, (uint32_t)(size >> 32)); GWrite32(base, out + 0x24, (uint32_t)size);
-            GWrite32(base, out + 0x28, (uint32_t)(size >> 32)); GWrite32(base, out + 0x2C, (uint32_t)size);
-            GWrite32(base, out + 0x30, file->directory?0x10u:0x80u); GWrite32(base, out + 0x34, 0);
+            GWrite32(base, out + 0x20, (uint32_t)(size.QuadPart >> 32)); GWrite32(base, out + 0x24, (uint32_t)size.QuadPart);
+            GWrite32(base, out + 0x28, (uint32_t)(size.QuadPart >> 32)); GWrite32(base, out + 0x2C, (uint32_t)size.QuadPart);
+            GWrite32(base, out + 0x30, file->directory?FILE_ATTRIBUTE_DIRECTORY:FILE_ATTRIBUTE_NORMAL); GWrite32(base, out + 0x34, 0);
             handled = true;
             break;
         }
     }
-    if (IoTrace())
     {
         static std::atomic<uint32_t> qlog{0};
         if (++qlog <= 200 || !handled)
             std::fprintf(stderr, "[io] qinfo h=%08X '%s' class=%u len=%u size=%lld%s\n",
                          ctx.r3.u32, file->path.c_str(), cls, ctx.r6.u32,
-                         (long long)size, handled ? "" : " UNHANDLED");
+                         (long long)size.QuadPart, handled ? "" : " UNHANDLED");
     }
     if (ctx.r4.u32) { GWrite32(base, ctx.r4.u32 + 0, status); GWrite32(base, ctx.r4.u32 + 4, status == STATUS_SUCCESS ? ctx.r6.u32 : 0); }
     ctx.r3.u32 = status;
@@ -532,28 +612,28 @@ PPC_FUNC(__imp__NtQueryFullAttributesFile)
     std::filesystem::path savePath,container;uint32_t saveError=0;
     bool save=ResolveSaveFile(guestPath,savePath,container,saveError);
     if(saveError){ctx.r3.u32=FileErrorStatus(saveError);return;}
-    std::filesystem::path host = save?savePath:ResolvePath(guestPath);
-    const std::string hostLabel=HostPathForLog(host);
-    uint64_t sz=0;bool directory=false;
-    const uint32_t queryStatus=host_file::QueryAttributes(host,
-        save?container:std::filesystem::path{},sz,directory);
+    std::string host = save?savePath.string():ResolvePath(guestPath);
+    std::error_code ec;
     {
         char line[1200];
-        std::snprintf(line,sizeof(line),"[io] query '%s' -> %s status=%08X\n",
-                      guestPath.c_str(),queryStatus?"FAILED":hostLabel.c_str(),queryStatus);
-        std::fputs(line,stderr);
+        std::snprintf(line, sizeof(line), "[io] query '%s' -> %s\n", guestPath.c_str(),
+                      std::filesystem::exists(host, ec) ? host.c_str() : "NOT FOUND");
+        std::fputs(line, stderr);
     }
-    if(!queryStatus)
+    if (std::filesystem::exists(host, ec))
     {
+        const bool directory=std::filesystem::is_directory(host,ec);
+        uint64_t sz=directory?0:std::filesystem::file_size(host,ec);
+        if(ec){ctx.r3.u32=FileErrorStatus(DWORD(ec.value()));return;}
         uint32_t o = ctx.r4.u32;
         // FILE_NETWORK_OPEN_INFORMATION: times @0..0x18, AllocationSize @0x20, EndOfFile @0x28, Attributes @0x30
         if (o) { for (int i = 0; i < 0x38; i += 4) GWrite32(base, o + i, 0);
-                 GWrite32(base, o + 0x20, (uint32_t)(sz >> 32)); GWrite32(base, o + 0x24, (uint32_t)sz);
-                 GWrite32(base, o + 0x28, (uint32_t)(sz >> 32)); GWrite32(base, o + 0x2C, (uint32_t)sz);
-                 GWrite32(base, o + 0x30, directory?0x10u:0x80u); }
+                 GWrite32(base, o + 0x20, (uint32_t)(sz >> 32)); GWrite32(base, o + 0x24, (uint32_t)sz);   // AllocationSize
+                 GWrite32(base, o + 0x28, (uint32_t)(sz >> 32)); GWrite32(base, o + 0x2C, (uint32_t)sz);   // EndOfFile
+                 GWrite32(base, o + 0x30, directory?FILE_ATTRIBUTE_DIRECTORY:FILE_ATTRIBUTE_NORMAL); }
         ctx.r3.u32 = STATUS_SUCCESS;
     }
-    else ctx.r3.u32 = queryStatus;
+    else ctx.r3.u32 = IO_STATUS_NAME_NOT_FOUND;
 }
 
 PPC_FUNC(__imp__NtWriteFile)
@@ -565,18 +645,16 @@ PPC_FUNC(__imp__NtWriteFile)
     if(!XamGuestRange(ios,8)||(length&&!XamGuestRange(buffer,length,1))||(offsetPtr&&!XamGuestRange(offsetPtr,8))) {ctx.r3.u32=IO_STATUS_INVALID_PARAMETER;return;}
     int64_t offset=-2;if(offsetPtr)offset=int64_t((uint64_t(GRead32(base,offsetPtr))<<32)|GRead32(base,offsetPtr+4));
     if(offset<0 && offset!=-1 && offset!=-2){ctx.r3.u32=IO_STATUS_INVALID_PARAMETER;return;}
-    uint32_t written=0;uint32_t status=0;
+    DWORD written=0;uint32_t status=0;
     {std::lock_guard fileLock(file->mutex);
      if(!file->writable || file->saveContainer.empty() || file->directory)status=0xC0000022u;
      else if(length) {
-        uint64_t original=0,position=0;
-        status=host_file::Seek(file->handle,0,host_file::Origin::Current,original);
-        if(!status) {
-            if(offset!=-2)
-                status=host_file::Seek(file->handle,offset==-1?0:offset,
-                    offset==-1?host_file::Origin::End:host_file::Origin::Begin,position);
-            if(!status)status=host_file::Write(file->handle,base+buffer,length,written);
-            if(status && offset!=-2)host_file::Seek(file->handle,int64_t(original),host_file::Origin::Begin,position);
+        LARGE_INTEGER original{},zero{},target{};
+        if(!SetFilePointerEx(file->handle,zero,&original,FILE_CURRENT))status=FileErrorStatus(GetLastError());
+        else {
+            if(offset!=-2){target.QuadPart=offset==-1?0:offset;if(!SetFilePointerEx(file->handle,target,nullptr,offset==-1?FILE_END:FILE_BEGIN))status=FileErrorStatus(GetLastError());}
+            if(!status && !WriteFile(file->handle,base+buffer,length,&written,nullptr))status=FileErrorStatus(GetLastError());
+            if(status && offset!=-2)SetFilePointerEx(file->handle,original,nullptr,FILE_BEGIN);
         }
      }}
     GWrite32(base,ios,status);GWrite32(base,ios+4,written);
@@ -587,7 +665,7 @@ PPC_FUNC(__imp__NtFlushBuffersFile)
 {
     KTrace("NtFlushBuffersFile");auto file=GetFile(ctx.r3.u32);
     if(!file){ctx.r3.u32=IO_STATUS_INVALID_HANDLE;return;}
-    uint32_t status=0;{std::lock_guard fileLock(file->mutex);if(file->writable)status=FileErrorStatus(host_file::Flush(file->handle));}
+    uint32_t status=0;{std::lock_guard fileLock(file->mutex);if(file->writable&&!FlushFileBuffers(file->handle))status=FileErrorStatus(GetLastError());}
     if(ctx.r4.u32){GWrite32(base,ctx.r4.u32,status);GWrite32(base,ctx.r4.u32+4,0);}ctx.r3.u32=status;
 }
 PPC_FUNC(__imp__NtQueryDirectoryFile)
@@ -611,16 +689,20 @@ PPC_FUNC(__imp__NtQueryDirectoryFile)
     {std::lock_guard fileLock(file->mutex);
      if(GRead32(base,ctx.r1.u32+0x54)){file->directoryScanned=false;file->directoryCursor=0;file->directoryItems.clear();}
      if(!file->directoryScanned){
-        std::vector<host_file::DirectoryEntry> listed;
-        status=host_file::ListRegularFiles(file->handle,listed);
+        std::error_code ec;
         file->directoryItems.clear();
-        if(!status)for(const auto& item:listed){
-            const auto& name=item.name;
-            if(wildcard || (name.size()==pattern.size() &&
-                std::equal(name.begin(),name.end(),pattern.begin(),
-                    [](unsigned char a,unsigned char b){return std::tolower(a)==std::tolower(b); })))
-                file->directoryItems.push_back(item);
+        for(auto it=std::filesystem::directory_iterator(file->saveContainer,ec);!ec&&it!=std::filesystem::directory_iterator();it.increment(ec)) {
+            const auto& d=*it;
+            auto name=d.path().filename().string();if(name.empty()||name[0]=='.')continue;
+            DWORD attr=GetFileAttributesW(d.path().c_str());
+            if(attr==INVALID_FILE_ATTRIBUTES){status=FileErrorStatus(GetLastError());break;}
+            if(attr&FILE_ATTRIBUTE_REPARSE_POINT){status=0xC0000022u;break;}
+            if(attr&FILE_ATTRIBUTE_DIRECTORY)continue;
+            if(wildcard || _stricmp(name.c_str(),pattern.c_str())==0){
+                uint64_t size=d.file_size(ec);if(ec)break;file->directoryItems.push_back({name,size});
+            }
         }
+        if(ec)status=FileErrorStatus(uint32_t(ec.value()));
         if(!status){std::sort(file->directoryItems.begin(),file->directoryItems.end(),[](auto& a,auto& b){return a.name<b.name;});file->directoryScanned=true;}
      }
      if(!status){
@@ -629,11 +711,11 @@ PPC_FUNC(__imp__NtQueryDirectoryFile)
             const auto& item=file->directoryItems[file->directoryCursor];uint32_t required=64+uint32_t(item.name.size());
             if(bytes<required)status=0xC0000023u;
             else {
-                guest_memory::FillGuest(base, base+out,0,required);GWrite32(base,out+4,uint32_t(file->directoryCursor));
+                std::memset(base+out,0,required);GWrite32(base,out+4,uint32_t(file->directoryCursor));
                 GWrite32(base,out+40,uint32_t(item.size>>32));GWrite32(base,out+44,uint32_t(item.size));
                 uint64_t allocated=(item.size+4095)&~uint64_t(4095);GWrite32(base,out+48,uint32_t(allocated>>32));GWrite32(base,out+52,uint32_t(allocated));
-                GWrite32(base,out+56,0x80u);GWrite32(base,out+60,uint32_t(item.name.size()));
-                guest_memory::CopyToGuest(base, base+out+64,item.name.data(),item.name.size());returned=required;++file->directoryCursor;
+                GWrite32(base,out+56,FILE_ATTRIBUTE_NORMAL);GWrite32(base,out+60,uint32_t(item.name.size()));
+                std::memcpy(base+out+64,item.name.data(),item.name.size());returned=required;++file->directoryCursor;
             }
         }
      }}

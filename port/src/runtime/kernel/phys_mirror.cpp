@@ -10,16 +10,16 @@
 // 1024x1024 resolve at A7515000 that way and reads C7515000 - all zeros here, so every baked
 // costume texture became all-black DXT blocks.
 //
-// The guest block is private and uses host VM written-page tracking for texture
-// invalidation, so these views cannot share pages. C and E are copies filled on demand:
-// the first access to a 64 KB chunk writes back any GPU resolve covering it, copies A into
-// that alias, and opens the chunk. Switching between C and E writes the previous alias's
-// dirty pages into A first. A resolve or frame swap closes open chunks in both aliases.
+// The guest block is one private MEM_WRITE_WATCH allocation (the GPU backend's texture
+// invalidation depends on GetWriteWatch), so the two views cannot share pages. The C view is
+// instead a coherent copy filled on demand: it starts PAGE_NOACCESS; the first access to a
+// 64 KB chunk has the GPU backend write back any resolve covering it, copies the A bytes in
+// and opens the chunk. A resolve into the A view, or a frame swap, closes chunks again,
+// first copying any page the CPU wrote through the C view back to the A view.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include "phys_mirror.h"
 #include "gpu_render.h"
-#include "../host_vm.h"
-#include <algorithm>
-#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -28,165 +28,151 @@
 #include <vector>
 
 namespace {
-constexpr uint32_t VIEW_A = 0xA0000000u, VIEW_C = 0xC0000000u;
-constexpr uint32_t VIEW_SIZE = 0x20000000u;
+constexpr uint32_t VIEW_A = 0xA0000000u, VIEW_C = 0xC0000000u, VIEW_SIZE = 0x20000000u;
 constexpr uint32_t CHUNK = 0x10000u, PAGE = 0x1000u, CHUNKS = VIEW_SIZE / CHUNK;
-constexpr std::array<uint32_t, 2> ALIASES{VIEW_C, 0xE0000000u};
 
 uint8_t* g_mirrorBase = nullptr;
 std::mutex g_mirrorMutex;
-std::array<std::vector<uint8_t>, 2> g_open;   // per alias/chunk: 1 = filled and accessible
-std::array<std::vector<uint8_t>, 2> g_listed; // avoid duplicate open-list entries on alias switches
-std::vector<uint32_t> g_openList;            // alias * CHUNKS + chunk
+std::vector<uint8_t> g_open;                 // per chunk: 1 = filled and accessible
+std::vector<uint32_t> g_openList;            // open chunk indices (for InvalidateAll)
 std::atomic<uint32_t> g_generation{ 0 };     // bumped by every invalidation
 std::atomic<uint64_t> g_fills{ 0 }, g_writeBacks{ 0 };
 
-uint8_t* AliasView(unsigned alias, uint32_t chunk)
-{
-    return g_mirrorBase + ALIASES[alias] + size_t(chunk) * CHUNK;
-}
+uint8_t* CView(uint32_t chunk) { return g_mirrorBase + VIEW_C + size_t(chunk) * CHUNK; }
 uint8_t* AView(uint32_t chunk) { return g_mirrorBase + VIEW_A + size_t(chunk) * CHUNK; }
 
-void RequireVm(bool succeeded, const char* operation, unsigned alias, uint32_t chunk)
+// Copy A -> C page by page, opening each page only once it is about to be written, so another
+// thread touching a later page of the chunk faults (and waits on the mutex) instead of seeing
+// half-copied bytes. Caller holds g_mirrorMutex.
+void Fill(uint32_t chunk)
 {
-    if (succeeded) return;
-    std::fprintf(stderr, "[phys-mirror] %s failed at %08X (%lu)\n", operation,
-                 ALIASES[alias] + chunk * CHUNK, host_vm::LastError());
-    std::abort(); // Continuing would expose a partly copied or stale physical view.
-}
-
-// Copy A -> alias and arm write tracking. The Linux VM backend fills through a
-// separate mapping while the guest view remains inaccessible. Caller holds
-// g_mirrorMutex.
-void Fill(unsigned alias, uint32_t chunk)
-{
-    uint8_t* c = AliasView(alias, chunk);
+    uint8_t* c = CView(chunk);
     const uint8_t* a = AView(chunk);
-    RequireVm(host_vm::FillMirrorView(c, a, CHUNK), "fill cached view", alias, chunk);
-    g_open[alias][chunk] = 1;
-    if (!g_listed[alias][chunk])
+    DWORD old;
+    for (uint32_t p = 0; p < CHUNK; p += PAGE)
     {
-        g_listed[alias][chunk] = 1;
-        g_openList.push_back(alias * CHUNKS + chunk);
+        VirtualProtect(c + p, PAGE, PAGE_READWRITE, &old);
+        std::memcpy(c + p, a + p, PAGE);
     }
+    ResetWriteWatch(c, CHUNK);               // only guest writes from here on count
+    g_open[chunk] = 1;
+    g_openList.push_back(chunk);
     g_fills.fetch_add(1, std::memory_order_relaxed);
 }
 
-// Caller holds g_mirrorMutex. Pages written through either alias go back to A first.
-void Close(unsigned alias, uint32_t chunk)
+// Caller holds g_mirrorMutex. Pages written through the C view go back to the A view first.
+void Close(uint32_t chunk)
 {
-    uint8_t* c = AliasView(alias, chunk);
-    RequireVm(host_vm::Protect(c, CHUNK, host_vm::Protection::ReadOnly),
-              "stop writers", alias, chunk);
-    void* written[CHUNK / PAGE];
-    size_t count = 0;
-    RequireVm(host_vm::TakeWriteWatch(c, CHUNK, written, CHUNK / PAGE, count, true),
-              "collect dirty pages", alias, chunk);
-    for (size_t i = 0; i < count; ++i)
-    {
-        const size_t offset = static_cast<uint8_t*>(written[i]) - c;
-        std::memcpy(AView(chunk) + offset, c + offset, PAGE);
-        g_writeBacks.fetch_add(1, std::memory_order_relaxed);
-    }
-    RequireVm(host_vm::Protect(c, CHUNK, host_vm::Protection::None),
-              "close chunk", alias, chunk);
-    g_open[alias][chunk] = 0;
+    uint8_t* c = CView(chunk);
+    DWORD old;
+    VirtualProtect(c, CHUNK, PAGE_READONLY, &old);   // writers now fault and wait on the mutex
+    PVOID written[CHUNK / PAGE];
+    ULONG_PTR count = CHUNK / PAGE;
+    DWORD granularity = 0;
+    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, c, CHUNK, written, &count, &granularity) == 0)
+        for (ULONG_PTR i = 0; i < count; ++i)
+        {
+            const size_t offset = static_cast<uint8_t*>(written[i]) - c;
+            std::memcpy(AView(chunk) + offset, c + offset, PAGE);
+            g_writeBacks.fetch_add(1, std::memory_order_relaxed);
+        }
+    VirtualProtect(c, CHUNK, PAGE_NOACCESS, &old);
+    g_open[chunk] = 0;
 }
 
-void CloseRange(uint32_t start, uint32_t size, bool announceResolve)
+LONG CALLBACK MirrorVeh(EXCEPTION_POINTERS* ep)
 {
-    if (!g_mirrorBase || !size || start < VIEW_A) return;
-    const uint32_t phys = start & 0x1FFFFFFFu;
-    const uint64_t end = (std::min<uint64_t>)(uint64_t(phys) + size, VIEW_SIZE);
-    std::lock_guard<std::mutex> lock(g_mirrorMutex);
-    // A new GPU resolve must make a concurrent fault worker repeat its
-    // writeback before filling a cached chunk. A pre-read flush need not.
-    if (announceResolve) g_generation.fetch_add(1, std::memory_order_acq_rel);
-    bool closed = false;
-    for (uint32_t chunk = phys / CHUNK; uint64_t(chunk) * CHUNK < end; ++chunk)
-        for (unsigned alias = 0; alias < ALIASES.size(); ++alias)
-            if (g_open[alias][chunk]) { Close(alias, chunk); closed = true; }
-    if (closed)
-    {
-        g_openList.erase(std::remove_if(g_openList.begin(), g_openList.end(), [](uint32_t id) {
-            const unsigned alias = id / CHUNKS;
-            const uint32_t chunk = id % CHUNKS;
-            if (g_open[alias][chunk]) return false;
-            g_listed[alias][chunk] = 0;
-            return true;
-        }), g_openList.end());
-    }
-}
-
-}
-
-PhysMirrorFaultResult PhysMirrorHandleFault(uintptr_t fault)
-{
-    if (!g_mirrorBase) return PhysMirrorFaultResult::Unhandled;
+    const EXCEPTION_RECORD* r = ep->ExceptionRecord;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || !g_mirrorBase)
+        return EXCEPTION_CONTINUE_SEARCH;
     const uint64_t lo = reinterpret_cast<uint64_t>(g_mirrorBase) + VIEW_C;
-    if (fault < lo || fault >= lo + uint64_t(VIEW_SIZE) * ALIASES.size())
-        return PhysMirrorFaultResult::Unhandled;
-    const uint64_t offset = fault - lo;
-    const unsigned alias = unsigned(offset / VIEW_SIZE);
-    const uint32_t chunk = uint32_t((offset % VIEW_SIZE) / CHUNK);
-    for (;;)
+    const uint64_t fault = r->ExceptionInformation[1];
+    if (fault < lo || fault >= lo + VIEW_SIZE) return EXCEPTION_CONTINUE_SEARCH;
+    const uint32_t chunk = uint32_t((fault - lo) / CHUNK);
+    for (int attempt = 0;; ++attempt)
     {
         // The writeback takes the GPU backend lock; never hold the mirror lock across it
         // (the command processor invalidates with the backend idle but may hold it later).
         const uint32_t generation = g_generation.load(std::memory_order_acquire);
         GpuHwWriteBackRange(VIEW_A + chunk * CHUNK, CHUNK);
         std::lock_guard<std::mutex> lock(g_mirrorMutex);
-        if (g_open[alias][chunk]) return PhysMirrorFaultResult::AlreadyOpen; // filled meanwhile
+        if (g_open[chunk]) return EXCEPTION_CONTINUE_EXECUTION;    // filled meanwhile; retry
         // A resolve landed between the writeback and the lock: write that one back too.
-        if (g_generation.load(std::memory_order_acquire) != generation) continue;
-        if (g_open[alias ^ 1][chunk]) Close(alias ^ 1, chunk);
-        Fill(alias, chunk);
-        return PhysMirrorFaultResult::Filled;
+        if (g_generation.load(std::memory_order_acquire) != generation && attempt < 4) continue;
+        Fill(chunk);
+        // TTT2_MIRROR_LOG=1: name the code reading the cached view (host RVA -> rva2sym.py).
+        static const bool log = [] { const char* e = std::getenv("TTT2_MIRROR_LOG"); return e && *e == '1'; }();
+        static std::atomic<uint32_t> seen{ 0 };
+        const uint32_t n = seen.fetch_add(1, std::memory_order_relaxed);
+        if (log && (n < 400 || (n & 127) == 0))          // all early fills, then a sample
+        {
+            const uint64_t module = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+            // Unwind a few host frames from the fault: the callers are recompiled guest
+            // functions (a guest memcpy alone does not say who copies).
+            uint64_t callers[3] = {};
+            CONTEXT walk = *ep->ContextRecord;
+            for (uint64_t& caller : callers)
+            {
+                DWORD64 imageBase = 0;
+                PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(walk.Rip, &imageBase, nullptr);
+                if (!fn)
+                {
+                    // Leaf function (no unwind data): the return address is on top of the stack.
+                    walk.Rip = *reinterpret_cast<const DWORD64*>(walk.Rsp);
+                    walk.Rsp += 8;
+                }
+                else
+                {
+                    PVOID handlerData = nullptr;
+                    DWORD64 establisher = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, walk.Rip, fn, &walk, &handlerData, &establisher, nullptr);
+                }
+                if (!walk.Rip) break;
+                caller = walk.Rip - module;
+            }
+            std::fprintf(stderr, "[phys-mirror] fill %08X %s pc RVA=0x%llX callers 0x%llX 0x%llX 0x%llX\n",
+                         VIEW_C + chunk * CHUNK, r->ExceptionInformation[0] ? "write" : "read",
+                         (unsigned long long)(reinterpret_cast<uint64_t>(r->ExceptionAddress) - module),
+                         (unsigned long long)callers[0], (unsigned long long)callers[1], (unsigned long long)callers[2]);
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
 }
+}
 
-bool PhysMirrorInit(uint8_t* base)
+void PhysMirrorInit(uint8_t* base)
 {
-    for (unsigned alias = 0; alias < ALIASES.size(); ++alias)
-    {
-        g_open[alias].assign(CHUNKS, 0);
-        g_listed[alias].assign(CHUNKS, 0);
-    }
-    g_openList.clear();
-    g_openList.reserve(ALIASES.size() * CHUNKS);
+    g_open.assign(CHUNKS, 0);
     g_mirrorBase = base;
-    const size_t cachedBytes = size_t(VIEW_SIZE) * ALIASES.size();
-    if (!host_vm::InstallMirrorBacking(base + VIEW_C, cachedBytes))
+    DWORD old;
+    if (!VirtualProtect(base + VIEW_C, VIEW_SIZE, PAGE_NOACCESS, &old))
     {
-        std::fprintf(stderr, "[phys-mirror] cannot prepare cached views (%lu)\n",
-                     host_vm::LastError());
+        std::fprintf(stderr, "[phys-mirror] cannot close the cached view (%lu); C-view reads stay zero\n",
+                     GetLastError());
         g_mirrorBase = nullptr;
-        return false;
+        return;
     }
-    if (!PhysMirrorInstallFaultHandler(base + VIEW_C, cachedBytes))
-    {
-        std::fprintf(stderr, "[phys-mirror] cannot install cached-view fault handler\n");
-        g_mirrorBase = nullptr;
-        return false;
-    }
-    if (!host_vm::Protect(base + VIEW_C, cachedBytes, host_vm::Protection::None))
-    {
-        std::fprintf(stderr, "[phys-mirror] cannot close the cached views (%lu)\n",
-                     host_vm::LastError());
-        g_mirrorBase = nullptr;
-        return false;
-    }
-    return true;
+    AddVectoredExceptionHandler(1, MirrorVeh);
 }
 
 void PhysMirrorInvalidate(uint32_t start, uint32_t size)
 {
-    CloseRange(start, size, true);
-}
-
-void PhysMirrorFlushRange(uint32_t start, uint32_t size)
-{
-    CloseRange(start, size, false);
+    if (!g_mirrorBase || !size) return;
+    // Accept either view's address for the same physical bytes.
+    const uint32_t phys = start & 0x1FFFFFFFu;
+    if (start < VIEW_A || start >= VIEW_C + VIEW_SIZE) return;
+    const uint64_t end = (std::min<uint64_t>)(uint64_t(phys) + size, VIEW_SIZE);
+    std::lock_guard<std::mutex> lock(g_mirrorMutex);
+    g_generation.fetch_add(1, std::memory_order_acq_rel);
+    bool closed = false;
+    for (uint32_t chunk = phys / CHUNK; uint64_t(chunk) * CHUNK < end; ++chunk)
+        if (g_open[chunk]) { Close(chunk); closed = true; }
+    if (closed)
+    {
+        std::vector<uint32_t> still;
+        for (uint32_t chunk : g_openList) if (g_open[chunk]) still.push_back(chunk);
+        g_openList.swap(still);
+    }
 }
 
 void PhysMirrorInvalidateAll()
@@ -194,13 +180,7 @@ void PhysMirrorInvalidateAll()
     if (!g_mirrorBase) return;
     std::lock_guard<std::mutex> lock(g_mirrorMutex);
     g_generation.fetch_add(1, std::memory_order_acq_rel);
-    for (uint32_t id : g_openList)
-    {
-        const unsigned alias = id / CHUNKS;
-        const uint32_t chunk = id % CHUNKS;
-        if (g_open[alias][chunk]) Close(alias, chunk);
-        g_listed[alias][chunk] = 0;
-    }
+    for (uint32_t chunk : g_openList) if (g_open[chunk]) Close(chunk);
     g_openList.clear();
     static uint64_t reported = 0;
     const uint64_t fills = g_fills.load(std::memory_order_relaxed);

@@ -3,7 +3,6 @@
 // constrained and existing reparse points are rejected before file operations.
 #include "save_store.h"
 #include "profiles.h"
-#include "../host_storage.h"
 #include <cwchar>
 #include <cstdio>
 #include <algorithm>
@@ -11,12 +10,9 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
-// Guest-facing DOS error numbers are independent of the host's errno values.
-static constexpr uint32_t ERROR_FILE_NOT_FOUND = 2, ERROR_PATH_NOT_FOUND = 3;
-static constexpr uint32_t ERROR_ACCESS_DENIED = 5, ERROR_INVALID_PARAMETER = 87;
-static constexpr uint32_t ERROR_INVALID_NAME = 123, ERROR_BUSY = 170;
-static constexpr uint32_t ERROR_ALREADY_EXISTS = 183, ERROR_NOT_LOGGED_ON = 1245;
-static constexpr uint32_t ERROR_FILE_CORRUPT = 1392;
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 #ifndef TTT2_LOCAL_SAVES
 #define TTT2_LOCAL_SAVES 0
 #endif
@@ -40,11 +36,29 @@ bool Component(const std::string& s)
 }
 uint32_t NoReparse(const std::filesystem::path& path)
 {
-    return host_storage::RejectLinks(path);
+    std::filesystem::path part;
+    for(const auto& component:path) {
+        part/=component;
+        if(part==path.root_name())continue; // C: alone is drive-relative.
+        DWORD a=GetFileAttributesW(part.c_str());
+        if(a==INVALID_FILE_ATTRIBUTES) {
+            const auto e=GetLastError();
+            if(e==ERROR_FILE_NOT_FOUND||e==ERROR_PATH_NOT_FOUND)continue;
+            return e;
+        }
+        if(a&FILE_ATTRIBUTE_REPARSE_POINT)return ERROR_ACCESS_DENIED;
+    }
+    return 0;
 }
 uint32_t Root(std::filesystem::path& root)
 {
-    if (uint32_t error = host_storage::SaveBase(root)) return error;
+    // An override is useful for repeatable tests and portable installations.
+    const wchar_t* overridePath=_wgetenv(L"TTT2_SAVE_ROOT");
+    const wchar_t* local=_wgetenv(L"LOCALAPPDATA");
+    if(overridePath&&*overridePath)root=overridePath;
+    else if(local&&*local)root=std::filesystem::path(local)/L"TTT2Recomp"/L"saves";
+    else return ERROR_PATH_NOT_FOUND;
+    if(!root.is_absolute())return ERROR_INVALID_NAME;
     const uint64_t xuid=LocalXuid();
     if(!xuid)return ERROR_NOT_LOGGED_ON;          // nobody signed in: no save device
     wchar_t folder[17];swprintf(folder,17,L"%016llX",static_cast<unsigned long long>(xuid));
@@ -65,11 +79,12 @@ uint32_t RecordPath(const SaveContentRecord& record,std::filesystem::path& path)
 uint32_t ReadMetadata(const std::filesystem::path& path,SaveContentRecord& record,uint64_t& creator)
 {
     if(uint32_t e=NoReparse(path/META))return e;
-    std::array<uint8_t,324> data{};
-    uint32_t readError=host_storage::ReadExact(path/META,data.data(),data.size());
-    if(readError==ERROR_FILE_NOT_FOUND)return ERROR_PATH_NOT_FOUND;
-    if(readError)return readError;
-    if(std::memcmp(data.data(),"TTT2SAV1",8))return ERROR_FILE_CORRUPT;
+    HANDLE h=CreateFileW((path/META).c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(h==INVALID_HANDLE_VALUE){auto e=GetLastError();return e==ERROR_FILE_NOT_FOUND?ERROR_PATH_NOT_FOUND:e;}
+    std::array<uint8_t,324> data{};DWORD n=0;LARGE_INTEGER size{};
+    bool ok=GetFileSizeEx(h,&size)&&size.QuadPart==data.size()&&ReadFile(h,data.data(),DWORD(data.size()),&n,nullptr)&&n==data.size();
+    CloseHandle(h);
+    if(!ok || std::memcmp(data.data(),"TTT2SAV1",8))return ERROR_FILE_CORRUPT;
     creator=0;for(unsigned i=8;i<16;++i)creator=creator<<8|data[i];
     std::copy(data.begin()+16,data.end(),record.begin());
     std::filesystem::path expected;
@@ -81,7 +96,15 @@ uint32_t WriteMetadata(const std::filesystem::path& path,const SaveContentRecord
     std::array<uint8_t,324> data{};std::memcpy(data.data(),"TTT2SAV1",8);
     for(unsigned i=0;i<8;++i)data[8+i]=uint8_t(LocalXuid()>>(56-8*i));
     std::copy(record.begin(),record.end(),data.begin()+16);
-    return host_storage::WriteAtomic(path/META,data.data(),data.size());
+    const auto temp=path/L".ttt2-content-tmp";
+    if(uint32_t e=NoReparse(temp))return e;
+    HANDLE h=CreateFileW(temp.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(h==INVALID_HANDLE_VALUE)return GetLastError();
+    DWORD n=0;uint32_t e=0;
+    if(!WriteFile(h,data.data(),DWORD(data.size()),&n,nullptr)||n!=data.size()||!FlushFileBuffers(h))e=GetLastError()?GetLastError():ERROR_WRITE_FAULT;
+    CloseHandle(h);if(e)return e;
+    if(!MoveFileExW(temp.c_str(),(path/META).c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))return GetLastError();
+    return 0;
 }
 uint32_t DeleteTree(const std::filesystem::path& path)
 {
@@ -90,7 +113,11 @@ uint32_t DeleteTree(const std::filesystem::path& path)
     if(path.parent_path()!=root || !Component(path.filename().string()))return ERROR_ACCESS_DENIED;
     if((e=NoReparse(path)))return e;
     if((e=FlushSaveFiles(path,true)))return e;
-    return host_storage::RemoveTree(path);
+    std::error_code ec;
+    for(auto it=std::filesystem::recursive_directory_iterator(path,ec);!ec&&it!=std::filesystem::recursive_directory_iterator();it.increment(ec))
+        if((e=NoReparse(it->path())))return e;
+    if(ec)return uint32_t(ec.value());
+    std::filesystem::remove_all(path,ec);return ec?uint32_t(ec.value()):0;
 }
 }
 
@@ -112,7 +139,7 @@ struct JournalFile
 {
     std::wstring name;
     std::vector<uint8_t> bytes;
-    std::filesystem::file_time_type written{};                        // as copied: an unchanged file is left alone on undo
+    FILETIME written{};                        // as copied: an unchanged file is left alone on undo
 };
 struct JournalEntry
 {
@@ -121,27 +148,39 @@ struct JournalEntry
     bool existed = false;
     std::vector<JournalFile> files;
 };
-bool WrittenAt(const std::filesystem::path& p, std::filesystem::file_time_type& t, uint64_t& size)
+bool WrittenAt(const std::filesystem::path& p, FILETIME& t, uint64_t& size)
 {
-    std::error_code ec;
-    t = std::filesystem::last_write_time(p, ec);
-    if (ec) return false;
-    size = std::filesystem::file_size(p, ec);
-    return !ec;
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &a)) return false;
+    t = a.ftLastWriteTime;
+    size = uint64_t(a.nFileSizeHigh) << 32 | a.nFileSizeLow;
+    return true;
 }
-
 std::vector<JournalEntry> g_journal;           // under g_saveMutex, oldest first
 bool ReadWhole(const std::filesystem::path& p, std::vector<uint8_t>& out)
 {
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(p, ec);
-    if (ec || size >= (64ull << 20)) return false;
-    out.resize(size_t(size));
-    return host_storage::ReadExact(p, out.data(), out.size()) == 0;
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER size{};
+    bool ok = GetFileSizeEx(h, &size) && size.QuadPart < (64ll << 20);
+    if (ok)
+    {
+        out.resize(size_t(size.QuadPart));
+        DWORD n = 0;
+        ok = out.empty() || (ReadFile(h, out.data(), DWORD(out.size()), &n, nullptr) && n == out.size());
+    }
+    CloseHandle(h);
+    return ok;
 }
 bool WriteWhole(const std::filesystem::path& p, const std::vector<uint8_t>& data)
 {
-    return host_storage::WriteAtomic(p, data.data(), data.size()) == 0;
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    DWORD n = 0;
+    const bool ok = data.empty() || (WriteFile(h, data.data(), DWORD(data.size()), &n, nullptr) && n == data.size());
+    CloseHandle(h);
+    return ok;
 }
 }
 
@@ -168,14 +207,14 @@ void SaveJournalCapture(const SaveContentRecord& record, int32_t frame)
             uint64_t size = 0;
             if (!WrittenAt(it->path(), f.written, size) || !ReadWhole(it->path(), f.bytes))
             {
-                std::fprintf(stderr, "[save-journal] could not copy %ls - no copy of this save\n", it->path().filename().wstring().c_str());
+                std::fprintf(stderr, "[save-journal] could not copy %ls - no copy of this save\n", it->path().filename().c_str());
                 return;
             }
             bytes += f.bytes.size();
             e.files.push_back(std::move(f));
         }
     std::fprintf(stderr, "[save-journal] save in frame %d (not confirmed yet): %zu files (%zu bytes) of %ls copied\n", frame,
-                 e.files.size(), bytes, dir.filename().wstring().c_str());
+                 e.files.size(), bytes, dir.filename().c_str());
     g_journal.push_back(std::move(e));
 }
 
@@ -219,15 +258,15 @@ int SaveJournalUndo(int32_t fromFrame)
             bool keep = false;
             for (const JournalFile& f : e.files) keep |= p.filename().wstring() == f.name;
             if (keep) continue;
-            if (std::filesystem::remove(p, ec)) ++removed;
+            if (DeleteFileW(p.c_str())) ++removed;
             else ok = false;
         }
         for (const JournalFile& f : e.files)
         {
             const auto p = e.dir / f.name;
-            std::filesystem::file_time_type t{};
+            FILETIME t{};
             uint64_t size = 0;
-            if (WrittenAt(p, t, size) && size == f.bytes.size() && t == f.written) continue;
+            if (WrittenAt(p, t, size) && size == f.bytes.size() && CompareFileTime(&t, &f.written) == 0) continue;
             if (WriteWhole(p, f.bytes)) ++put;
             else ok = false;
         }
@@ -256,15 +295,14 @@ uint32_t SaveListContent(std::vector<SaveContentRecord>& records)
     if constexpr (!TTT2_LOCAL_SAVES) { records.clear(); return 0; }
     std::lock_guard lock(g_saveMutex);records.clear();std::filesystem::path root;
     if(uint32_t e=Root(root))return e;
+    std::error_code ec;if(!std::filesystem::exists(root,ec))return ec?uint32_t(ec.value()):0;
     std::vector<std::filesystem::path> paths;
-    if(uint32_t e=host_storage::ListDirectories(root,paths))return e;
-    std::sort(paths.begin(),paths.end());
-    for(const auto& p:paths){
-        if(!Component(p.filename().string()))continue;
-        SaveContentRecord r{};uint64_t owner=0;
-        uint32_t e=ReadMetadata(p,r,owner);if(e)return e;
-        if(owner==LocalXuid())records.push_back(r);
+    for(auto it=std::filesystem::directory_iterator(root,ec);!ec&&it!=std::filesystem::directory_iterator();it.increment(ec)) {
+        if(uint32_t e=NoReparse(it->path()))return e;
+        if(it->is_directory(ec))paths.push_back(it->path());
     }
+    if(ec)return uint32_t(ec.value());std::sort(paths.begin(),paths.end());
+    for(const auto& p:paths){SaveContentRecord r{};uint64_t owner=0;uint32_t e=ReadMetadata(p,r,owner);if(e)return e;if(owner==LocalXuid())records.push_back(r);}
     return 0;
 }
 uint32_t SaveCreateContent(const std::string& rootName,const SaveContentRecord& record,uint32_t mode,uint32_t& disposition)
@@ -281,7 +319,7 @@ uint32_t SaveCreateContent(const std::string& rootName,const SaveContentRecord& 
     // Never adopt or erase an unrelated folder whose metadata is missing.
     std::error_code existsError;
     if(!exists && std::filesystem::exists(path,existsError))return ERROR_FILE_CORRUPT;
-    if(existsError)return host_storage::Error(existsError);
+    if(existsError)return uint32_t(existsError.value());
     if(exists&&owner!=LocalXuid())return ERROR_ACCESS_DENIED;
     if(mode==1&&exists)return ERROR_ALREADY_EXISTS;
     if((mode==3||mode==5)&&!exists)return ERROR_PATH_NOT_FOUND;
@@ -289,7 +327,7 @@ uint32_t SaveCreateContent(const std::string& rootName,const SaveContentRecord& 
     if(create) {
         for(const auto& [alias,mount]:g_saveMounts)if(mount==path)return ERROR_BUSY;
         if(exists){if(uint32_t e=DeleteTree(path))return e;}
-        if(uint32_t e=host_storage::CreateDirectories(path))return e;
+        std::error_code ec;std::filesystem::create_directories(path,ec);if(ec)return uint32_t(ec.value());
         if(uint32_t e=NoReparse(path))return e;
         if(uint32_t e=WriteMetadata(path,record))return e;
     }
@@ -319,7 +357,7 @@ uint32_t SaveContentCreator(const SaveContentRecord& record,uint64_t& creator)
 }
 bool ResolveSaveFile(const std::string& guest,std::filesystem::path& host,std::filesystem::path& container,uint32_t& error)
 {
-    std::string p=guest;std::replace(p.begin(),p.end(),'\\','/');if(p.rfind("/?" "?/",0)==0)p.erase(0,4);
+    std::string p=guest;std::replace(p.begin(),p.end(),'\\','/');if(p.rfind("/??/",0)==0)p.erase(0,4);
     const auto colon=p.find(':');if(colon==std::string::npos)return false;
     const auto name=Lower(p.substr(0,colon));if(name!="tag25save"&&name!="dummysave")return false;
     std::lock_guard lock(g_saveMutex);error=ERROR_PATH_NOT_FOUND;

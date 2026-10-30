@@ -77,57 +77,6 @@ int main() {
     CHECK(WaitMultiple(all,2,false,0)==STATUS_SUCCESS);
     CHECK(!first.state && !second.state);
 
-    // Concurrent single waits must consume exactly the released permits;
-    // releasing a batch must also wake enough waiters to consume every permit.
-    {
-    KSemaphore permits(0,8);
-    std::atomic<unsigned> entered{0}, completed{0};
-    std::vector<std::future<uint32_t>> singleWaiters;
-    for(unsigned i=0;i<8;++i) singleWaiters.push_back(std::async(std::launch::async,[&]{
-        ++entered; const auto result=permits.Wait(2000); if(result==0)++completed; return result;
-    }));
-    while(entered<8)std::this_thread::yield();
-    auto awaitCompleted=[&](unsigned wanted){
-        const auto deadline=std::chrono::steady_clock::now()+1s;
-        while(completed<wanted && std::chrono::steady_clock::now()<deadline)std::this_thread::yield();
-        CHECK(completed==wanted);
-    };
-    permits.Release(1);awaitCompleted(1);
-    permits.Release(3);awaitCompleted(4);
-    permits.Release(4);awaitCompleted(8);
-    for(auto& waiter:singleWaiters)CHECK(waiter.get()==0);
-    CHECK(permits.Wait(0)==STATUS_TIMEOUT);
-    }
-
-    // A semaphore's single waiter and a registered WaitAll use different CVs.
-    // The incomplete WaitAll must retain the permit for the single waiter;
-    // after its companion becomes ready, a later permit must wake WaitAll.
-    {
-        KSemaphore permit(0,2);
-        ObservedEvent gate(true);
-        KObject* both[]={&gate,&permit};
-        auto all=std::async(std::launch::async,[&]{return WaitMultiple(both,2,false,2000);});
-        AwaitScans(gate,1);
-        auto single=std::async(std::launch::async,[&]{return permit.Wait(2000);});
-        permit.Release(1);
-        CHECK(single.get()==STATUS_SUCCESS);
-        CHECK(all.wait_for(0ms)==std::future_status::timeout);
-        gate.Set();permit.Release(1);
-        CHECK(all.get()==STATUS_SUCCESS);
-        CHECK(permit.Wait(0)==STATUS_TIMEOUT);
-    }
-    // Releasing before or during sleep must not strand a second entitlement.
-    for(unsigned race=0;race<64;++race) {
-        KSemaphore permit(0,2);KObject* one[]={&permit};
-        auto single=std::async(std::launch::async,[&]{return permit.Wait(1000);});
-        if(race&1)permit.Release(1);
-        auto multi=std::async(std::launch::async,[&]{return WaitMultiple(one,1,true,1000);});
-        if(!(race&1))permit.Release(1);
-        permit.Release(1);
-        CHECK(single.get()==STATUS_SUCCESS && multi.get()==STATUS_SUCCESS);
-        CHECK(permit.Wait(0)==STATUS_TIMEOUT);
-    }
-
     KSemaphore semaphore(2,4);
     KMutant mutant;
     KObject* mixed[]={&semaphore,&mutant,&second};

@@ -2,8 +2,7 @@
 // SteamNetworkingMessages (Valve relays, no port forwarding), sessions as Steam lobbies, a friend's
 // "Join Game" as the game's own invite. Built only when the Steamworks SDK is present
 // (TTT2_HAVE_STEAM); otherwise every call reports "not running" and the loopback backend is used.
-// Windows delay-loads steam_api64.dll; the opt-in Linux Steam build links
-// libsteam_api.so. A closed Steam client leaves either backend unavailable.
+// steam_api64.dll is delay-loaded: a missing DLL or a closed Steam client just means no Steam.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -42,8 +41,7 @@ bool InviteToSession(uint64_t sessionId, uint64_t friendId, int timeoutMs);
 bool WebApiTicket(const std::string& identity, std::string& hex, uint32_t& handle, int timeoutMs);
 void CancelTicket(uint32_t handle);
 
-// The calls above run Steam in a HELPER PROCESS (steam_bridge.cpp on Windows,
-// steam_bridge_linux.cpp on Linux): this exe started again as
+// The calls above run Steam in a HELPER PROCESS (steam_bridge.cpp): this exe started again as
 // `--steam-bridge`, talking over its stdin/stdout. Steam Input hides every controller from the
 // process that runs SteamAPI as app 480 (MEASURED 2026-10-12: XInput slots 0+1 connected before
 // SteamAPI_InitEx, none after, gameoverlayrenderer64.dll loaded) and Spacewar's controller

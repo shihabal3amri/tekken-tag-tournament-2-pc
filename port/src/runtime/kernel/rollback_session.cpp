@@ -13,11 +13,7 @@
 #include "kernel_shared.h"
 #include "guest_heap.h"
 #include "display_settings.h"
-#include "host_thread.h"
-#include "host_vm.h"
-#if defined(_WIN32)
 #include <windows.h>
-#endif
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -47,7 +43,7 @@ bool TraceOn()
 std::string g_line;                    // this update's events
 bool g_notable = false;                // rollback, stall or prediction change in this update
 int g_lines = 0;
-uint32_t g_main = 0;
+DWORD g_main = 0;
 uint32_t g_ring = 0;                   // the session's larger prediction ring (a guest page of its own)
 
 int32_t R32(uint32_t a) { return int32_t(GRead32(g_base, a)); }
@@ -65,7 +61,7 @@ void NodeFrames(int i, int32_t& newest, int32_t& current)
 
 void Event(const char* what, bool notable = false)
 {
-    if (!TraceOn() || host_thread::CurrentId() != g_main) return;
+    if (!TraceOn() || GetCurrentThreadId() != g_main) return;
     int32_t ln, lc, rn, rc;
     NodeFrames(0, ln, lc);
     NodeFrames(1, rn, rc);
@@ -103,7 +99,7 @@ void SessionTraceUpdate()
         RollbackNeverRewind(0x82E4CE20u, 12);
     }
     if (!TraceOn()) return;
-    g_main = host_thread::CurrentId();
+    g_main = GetCurrentThreadId();
     const int run = RollbackFightRun();
     if (!g_line.empty() && (g_notable || (run > 0 && run < 400)) && g_lines < 20000)
     {
@@ -156,7 +152,7 @@ void SessionTraceTick(bool start)
     if (start)
     {
         Event("tick");
-        g_stallTick = TraceOn() && host_thread::CurrentId() == g_main && R32(kSync + 4856) > 0 && !GRead8(g_base, kNace + 6020) && g_stallWords < 400;
+        g_stallTick = TraceOn() && GetCurrentThreadId() == g_main && R32(kSync + 4856) > 0 && !GRead8(g_base, kNace + 6020) && g_stallWords < 400;
         if (g_stallTick)
             for (int k = 0; k < 4; ++k) std::memcpy(g_stallBefore + k * 0x28B0, g_base + kFighterObjects[k], 0x28B0);
         return;
@@ -176,7 +172,7 @@ void SessionTraceTick(bool start)
             }
     }
     FlowTrace("after a tick");
-    if (!TraceOn() || host_thread::CurrentId() != g_main || R32(kSync + 4856) <= 0) return;
+    if (!TraceOn() || GetCurrentThreadId() != g_main || R32(kSync + 4856) <= 0) return;
     const int32_t a = R32(kNace + 5976), b = R32(kNace + 5980), own = RollbackSessionFrame();
     const int32_t frame = own >= 0 ? own : a > b ? a : b;   // sessions count frames; otherwise best effort
     const uint8_t ready = GRead8(g_base, kNace + 6020);
@@ -450,7 +446,7 @@ PPC_FUNC(sub_822572A0)
 {
     const uint32_t state = ctx.r3.u32, range = ctx.r4.u32, lr = uint32_t(ctx.lr);
     __imp__sub_822572A0(ctx, base);
-    if (!TraceOn() || host_thread::CurrentId() != g_main || R32(kSync + 4856) <= 0) return;
+    if (!TraceOn() || GetCurrentThreadId() != g_main || R32(kSync + 4856) <= 0) return;
     const uint32_t holder = GRead32(g_base, 0x82E6B05Cu);
     if (!holder || state != holder + 16) return;
     const int32_t own = RollbackSessionFrame();

@@ -180,15 +180,8 @@ PPC_FUNC(sub_82D089A0)
         const char* e = std::getenv("TTT2_XMA_TRACE");
         return e ? uint32_t(std::strtoul(e, nullptr, 16)) : 0u;
     }();
-    static const bool traceStereo = EnvIs("TTT2_XMA_TRACE_STEREO", "1");
     const uint32_t voice = ctx.r3.u32;
-    const uint32_t list = voice && traceStereo ? GRead32(base, voice + 52) : 0;
-    const uint32_t entries = list ? GRead32(base, list + 8) : 0;
-    const uint32_t context = entries ? GRead32(base, entries + VOICE_CONTEXT_OFFSET) : 0;
-    const bool stereo = context && (GRead32(base, context + 4) >> 29) & 1;
-    const bool tracedAddress = voice && trace &&
-                               GRead32(base, voice) + GRead32(base, voice + 8) == trace;
-    if (!voice || (!tracedAddress && !(traceStereo && stereo)))
+    if (!trace || !voice || GRead32(base, voice) + GRead32(base, voice + 8) != trace)
     {
         __imp__sub_82D089A0(ctx, base);
         return;
@@ -203,12 +196,12 @@ PPC_FUNC(sub_82D089A0)
         return;
     ++lines;
     lastVoice = voice, last12 = GRead32(base, voice + 12), lastFlags = flags, lastProduced = produced;
-    const uint32_t tracedList = traceStereo ? list : GRead32(base, voice + 52);
-    const uint32_t tracedEntries = traceStereo ? entries : tracedList ? GRead32(base, tracedList + 8) : 0;
-    const uint32_t tracedContext = traceStereo ? context : tracedEntries ? GRead32(base, tracedEntries + VOICE_CONTEXT_OFFSET) : 0;
+    const uint32_t list = GRead32(base, voice + 52);
+    const uint32_t entries = list ? GRead32(base, list + 8) : 0;
+    const uint32_t context = entries ? GRead32(base, entries + VOICE_CONTEXT_OFFSET) : 0;
     std::fprintf(stderr,
                  "[xma-trace] t=%llu voice=%08X ctx=%08X want=%u ret=%08X produced=%u pos=%u->%u flags=%X | +20=%X +24=%u +28=%u +32=%u +40=%u +44=%u +48=%u +56=%u +64=%X +88=%u +92=%u +108=%X +116=%u +120=%X +128=%u +132=%X +140=%X b68-71=%02X%02X%02X%02X b144-147=%02X%02X%02X%02X | hw dw0=%08X dw1=%08X rd=%X\n",
-                 (unsigned long long)xma::SteadyMs(), voice, tracedContext, want, ctx.r3.u32, produced, before12,
+                 (unsigned long long)xma::SteadyMs(), voice, context, want, ctx.r3.u32, produced, before12,
                  GRead32(base, voice + 12), flags,
                  GRead32(base, voice + 20), GRead32(base, voice + 24), GRead32(base, voice + 28), GRead32(base, voice + 32),
                  GRead32(base, voice + 40), GRead32(base, voice + 44), GRead32(base, voice + 48), GRead32(base, voice + 56),
@@ -217,8 +210,8 @@ PPC_FUNC(sub_82D089A0)
                  GRead32(base, voice + 140),
                  base[voice + 68], base[voice + 69], base[voice + 70], base[voice + 71],
                  base[voice + 144], base[voice + 145], base[voice + 146], base[voice + 147],
-                 tracedContext ? GRead32(base, tracedContext) : 0, tracedContext ? GRead32(base, tracedContext + 4) : 0,
-                 tracedContext ? GRead32(base, tracedContext + 8) : 0);
+                 context ? GRead32(base, context) : 0, context ? GRead32(base, context + 4) : 0,
+                 context ? GRead32(base, context + 8) : 0);
 }
 
 // Diagnostics (TTT2_XMA_LOG=1): NUSound re-initialises a voice's context for a new sound in

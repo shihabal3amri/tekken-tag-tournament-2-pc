@@ -13,9 +13,10 @@
 //   Netcode=0..3          (STANDARD, PRIORITIZE RESPONSE, PRIORITIZE GRAPHICS, CUSTOM)
 //   CustomDelay=1..6      (CUSTOM's input delay, frames)
 //   CustomRollback=1..8   (CUSTOM's prediction limit, frames)
-// in the host settings file (host_settings.h), read once at first use.
+// in %LOCALAPPDATA%\TTT2Recomp\settings.ini, read once at first use.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include "display_settings.h"
-#include "host_settings.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -38,61 +39,75 @@ std::atomic<int> g_sharpness{ 0 }, g_antiAliasing{ 0 }, g_textureFilter{ 0 }, g_
 std::atomic<bool> g_loadedFlag{ false };
 std::atomic<uint32_t> g_generation{ 0 };
 
+std::string IniPath()
+{
+    if (const char* e = std::getenv("TTT2_SETTINGS_INI"); e && *e) return e;   // test runs
+    char dir[MAX_PATH];
+    const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof(dir));
+    std::string path = (n && n < sizeof(dir)) ? std::string(dir) : std::string(".");
+    path += "\\TTT2Recomp";
+    CreateDirectoryA(path.c_str(), nullptr);
+    return path + "\\settings.ini";
+}
+
 void LoadLocked()
 {
     if (g_loaded) return;
     g_loaded = true;
-    g_mode = std::clamp<int>(host_settings::ReadInt("Display", "Mode", Windowed), Windowed, Fullscreen);
-    const std::string res = host_settings::Read("Display", "Resolution", "1280x720");
+    const std::string ini = IniPath();
+    g_mode = std::clamp<int>(GetPrivateProfileIntA("Display", "Mode", Windowed, ini.c_str()), Windowed, Fullscreen);
+    char res[32] = {};
+    GetPrivateProfileStringA("Display", "Resolution", "1280x720", res, sizeof(res), ini.c_str());
     unsigned w = 0, h = 0;
     g_resolution = 2;                                   // 1280x720 unless the file names another
-    if (std::sscanf(res.c_str(), "%ux%u", &w, &h) == 2)
+    if (std::sscanf(res, "%ux%u", &w, &h) == 2)
     {
         const auto& list = Resolutions();
         for (size_t i = 0; i < list.size(); ++i)
             if (list[i].width == w && list[i].height == h) g_resolution = int(i);
     }
-    g_inputDelay = host_settings::ReadInt("Game", "InputDelay", 0) != 0;
-    g_netcode = std::clamp<int>(host_settings::ReadInt("Online", "Netcode", NetStandard), NetStandard, NetCustom);
-    g_customDelay = std::clamp<int>(host_settings::ReadInt("Online", "CustomDelay", 1), kMinDelay, kMaxCustomDelay);
-    g_customRollback = std::clamp<int>(host_settings::ReadInt("Online", "CustomRollback", kMaxRollback), 1, kMaxRollback);
-    g_sharpness = std::clamp<int>(host_settings::ReadInt("Display", "Sharpness", 0), 0, kMaxSharpness);
-    g_antiAliasing = std::clamp<int>(host_settings::ReadInt("Display", "AntiAliasing", 0), 0, kMaxAntiAliasing);
-    g_textureFilter = std::clamp<int>(host_settings::ReadInt("Display", "TextureFilter", 0), 0, kMaxTextureFilter);
-    g_vsync = host_settings::ReadInt("Display", "VSync", 1) != 0 ? 1 : 0;
-    g_shadows = host_settings::ReadInt("Display", "Shadows", 1) != 0 ? 1 : 0;
+    g_inputDelay = GetPrivateProfileIntA("Game", "InputDelay", 0, ini.c_str()) != 0;
+    g_netcode = std::clamp<int>(GetPrivateProfileIntA("Online", "Netcode", NetStandard, ini.c_str()), NetStandard, NetCustom);
+    g_customDelay = std::clamp<int>(GetPrivateProfileIntA("Online", "CustomDelay", 1, ini.c_str()), kMinDelay, kMaxCustomDelay);
+    g_customRollback = std::clamp<int>(GetPrivateProfileIntA("Online", "CustomRollback", kMaxRollback, ini.c_str()), 1, kMaxRollback);
+    g_sharpness = std::clamp<int>(GetPrivateProfileIntA("Display", "Sharpness", 0, ini.c_str()), 0, kMaxSharpness);
+    g_antiAliasing = std::clamp<int>(GetPrivateProfileIntA("Display", "AntiAliasing", 0, ini.c_str()), 0, kMaxAntiAliasing);
+    g_textureFilter = std::clamp<int>(GetPrivateProfileIntA("Display", "TextureFilter", 0, ini.c_str()), 0, kMaxTextureFilter);
+    g_vsync = GetPrivateProfileIntA("Display", "VSync", 1, ini.c_str()) != 0 ? 1 : 0;
+    g_shadows = GetPrivateProfileIntA("Display", "Shadows", 1, ini.c_str()) != 0 ? 1 : 0;
     g_loadedFlag.store(true, std::memory_order_release);
     std::fprintf(stderr, "[display] image: sharpness %d, anti-aliasing %d, texture filtering %d, vsync %s, shadows %s\n",
                  g_sharpness.load(), g_antiAliasing.load(), g_textureFilter.load(), g_vsync.load() ? "on" : "off",
                  g_shadows.load() ? "on" : "off");
-    std::fprintf(stderr, "[display] settings: mode=%d resolution=%ux%u input delay %s, online netcode %d (custom: delay %d, rollback %d)\n",
+    std::fprintf(stderr, "[display] settings: mode=%d resolution=%ux%u input delay %s, online netcode %d (custom: delay %d, rollback %d) (%s)\n",
                  g_mode, Resolutions()[g_resolution].width, Resolutions()[g_resolution].height, g_inputDelay ? "on" : "off",
-                 g_netcode, g_customDelay, g_customRollback);
+                 g_netcode, g_customDelay, g_customRollback, ini.c_str());
 }
 
 void SaveLocked()
 {
+    const std::string ini = IniPath();
     char value[32];
     std::snprintf(value, sizeof(value), "%d", g_mode);
-    host_settings::Write("Display", "Mode", value);
+    WritePrivateProfileStringA("Display", "Mode", value, ini.c_str());
     const Resolution r = Resolutions()[g_resolution];
     std::snprintf(value, sizeof(value), "%ux%u", r.width, r.height);
-    host_settings::Write("Display", "Resolution", value);
+    WritePrivateProfileStringA("Display", "Resolution", value, ini.c_str());
     std::snprintf(value, sizeof(value), "%d", g_sharpness.load());
-    host_settings::Write("Display", "Sharpness", value);
+    WritePrivateProfileStringA("Display", "Sharpness", value, ini.c_str());
     std::snprintf(value, sizeof(value), "%d", g_antiAliasing.load());
-    host_settings::Write("Display", "AntiAliasing", value);
+    WritePrivateProfileStringA("Display", "AntiAliasing", value, ini.c_str());
     std::snprintf(value, sizeof(value), "%d", g_textureFilter.load());
-    host_settings::Write("Display", "TextureFilter", value);
-    host_settings::Write("Display", "VSync", g_vsync.load() ? "1" : "0");
-    host_settings::Write("Display", "Shadows", g_shadows.load() ? "1" : "0");
-    host_settings::Write("Game", "InputDelay", g_inputDelay ? "1" : "0");
+    WritePrivateProfileStringA("Display", "TextureFilter", value, ini.c_str());
+    WritePrivateProfileStringA("Display", "VSync", g_vsync.load() ? "1" : "0", ini.c_str());
+    WritePrivateProfileStringA("Display", "Shadows", g_shadows.load() ? "1" : "0", ini.c_str());
+    WritePrivateProfileStringA("Game", "InputDelay", g_inputDelay ? "1" : "0", ini.c_str());
     std::snprintf(value, sizeof(value), "%d", g_netcode);
-    host_settings::Write("Online", "Netcode", value);
+    WritePrivateProfileStringA("Online", "Netcode", value, ini.c_str());
     std::snprintf(value, sizeof(value), "%d", g_customDelay);
-    host_settings::Write("Online", "CustomDelay", value);
+    WritePrivateProfileStringA("Online", "CustomDelay", value, ini.c_str());
     std::snprintf(value, sizeof(value), "%d", g_customRollback);
-    host_settings::Write("Online", "CustomRollback", value);
+    WritePrivateProfileStringA("Online", "CustomRollback", value, ini.c_str());
 }
 
 // One clamped int setting: stored and logged when it changes.

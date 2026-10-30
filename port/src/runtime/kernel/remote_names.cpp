@@ -58,6 +58,7 @@ void Remember(uint8_t* base, uint32_t record)
     if (k.name == name) return;
     k.name = name;
     k.guestText = 0;                          // re-published on the next lookup
+    std::fprintf(stderr, "[names] %016llX = '%s'\n", (unsigned long long)xuid, name.c_str());
 }
 
 } // namespace
@@ -97,6 +98,8 @@ PPC_FUNC(sub_82416380)
         std::memset(text, 0, 32);
         std::memcpy(text, k.name.data(), (std::min)(k.name.size(), size_t(15)));
         k.guestText = uint32_t(text - base);
+        std::fprintf(stderr, "[names] lookup %016llX: '%s' -> '%s'\n", (unsigned long long)xuid,
+                     answer ? Name16(base, answer).c_str() : "", k.name.c_str());
     }
     ctx.r3.u64 = k.guestText;
 }

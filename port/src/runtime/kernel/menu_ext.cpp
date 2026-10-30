@@ -1,4 +1,3 @@
-#include <SDL3/SDL.h>
 // PC menu extensions (plan and reverse-engineering notes: port/MENU_PLAN.md).
 //
 // TTT2's menus are BX01 binary-XML documents (frames, menus, rows, value lists) whose event
@@ -15,6 +14,8 @@
 // C:/ttt2/port/menu_bin/; TTT2_TEXT_TRACE=1 logs each text id the game looks up (first time, with
 // the caller). Development: TTT2_MENU_OVERRIDE=1 loads a document prepared with
 // port/tools/menu_proto.py from C:/ttt2/port/menu_override/<fnv1a>.bin instead of editing.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include "kernel_shared.h"
 #include "guest_heap.h"
 #include "display_settings.h"
@@ -22,10 +23,6 @@
 #include "sys_ui.h"
 #include "profiles.h"
 #include "keyboard_keys.h"
-#include "host_keycodes.h"
-#include "host_settings.h"
-#include "host_input_sdl.h"
-#include "../host_process.h"
 #include "menu_host.h"
 #include "server_ui.h"
 #include "gin_service.h"
@@ -33,7 +30,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
 #include <string>
 #include <algorithm>
 #include <cctype>
@@ -308,9 +304,7 @@ std::string SuggestedName()
     {
         const std::string name = "PLAYER " + std::to_string(n);
         bool used = false;
-        for (const profiles::Profile& p : list) used |= p.name.size() == name.size() && std::equal(
-            p.name.begin(), p.name.end(), name.begin(),
-            [](unsigned char a, unsigned char b) { return std::tolower(a) == std::tolower(b); });
+        for (const profiles::Profile& p : list) used |= _stricmp(p.name.c_str(), name.c_str()) == 0;
         if (!used) return name;
     }
 }
@@ -556,13 +550,15 @@ void UpdateBox(PPCContext& ctx, uint8_t* base, const BoxState& b)
 std::string ClipboardText()
 {
     std::string out;
-    char* text = SDL_GetClipboardText();
-    if (text)
-    {
-        for (size_t i = 0; text[i] && text[i] != '\r' && text[i] != '\n' && out.size() < 512; ++i)
-            if (text[i] >= 0x20 && text[i] < 0x7F) out.push_back(text[i]);
-        SDL_free(text);
-    }
+    if (!OpenClipboard(nullptr)) return out;
+    if (HANDLE h = GetClipboardData(CF_UNICODETEXT))
+        if (const auto* w = static_cast<const wchar_t*>(GlobalLock(h)))
+        {
+            for (size_t i = 0; w[i] && w[i] != L'\r' && w[i] != L'\n' && out.size() < 512; ++i)
+                if (w[i] >= 0x20 && w[i] < 0x7F) out.push_back(char(w[i]));
+            GlobalUnlock(h);
+        }
+    CloseClipboard();
     return out;
 }
 
@@ -1026,11 +1022,16 @@ void RestoreHelp(PPCContext& ctx, uint8_t* base)
 
 bool Foreground()
 {
-    return host_input::Focused();
+    DWORD process = 0;
+    const HWND w = GetForegroundWindow();
+    if (w) GetWindowThreadProcessId(w, &process);
+    return w && process == GetCurrentProcessId();
 }
 bool AnyKeyDown()
 {
-    return host_input::AnyKeyDown();
+    for (int vk = 8; vk < 256; ++vk)
+        if (GetAsyncKeyState(vk) & 0x8000) return true;
+    return false;
 }
 
 // The next slot from `slot` in a direction (page 2 skips its empty cells; rows and columns wrap).
@@ -1144,7 +1145,7 @@ void Frame(PPCContext& ctx, uint8_t* base)
         return;
     }
     const uint16_t buttons = HostControllerButtons();
-    const bool esc = Foreground() && host_input::KeyDown(VK_ESCAPE);
+    const bool esc = Foreground() && (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
     if (!st.here)
     {
         st.here = true;                                   // every visit starts on PAD
@@ -1252,15 +1253,13 @@ void UiFrame(PPCContext& ctx, uint8_t* base)
     server_ui::Frame(ctx, base);
     static uint32_t tick = 0;
     if (++tick % 30) return;
-    const std::string trigger = host_settings::DiagnosticPath("ui.trigger");
-    FILE* f = std::fopen(trigger.c_str(), "rb");
+    FILE* f = std::fopen("C:/ttt2/port/ui.trigger", "rb");
     if (!f) return;
     std::string text;
     char chunk[4096];
     for (size_t n; (n = std::fread(chunk, 1, sizeof(chunk), f)) > 0 && text.size() < 65536;) text.append(chunk, n);
     std::fclose(f);
-    std::error_code error;
-    std::filesystem::remove(trigger, error);
+    DeleteFileA("C:/ttt2/port/ui.trigger");
     for (size_t at = 0; at < text.size();)
     {
         size_t end = text.find('\n', at);
@@ -1392,7 +1391,7 @@ PPC_FUNC(NativeTrue) { (void)base; ctx.r3.u64 = 1; }
 
 // lib::ExitGameWindow - the exit dialog's lib::WindowGetValue: -1 while it waits, 0 for the
 // confirm button (A, YES), otherwise NO. Settings are saved as they change; the guest threads
-// are not unwound (an immediate process exit, as for a closed window), so nothing can hang on the way out.
+// are not unwound (TerminateProcess, as for a closed window), so nothing can hang on the way out.
 PPC_FUNC(NativeExitGameWindow)
 {
     __imp__sub_8241E7A8(ctx, base);
@@ -1401,7 +1400,7 @@ PPC_FUNC(NativeExitGameWindow)
         std::fprintf(stderr, "[menu] exit confirmed - quitting\n");
         std::fflush(stderr);
         std::fflush(stdout);
-        LogDrain(); host_process::ExitNow(0);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 0);
     }
 }
 
@@ -1813,10 +1812,9 @@ PPC_FUNC(sub_82346060)
     const uint32_t size = ctx.r5.u32;
     if (MenuOverride())
     {
-        char path[128];
-        std::snprintf(path, sizeof(path), "menu_override/%08X.bin", Fnv1a(doc, size));
-        const std::string overridePath = host_settings::DiagnosticPath(path);
-        if (FILE* f = std::fopen(overridePath.c_str(), "rb"))
+        char path[MAX_PATH];
+        std::snprintf(path, sizeof(path), "C:/ttt2/port/menu_override/%08X.bin", Fnv1a(doc, size));
+        if (FILE* f = std::fopen(path, "rb"))
         {
             std::string bytes;
             char chunk[65536];
@@ -1824,7 +1822,7 @@ PPC_FUNC(sub_82346060)
             std::fclose(f);
             ctx.r4.u64 = GuestCopy(base, bytes.data(), bytes.size());
             ctx.r5.u64 = bytes.size();
-            std::fprintf(stderr, "[menu] document replaced by %s (%zu bytes)\n", overridePath.c_str(), bytes.size());
+            std::fprintf(stderr, "[menu] document replaced by %s (%zu bytes)\n", path, bytes.size());
         }
     }
     else
@@ -1836,11 +1834,10 @@ PPC_FUNC(sub_82346060)
         {
             if (MenuDump())
             {
-                std::error_code error;
-                std::filesystem::create_directories(host_settings::DiagnosticPath("menu_bin"), error);
-                char path[128];
-                std::snprintf(path, sizeof(path), "menu_bin/edited_%08X.bin", Fnv1a(doc, size));
-                SaveFile(host_settings::DiagnosticPath(path).c_str(), edited.data(), edited.size());
+                CreateDirectoryA("C:/ttt2/port/menu_bin", nullptr);
+                char path[MAX_PATH];
+                std::snprintf(path, sizeof(path), "C:/ttt2/port/menu_bin/edited_%08X.bin", Fnv1a(doc, size));
+                SaveFile(path, edited.data(), edited.size());
             }
             ctx.r4.u64 = GuestCopy(base, edited.data(), edited.size());
             ctx.r5.u64 = edited.size();
@@ -1860,12 +1857,11 @@ PPC_FUNC(sub_82A8C170)
     if (MenuDump() && ctx.r4.u32 && ctx.r5.u32 && ctx.r5.u32 < (64u << 20))
     {
         static std::atomic<uint32_t> index{ 0 };
-        std::error_code error;
-        std::filesystem::create_directories(host_settings::DiagnosticPath("menu_bin"), error);
-        char path[128];
-        std::snprintf(path, sizeof(path), "menu_bin/%03u_%08X.bin", index.fetch_add(1),
+        CreateDirectoryA("C:/ttt2/port/menu_bin", nullptr);
+        char path[MAX_PATH];
+        std::snprintf(path, sizeof(path), "C:/ttt2/port/menu_bin/%03u_%08X.bin", index.fetch_add(1),
                       Fnv1a(base + ctx.r4.u32, ctx.r5.u32));
-        SaveFile(host_settings::DiagnosticPath(path).c_str(), base + ctx.r4.u32, ctx.r5.u32);
+        SaveFile(path, base + ctx.r4.u32, ctx.r5.u32);
     }
     __imp__sub_82A8C170(ctx, base);
 }

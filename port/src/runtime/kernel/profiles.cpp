@@ -1,14 +1,14 @@
 // Local player profiles - see profiles.h.
 #include "profiles.h"
-#include "../host_storage.h"
-#include "../host_random.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <random>
 #include <sstream>
 
 namespace profiles {
@@ -18,30 +18,29 @@ constexpr uint64_t kLegacyXuid = 0xB13EBABEBABEBABEull;   // the single profile 
 
 std::mutex g_mutex;
 bool g_loaded = false;
-bool g_storageReadFailed = false;
 std::vector<Profile> g_list;
 int g_active = -1, g_last = 0;
 std::atomic<uint32_t> g_generation{ 0 };
 
 std::filesystem::path File()
 {
+    const wchar_t* overridePath = _wgetenv(L"TTT2_SAVE_ROOT");
+    const wchar_t* local = _wgetenv(L"LOCALAPPDATA");
     std::filesystem::path root;
-    return host_storage::SaveBase(root) ? std::filesystem::path{} : root / "profiles.ini";
+    if (overridePath && *overridePath) root = overridePath;
+    else if (local && *local) root = std::filesystem::path(local) / L"TTT2Recomp" / L"saves";
+    else return {};
+    return root / L"profiles.ini";
 }
 
 void SaveLocked()
 {
-    // Keep an existing file intact if startup could not read it.
-    if (g_storageReadFailed) return;
     const std::filesystem::path path = File();
     if (path.empty()) return;
-    const uint32_t directoryError = host_storage::CreateDirectories(path.parent_path());
-    if (directoryError)
-    {
-        std::fprintf(stderr, "[profiles] cannot create profile directory (%u)\n", directoryError);
-        return;
-    }
-    std::ostringstream out;
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream out(path, std::ios::trunc);
+    if (!out) return;
     out << "[Profiles]\nLast=" << g_last << "\n";
     char line[64];
     for (size_t i = 0; i < g_list.size(); ++i)
@@ -49,9 +48,6 @@ void SaveLocked()
         std::snprintf(line, sizeof(line), "P%zu=%016llX ", i, static_cast<unsigned long long>(g_list[i].xuid));
         out << line << g_list[i].name << "\n";
     }
-    const std::string data = out.str();
-    const uint32_t error = host_storage::WriteAtomic(path, data.data(), data.size());
-    if (error) std::fprintf(stderr, "[profiles] cannot save profiles (%u)\n", error);
 }
 
 void LoadLocked()
@@ -59,15 +55,7 @@ void LoadLocked()
     if (g_loaded) return;
     g_loaded = true;
     const std::filesystem::path path = File();
-    std::string data;
-    const uint32_t readError = path.empty() ? 3 :
-        host_storage::ReadSmallFile(path, data, 64 * 1024);
-    if (readError && readError != 2 && readError != 3)
-    {
-        g_storageReadFailed = true;
-        std::fprintf(stderr, "[profiles] cannot read profiles (%u); persistence disabled\n", readError);
-    }
-    std::istringstream in(data);
+    std::ifstream in(path);
     std::string line;
     while (in && std::getline(in, line))
     {
@@ -96,8 +84,9 @@ void LoadLocked()
             if (g_list[i].xuid == want) g_active = int(i);
     }
     else if (autoSignIn && *autoSignIn == '1') g_active = g_last;
-    std::fprintf(stderr, "[profiles] %zu profile(s), %s\n", g_list.size(),
-                 g_active >= 0 ? "signed in" : "signed out");
+    std::fprintf(stderr, "[profiles] %zu profile(s) in %ls, last '%s'%s%s\n", g_list.size(), path.c_str(),
+                 g_list[g_last].name.c_str(), g_active >= 0 ? " - signed in (TTT2_AUTO_SIGNIN): " : " - signed out",
+                 g_active >= 0 ? g_list[g_active].name.c_str() : "");
 }
 
 } // namespace
@@ -138,7 +127,8 @@ bool SignIn(int index)
     g_active = g_last = index;
     SaveLocked();
     g_generation.fetch_add(1);
-    std::fprintf(stderr, "[profiles] signed in\n");
+    std::fprintf(stderr, "[profiles] signed in '%s' (%016llX)\n", g_list[index].name.c_str(),
+                 static_cast<unsigned long long>(g_list[index].xuid));
     return true;
 }
 
@@ -147,7 +137,7 @@ void SignOut()
     std::lock_guard l(g_mutex);
     LoadLocked();
     if (g_active < 0) return;
-    std::fprintf(stderr, "[profiles] signed out\n");
+    std::fprintf(stderr, "[profiles] signed out '%s'\n", g_list[g_active].name.c_str());
     g_active = -1;
     g_generation.fetch_add(1);
 }
@@ -166,17 +156,14 @@ int Create(const std::string& rawName)
         if (a == b) return -1;
     }
     // An offline XUID (E000 + 48 random bits), unique in the list.
+    std::random_device rd;
     uint64_t xuid = 0;
-    do
-    {
-        uint64_t entropy = 0;
-        host_random::Fill(&entropy, sizeof(entropy));
-        xuid = 0xE000000000000000ull | (entropy & 0x0000FFFFFFFFFFFFull);
-    }
+    do xuid = 0xE000000000000000ull | ((uint64_t(rd()) << 32 | rd()) & 0x0000FFFFFFFFFFFFull);
     while (std::any_of(g_list.begin(), g_list.end(), [&](const Profile& p) { return p.xuid == xuid; }));
     g_list.push_back({ name, xuid });
     SaveLocked();
-    std::fprintf(stderr, "[profiles] created profile\n");
+    std::fprintf(stderr, "[profiles] created '%s' (%016llX)\n", name.c_str(),
+                 static_cast<unsigned long long>(g_list.back().xuid));
     return int(g_list.size()) - 1;
 }
 

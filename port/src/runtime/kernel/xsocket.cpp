@@ -11,6 +11,8 @@
 // Guest structs are big-endian: XSOCKADDR_IN {u16 family, u16 port, u32 addr, 8 zero},
 // fd_set {u32 count, u32 handles[64]}, timeval {s32 sec, s32 usec}.
 // TTT2_NET_TRACE=1 logs every socket call and packet.
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include "kernel_shared.h"
 #include "kernel_trace.h"
 #include "net_transport.h"

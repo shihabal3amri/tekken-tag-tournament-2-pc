@@ -13,7 +13,7 @@
 // Research switches: TTT2_GIN_FORCE_WINNER=<side> (the ghost step's winner), TTT2_GIN_FORCE_DAN=1 (the two rank checks
 // see 1st dan).
 #include "kernel_shared.h"
-#include "community_platform.h"
+#include <windows.h>
 #include <cstdio>
 #include <cstdlib>
 

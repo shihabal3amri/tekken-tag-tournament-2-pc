@@ -10,28 +10,25 @@ static uint32_t Le24(const uint8_t* p) { return uint32_t(p[0]) | uint32_t(p[1]) 
 static uint32_t Be24(const uint8_t* p) { return uint32_t(p[0]) << 16 | uint32_t(p[1]) << 8 | p[2]; }
 
 bool StfsPackage::ReadAt(uint64_t off, void* buf, uint32_t n) {
-    return file_.Read(off, buf, n);
+    if (h_ == INVALID_HANDLE_VALUE || off + n > size_) return false;
+    LARGE_INTEGER li; li.QuadPart = (LONGLONG)off;
+    if (!SetFilePointerEx(h_, li, nullptr, FILE_BEGIN)) return false;
+    DWORD got = 0;
+    return ::ReadFile(h_, buf, n, &got, nullptr) && got == n;
 }
 
 void StfsPackage::Close() {
-    file_.Close();
+    if (h_ != INVALID_HANDLE_VALUE) { CloseHandle(h_); h_ = INVALID_HANDLE_VALUE; }
     entries_.clear();
 }
 
-bool StfsPackage::Open(const std::filesystem::path& path, std::string& err) {
+bool StfsPackage::Open(const wchar_t* path, std::string& err) {
     Close();
-    if (!file_.Open(path)) { err = "Could not open a seekable input file."; return false; }
-    return Parse(err);
-}
-#ifndef _WIN32
-bool StfsPackage::OpenFd(int fd, std::string& err) {
-    Close();
-    if (!file_.OpenFd(fd)) { err = "This file cannot be read directly. Copy it to local storage and select it again."; return false; }
-    return Parse(err);
-}
-#endif
-bool StfsPackage::Parse(std::string& err) {
-    size_ = file_.Size();
+    h_ = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h_ == INVALID_HANDLE_VALUE) { err = "The title update file could not be opened."; return false; }
+    LARGE_INTEGER sz;
+    GetFileSizeEx(h_, &sz);
+    size_ = (uint64_t)sz.QuadPart;
     uint8_t hdr[0x1000];
     if (!ReadAt(0, hdr, sizeof hdr) ||
         (memcmp(hdr, "LIVE", 4) != 0 && memcmp(hdr, "PIRS", 4) != 0 && memcmp(hdr, "CON ", 4) != 0)) {
@@ -77,7 +74,6 @@ bool StfsPackage::ReadTable(std::string& err) {
             const uint8_t* r = blk + at;
             const uint32_t nameLen = r[0x28] & 0x3F;
             if (!nameLen) continue;
-            if (nameLen > 40) { err = "Invalid title update filename."; return false; }
             Entry e;
             e.name.assign((const char*)r, nameLen);
             e.dir = (r[0x28] & 0x80) != 0;
@@ -95,9 +91,8 @@ bool StfsPackage::ReadTable(std::string& err) {
 
 bool StfsPackage::ReadFile(const char* name, std::vector<uint8_t>& out) {
     for (const Entry& e : entries_) {
-        if (e.dir || CompareNames(e.name.c_str(), name) != 0) continue;
+        if (e.dir || _stricmp(e.name.c_str(), name) != 0) continue;
         out.clear();
-        if (e.size > size_ || e.size > (256u << 20)) return false;
         out.reserve(e.size);
         uint32_t block = e.start, remaining = e.size, count = 0;
         while (remaining > 0 && block != 0xFFFFFF && block != 0 && count <= e.blocks + 1) {

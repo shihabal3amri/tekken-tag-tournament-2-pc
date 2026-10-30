@@ -1,7 +1,8 @@
-"""Check the shared guest NTSTATUS conversion against known Windows mappings.
+"""Check the production guest NTSTATUS conversion against Windows ntdll and known errors.
 
-This Windows-specific oracle test supplements the cross-platform CMake probe.
-It covers the file source's EOF=38 contract and guest register/memory canaries.
+This covers statuses emitted by kernel_io.cpp, the async file source's EOF=38
+contract, unknown statuses, register/memory canaries, and the original low-bits
+stub as a failing negative control. No game or game files are used.
 """
 
 from pathlib import Path
@@ -48,13 +49,16 @@ int main() {
         CHECK(ctx.r4.u64==0xFEDCBA9876543210ull&&ctx.r5.u64==0xAABBCCDDEEFF0011ull);
         CHECK(memory==original);
     }
-    for(uint32_t status:{0x00000102u,0x80000006u,0xC000003Au,
-                         0xC0000043u,0xC00703E5u}) {
+    // Native behavior also includes customer-defined and Win32-facility statuses;
+    // these should not be reduced to arbitrary low bits or a catch-all success.
+    for(uint32_t status:{0x00000102u,0x40000000u,0x80000006u,0xC0000010u,
+                         0xC000003Au,0xC0000043u,0xC000009Du,0xC00000B5u,
+                         0xD0000011u,0xE0001234u,0xC00703E5u,0x80071234u}) {
         PPCContext ctx;ctx.r3.u32=status;
         __imp__RtlNtStatusToDosError(ctx,memory.data());
         CHECK(ctx.r3.u32==native(static_cast<LONG>(status)));
     }
-    std::printf("PASS %u shared status conversion checks: EOF38, emitted I/O errors, native oracle, ABI canaries\n",checks);
+    std::printf("PASS %u status conversion checks: EOF38, all emitted I/O errors, native oracle, unknown status, ABI canaries\n",checks);
 }
 '''
 
@@ -63,9 +67,7 @@ def main():
     source = (ROOT / "port/src/runtime/kernel/kernel_sys.cpp").read_text(encoding="utf-8-sig")
     begin = source.index("PPC_FUNC(__imp__RtlNtStatusToDosError)")
     end = source.index("\n}", begin) + 2
-    status_source = (ROOT / "port/src/runtime/host_status.cpp").read_text(encoding="utf-8-sig")
-    status_source = status_source.replace('#include "host_status.h"', '')
-    production = status_source + "\n" + source[begin:end]
+    production = source[begin:end]
     with tempfile.TemporaryDirectory(prefix="ttt2-status-map-") as temp:
         folder = Path(temp)
         executable = compile_one(folder, "status_mapping", HARNESS.replace("@PRODUCTION@", production), [])

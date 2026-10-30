@@ -2,27 +2,13 @@
 // code defines every sub_X as a weak alias of __imp__sub_X, so a strong definition here
 // takes over all direct and table calls while the original stays reachable as __imp__.
 // Each wrapper only observes; it never changes arguments or results.
-#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#else
-#include <cerrno>
-#include <csignal>
-#include <dlfcn.h>
-#include <linux/futex.h>
-#include <pthread.h>
-#include <sys/syscall.h>
-#include <sys/uio.h>
-#include <ucontext.h>
-#include <unistd.h>
-#endif
-#include "host_thread.h"
-#include "host_vm.h"
 #include "kernel_shared.h"
 #include "guest_heap.h"
 #include "timeline.h"
 #include <cmath>
-
+#include <xmmintrin.h>
 #include <cstdio>
 #include <cstdlib>
 #include <atomic>
@@ -38,7 +24,6 @@
 #include <vector>
 
 extern "C" PPC_FUNC(__imp__sub_82AD8A00);
-extern "C" PPC_FUNC(__imp__sub_82B10F40);
 extern "C" PPC_FUNC(__imp__sub_82BD3DF0);
 extern "C" PPC_FUNC(__imp__sub_82BD43C0);
 extern "C" PPC_FUNC(__imp__sub_82BD39B0);
@@ -141,7 +126,7 @@ void NoteSkinJob(PPCContext& ctx, uint8_t* base, const char* kernel, uint32_t st
     const uint32_t job = ctx.r3.u32;
     const uint32_t count = GRead32(base, job + 24);
     const SkinJob cur{ job, GRead32(base, job + 16), GRead32(base, job + 16) + count * stride,
-                       GRead32(base, job + 20), uint32_t(ctx.lr), host_thread::CurrentId(), 0,
+                       GRead32(base, job + 20), uint32_t(ctx.lr), GetCurrentThreadId(), 0,
                        count, stride, GRead32(base, job + 4), GRead32(base, job + 8),
                        GRead16(base, job + 12), GRead16(base, job + 14), kernelAddr };
     std::lock_guard lock(g_skinMutex);
@@ -164,14 +149,6 @@ void NoteSkinJob(PPCContext& ctx, uint8_t* base, const char* kernel, uint32_t st
 }
 }
 
-void DiagSkinJob(PPCContext& ctx, uint8_t* base, uint32_t kernel, uint32_t stride)
-{
-    if (!DiagSkin()) return;
-    char name[9];
-    std::snprintf(name, sizeof(name), "%08X", kernel);
-    NoteSkinJob(ctx, base, name, stride, kernel);
-}
-
 #define TTT2_SKIN_HOOK(addr, stride)                                                 \
     extern "C" PPC_FUNC(__imp__sub_##addr);                                    \
     PPC_FUNC(sub_##addr)                                                       \
@@ -180,6 +157,12 @@ void DiagSkinJob(PPCContext& ctx, uint8_t* base, uint32_t kernel, uint32_t strid
         if (DiagSkin()) NoteSkinJob(ctx, base, #addr, stride, 0x##addr);                 \
         __imp__sub_##addr(ctx, base);                                          \
     }
+TTT2_SKIN_HOOK(82B10800, 64)
+TTT2_SKIN_HOOK(82B10908, 16)
+TTT2_SKIN_HOOK(82B10A70, 32)
+TTT2_SKIN_HOOK(82B10C88, 48)
+TTT2_SKIN_HOOK(82B10F40, 64)
+TTT2_SKIN_HOOK(82B11288, 20)
 TTT2_SKIN_HOOK(82B11500, 36)
 TTT2_SKIN_HOOK(82B118C0, 16)
 
@@ -195,7 +178,7 @@ std::atomic<int> g_allocLogged{0};
 PPC_FUNC(sub_82AD46F0)
 {
     if (!DiagSkin()) { __imp__sub_82AD46F0(ctx, base); return; }
-    const uint32_t tid = host_thread::CurrentId(), lr = uint32_t(ctx.lr);
+    const uint32_t tid = GetCurrentThreadId(), lr = uint32_t(ctx.lr);
     const uint32_t cpu = ctx.r13.u32 ? base[ctx.r13.u32 + 0x10C] : 0xFF;
     if (g_allocInside.fetch_add(1) > 0 && g_allocLogged.fetch_add(1) < 40)
         std::fprintf(stderr, "[diag-skin] CONCURRENT alloc this=%08X size=%u tid=%u cpu=%u lr=%08X while tid=%u cpu=%u lr=%08X\n",
@@ -303,14 +286,13 @@ bool DiagSkinDescribe(uint32_t addr, char* out, size_t size)
                 GWrite32(base, scratch + 24, 1);
                 // Guest FP/VMX code loads MXCSR from the context; keep the host thread's own
                 // (a zeroed context unmasks every FP exception: C000008F on the next op).
-                PPCFPSCRRegister hostFp{};
-                const unsigned int hostCsr = hostFp.getcsr();
+                const unsigned int hostCsr = _mm_getcsr();
                 PPCContext c{};
                 c.fpscr.csr = hostCsr;
                 c.r3.u32 = scratch;
                 c.r1.u32 = scratch + 0x11000 - 0x100;
                 __imp__sub_82B10F40(c, base);
-                hostFp.setcsr(hostCsr);
+                _mm_setcsr(hostCsr);
                 float a[3], b[3];
                 for (int k = 0; k < 3; ++k)
                 {
@@ -327,7 +309,7 @@ bool DiagSkinDescribe(uint32_t addr, char* out, size_t size)
 
 // Frame pacing (TTT2_FRAMETIME=1): how long the main thread waits for TTT2's job pool.
 // sub_824F58B8(job) kicks a job of the pool threads (sub_824F5458, which poll for work with
-// std::this_thread::sleep_for(std::chrono::milliseconds(1)) while idle) and waits for it by entering the job's lock (+24). Every 10 s: waits,
+// Sleep(1) while idle) and waits for it by entering the job's lock (+24). Every 10 s: waits,
 // total and longest wait (ms).
 void RollbackNoteJobObject(uint32_t addr, uint32_t size);   // rollback.cpp
 void RollbackJobTrace(const char* what, uint32_t obj, bool after);
@@ -453,7 +435,7 @@ static void TimeCall(const char* name, PPCContext& ctx, uint8_t* base, void (*fn
     fn(ctx, base);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     static std::atomic<int> logged{ 0 };
-    if (ms > 8.0 && logged++ < 400) std::fprintf(stderr, "[frame] slow call %s %.1f ms thread %u\n", name, ms, host_thread::CurrentId());
+    if (ms > 8.0 && logged++ < 400) std::fprintf(stderr, "[frame] slow call %s %.1f ms thread %lu\n", name, ms, GetCurrentThreadId());
 }
 #define TIMED_HOOK(addr) \
     extern "C" PPC_FUNC(__imp__sub_##addr); \
@@ -481,17 +463,9 @@ struct Sample { int64_t at; uint32_t chain[24]; uint32_t depth; uint64_t host[32
 struct Target
 {
     std::string name;
-    uint32_t tid = 0;
-#if defined(_WIN32)
+    DWORD tid = 0;
     HANDLE thread = nullptr;
-#else
-    pthread_t thread{};
-    pid_t nativeTid = 0;
-    std::atomic<int> pending{0};
-    Sample captured{};
-#endif
-    uintptr_t stackLow = 0, stackHigh = 0;
-    std::mutex samplingMutex;
+    ULONG_PTR stackLow = 0, stackHigh = 0;
     PPCContext* ctx = nullptr;
     std::vector<Sample> ring;                     // flight recorder (mode 3), sampler thread only
     size_t next = 0;
@@ -521,26 +495,25 @@ void Loop();
 
 int64_t Now()
 {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
 }
-int64_t Freq() { return 1000000000; }
-#if !defined(_WIN32)
-void InitializeSampler(Target& target);
-#endif
+int64_t Freq()
+{
+    static const int64_t f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return q.QuadPart; }();
+    return f;
+}
 
 // Called on the thread to be sampled.
 Target* Register(const char* name, PPCContext* ctx, bool main = false)
 {
     auto* t = new Target;
     t->name = name;
-    t->tid = host_thread::CurrentId();
+    t->tid = GetCurrentThreadId();
     t->ctx = ctx;
-#if defined(_WIN32)
     GetCurrentThreadStackLimits(&t->stackLow, &t->stackHigh);
-    t->thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, host_thread::CurrentId());
-#else
-    InitializeSampler(*t);
-#endif
+    t->thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
     if (Mode() == 3) t->ring.resize(1024);
     static std::once_flag started;
     std::call_once(started, [] { std::thread(Loop).detach(); });
@@ -572,7 +545,7 @@ extern "C" struct GuestContextRegistry
     GuestContextSlot slots[512];
 } g_guestContextRegistry;
 
-uint32_t GuestEntryOfThread(uint32_t tid)   // rollback.cpp diagnostics
+uint32_t GuestEntryOfThread(DWORD tid)   // rollback.cpp diagnostics
 {
     const uint32_t n = (std::min)(g_guestContextRegistry.count.load(), 512u);
     for (uint32_t i = 0; i < n; ++i)
@@ -604,7 +577,7 @@ void DumpGuestThreads()
 }
 
 // rollback.cpp's watchdog: the live contexts (racy reads - diagnostics only).
-int GuestContexts(uint32_t* tids, uint32_t* entries, PPCContext** ctxs, int max)
+int GuestContexts(DWORD* tids, uint32_t* entries, PPCContext** ctxs, int max)
 {
     const uint32_t n = (std::min)(g_guestContextRegistry.count.load(), 512u);
     int k = 0;
@@ -617,7 +590,7 @@ int GuestContexts(uint32_t* tids, uint32_t* entries, PPCContext** ctxs, int max)
     return k;
 }
 
-PPCContext* GuestContextOf(uint32_t tid)
+PPCContext* GuestContextOf(DWORD tid)
 {
     const uint32_t n = (std::min)(g_guestContextRegistry.count.load(), 512u);
     for (uint32_t i = 0; i < n; ++i)
@@ -627,11 +600,9 @@ PPCContext* GuestContextOf(uint32_t tid)
 
 // The walks run while the thread is suspended; a fault (an odd host frame, a stale guest
 // context) loses the sample instead of the process.
-#if defined(_WIN32)
 bool Walk(Target& t, Sample& s);
 bool Take(Target& t, Sample& s)
 {
-    std::lock_guard sampling(t.samplingMutex);
     if (SuspendThread(t.thread) == DWORD(-1)) return false;
     s = {};
     s.at = Now();
@@ -682,149 +653,11 @@ bool Walk(Target& t, Sample& s)
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
-#else
-namespace {
-thread_local Target* t_sampleTarget = nullptr;
-struct sigaction g_previousSampler{};
-constexpr int SampleSignal = SIGURG;
-
-bool ReadSampleMemory(const void* address, void* output, size_t bytes)
-{
-    iovec local{output, bytes};
-    iovec remote{const_cast<void*>(address), bytes};
-    return syscall(SYS_process_vm_readv, getpid(), &local, 1ul, &remote, 1ul, 0ul) == ssize_t(bytes);
-}
-
-void CaptureSample(int number, siginfo_t* info, void* rawContext)
-{
-    const int savedError = errno;
-    Target* target = t_sampleTarget;
-    int requested = 1;
-    if (!target || !target->pending.compare_exchange_strong(requested, 2, std::memory_order_acquire))
-    {
-        if (g_previousSampler.sa_handler != SIG_DFL && g_previousSampler.sa_handler != SIG_IGN)
-        {
-            if (g_previousSampler.sa_flags & SA_SIGINFO) g_previousSampler.sa_sigaction(number, info, rawContext);
-            else g_previousSampler.sa_handler(number);
-        }
-        errno = savedError;
-        return;
-    }
-    Sample& sample = target->captured;
-    sample.depth = sample.hostDepth = 0;
-    timespec now{};
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    sample.at = int64_t(now.tv_sec) * 1000000000 + now.tv_nsec;
-    auto* context = static_cast<ucontext_t*>(rawContext);
-#if defined(__x86_64__)
-    sample.host[sample.hostDepth++] = context->uc_mcontext.gregs[REG_RIP];
-    uintptr_t frame = context->uc_mcontext.gregs[REG_RBP];
-#elif defined(__aarch64__)
-    sample.host[sample.hostDepth++] = context->uc_mcontext.pc;
-    uintptr_t frame = context->uc_mcontext.regs[29];
-#endif
-    while (sample.hostDepth < 32 && frame >= target->stackLow &&
-           frame <= target->stackHigh && target->stackHigh - frame >= 2 * sizeof(uintptr_t))
-    {
-        uintptr_t link[2]{};
-        if (!ReadSampleMemory(reinterpret_cast<void*>(frame), link, sizeof(link))) break;
-#if defined(__aarch64__)
-        link[1] &= 0x0000ffffffffffffull; // Strip return-address authentication bits.
-#endif
-        if (!link[1]) break;
-        sample.host[sample.hostDepth++] = link[1];
-        if (link[0] <= frame || link[0] - frame > 0x100000) break;
-        frame = link[0];
-    }
-    PPCContext* guest = target->ctx ? target->ctx : GuestContextOf(target->tid);
-    PPCContext snapshot;
-    if (guest && ReadSampleMemory(guest, &snapshot, sizeof(snapshot)))
-    {
-        sample.chain[sample.depth++] = uint32_t(snapshot.lr);
-        uint32_t guestFrame = snapshot.r1.u32;
-        while (sample.depth < 24 && guestFrame && guestFrame < 0xFFFFFFF0u)
-        {
-            uint32_t previous = 0, returnAddress = 0;
-            if (!host_vm::ReadMemory(g_base + guestFrame, &previous, sizeof(previous))) break;
-            previous = __builtin_bswap32(previous);
-            if (previous <= guestFrame || previous - guestFrame > 0x10000) break;
-            if (!host_vm::ReadMemory(g_base + previous - 8, &returnAddress, sizeof(returnAddress))) break;
-            sample.chain[sample.depth++] = __builtin_bswap32(returnAddress);
-            guestFrame = previous;
-        }
-    }
-    target->pending.store(3, std::memory_order_release);
-    syscall(SYS_futex, &target->pending, FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
-    errno = savedError;
-}
-}
-
-void InitializeSampler(Target& target)
-{
-    static std::once_flag installed;
-    std::call_once(installed, [] {
-        struct sigaction action{};
-        sigemptyset(&action.sa_mask);
-        action.sa_sigaction = CaptureSample;
-        action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;
-        if (sigaction(SampleSignal, &action, &g_previousSampler) != 0) std::abort();
-    });
-    target.thread = pthread_self();
-    target.nativeTid = pid_t(syscall(SYS_gettid));
-    pthread_attr_t attributes;
-    if (pthread_getattr_np(target.thread, &attributes) == 0)
-    {
-        void* base = nullptr;
-        size_t bytes = 0;
-        if (pthread_attr_getstack(&attributes, &base, &bytes) == 0)
-        {
-            target.stackLow = uintptr_t(base);
-            target.stackHigh = uintptr_t(base) + bytes;
-        }
-        pthread_attr_destroy(&attributes);
-    }
-    t_sampleTarget = &target;
-}
-
-bool Take(Target& target, Sample& sample)
-{
-    std::lock_guard sampling(target.samplingMutex);
-    int state = target.pending.load(std::memory_order_acquire);
-    if (state == 2) return false; // A previous timed-out capture is still finishing.
-    if (state == 3) target.pending.store(0, std::memory_order_release);
-    int idle = 0;
-    if (!target.pending.compare_exchange_strong(idle, 1, std::memory_order_acq_rel)) return false;
-    if (syscall(SYS_tgkill, getpid(), target.nativeTid, SampleSignal) != 0)
-    {
-        target.pending.store(0, std::memory_order_release);
-        return false;
-    }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);
-    while ((state = target.pending.load(std::memory_order_acquire)) != 3)
-    {
-        const auto left = deadline - std::chrono::steady_clock::now();
-        if (left <= std::chrono::steady_clock::duration::zero())
-        {
-            int waiting = 1;
-            target.pending.compare_exchange_strong(waiting, 0, std::memory_order_acq_rel);
-            return false;
-        }
-        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(left).count();
-        timespec timeout{time_t(ns / 1000000000), long(ns % 1000000000)};
-        syscall(SYS_futex, &target.pending, FUTEX_WAIT_PRIVATE, state, &timeout, nullptr, 0);
-    }
-    sample = target.captured;
-    target.pending.store(0, std::memory_order_release);
-    return true;
-}
-#endif
-
 // A sample whose innermost host frame is a kernel wait / delay / yield stub (ntdll Nt* syscall
 // stubs are short functions that end in syscall; NtWaitForSingleObject, NtDelayExecution,
 // NtYieldExecution, NtSignalAndWaitForSingleObject, NtWaitForMultipleObjects, NtWaitForAlertByThreadId).
 bool Waiting(uint64_t leaf)
 {
-#if defined(_WIN32)
     static const std::vector<uint64_t> stubs = [] {
         std::vector<uint64_t> v;
         HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
@@ -836,13 +669,6 @@ bool Waiting(uint64_t leaf)
     for (uint64_t a : stubs)
         if (leaf >= a && leaf < a + 0x20) return true;
     return false;
-#else
-    Dl_info info{};
-    if (!dladdr(reinterpret_cast<void*>(leaf), &info) || !info.dli_sname) return false;
-    for (const char* name : { "futex", "pthread_cond", "pthread_mutex", "nanosleep", "sem_wait", "sched_yield" })
-        if (std::strstr(info.dli_sname, name)) return true;
-    return false;
-#endif
 }
 
 void ReportGaps()
@@ -890,7 +716,7 @@ void Loop()
     std::vector<Sample> resimUpdate, resimDraw;   // mode 5
     for (;;)
     {
-        if (!always && !g_active.load(std::memory_order_acquire)) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+        if (!always && !g_active.load(std::memory_order_acquire)) { Sleep(1); continue; }
         if (mode == 5)
         {
             Target* t = g_main.load();
@@ -910,7 +736,7 @@ void Loop()
                 resimUpdate.clear(); resimDraw.clear();
                 windowStart = now;
             }
-            while (Now() < now + step) host_thread::Pause();
+            while (Now() < now + step) YieldProcessor();
             continue;
         }
         std::vector<Target*> targets;
@@ -947,7 +773,7 @@ void Loop()
             windowStart = now;
         }
         if (mode == 3) ReportGaps();
-        while (Now() < now + step) host_thread::Pause();
+        while (Now() < now + step) YieldProcessor();
     }
 }
 
@@ -967,7 +793,7 @@ void End(double ms, uint32_t vtable)
 {
     if (!On()) return;
     g_active.store(false, std::memory_order_release);
-    while (g_busy.load()) host_thread::Pause();
+    while (g_busy.load()) YieldProcessor();
     if (ms < 20.0) return;
     std::vector<Sample> samples;
     {
@@ -1021,7 +847,6 @@ void Report(const char* header, const std::vector<Sample>& samples, size_t guest
     }
     // exe functions as RVAs (rva2sym.py), others as module+RVA.
     auto where = [](uint64_t address) {
-#if defined(_WIN32)
         HMODULE m = nullptr;
         char path[MAX_PATH] = "?";
         if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -1033,19 +858,6 @@ void Report(const char* header, const std::vector<Sample>& samples, size_t guest
         if (m == GetModuleHandleW(nullptr)) std::snprintf(b, sizeof(b), "%llX", (unsigned long long)(address - uint64_t(m)));
         else std::snprintf(b, sizeof(b), "%s+%llX", name, (unsigned long long)(address - uint64_t(m)));
         return std::string(b);
-#else
-        Dl_info info{};
-        char text[256];
-        if (dladdr(reinterpret_cast<void*>(address), &info) && info.dli_fbase)
-        {
-            const char* name = info.dli_fname ? std::strrchr(info.dli_fname, '/') : nullptr;
-            name = name ? name + 1 : info.dli_fname;
-            std::snprintf(text, sizeof(text), "%s+%llX", name ? name : "?",
-                (unsigned long long)(address - uintptr_t(info.dli_fbase)));
-        }
-        else std::snprintf(text, sizeof(text), "%llX", (unsigned long long)address);
-        return std::string(text);
-#endif
     };
     for (const auto& [label, m, n] : { std::tuple{ "host inclusive", &hostInclusive, hostTop }, std::tuple{ "host leaf", &hostLeaf, leafTop } })
     {
@@ -1054,33 +866,12 @@ void Report(const char* header, const std::vector<Sample>& samples, size_t guest
         std::fprintf(stderr, "%s\n", out.c_str());
     }
 }
-void DumpNativeSamples()
-{
-    std::vector<Target*> targets;
-    { std::lock_guard lock(g_targetsMutex); targets = g_targets; }
-    // Take serializes each capture slot with the normal profiling sampler.
-    for (Target* target : targets)
-    {
-        if (target->tid == host_thread::CurrentId()) continue;
-        Sample sample{};
-        if (!Take(*target, sample)) continue;
-        std::fprintf(stderr, "[stacks] sampled thread %u (%s):", target->tid, target->name.c_str());
-        for (uint32_t i = 0; i < sample.hostDepth; ++i)
-            std::fprintf(stderr, " %llX", (unsigned long long)sample.host[i]);
-        std::fprintf(stderr, "\n");
-    }
-}
-
 } // namespace hitch
 
 // Mode 3 hooks for kernel_video.cpp: the command-processor thread registers itself, and the
 // present timer reports frames over 25 ms.
 // data_watch.cpp: the guest context a host thread is running (its LR names the guest caller).
-PPCContext* WatchGuestContextOf(uint32_t tid) { return hitch::GuestContextOf(tid); }
-#if defined(_WIN32)
-// Existing Windows diagnostic callers expose the SDK's unsigned-long DWORD.
-PPCContext* WatchGuestContextOf(unsigned long tid) { return hitch::GuestContextOf(uint32_t(tid)); }
-#endif
+PPCContext* WatchGuestContextOf(DWORD tid) { return hitch::GuestContextOf(tid); }
 
 void HitchRegisterThread(const char* name)
 {
@@ -1101,7 +892,11 @@ struct Counts { uint64_t allocs = 0, frees = 0; double allocMs = 0, freeMs = 0, 
 thread_local Counts t_counts;
 thread_local uint64_t t_ops = 0;          // always counted (rollback.cpp: heap use per frame)
 std::atomic<uint64_t> g_ops{ 0 };
-inline double Ms(int64_t a, int64_t b) { return double(b - a) / 1000000.0; }
+inline double Ms(LARGE_INTEGER a, LARGE_INTEGER b)
+{
+    static const double f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return 1000.0 / double(q.QuadPart); }();
+    return double(b.QuadPart - a.QuadPart) * f;
+}
 }
 bool RollbackOwnedCaller(const PPCContext& ctx);          // rollback.cpp: network code allocating?
 void RollbackNoteHeapBlock(uint32_t ptr, uint32_t size);
@@ -1137,11 +932,11 @@ PPC_FUNC(sub_82BFA928)
         RollbackHeapOp(true, ctx.r3.u32, size, entry);
         return;
     }
-    int64_t a, b;
+    LARGE_INTEGER a, b;
     const PPCContext entry = ctx;
-    a = hitch::Now();
+    QueryPerformanceCounter(&a);
     __imp__sub_82BFA928(ctx, base);
-    b = hitch::Now();
+    QueryPerformanceCounter(&b);
     if (owned) RollbackNoteHeapBlock(ctx.r3.u32, size);
     RollbackHeapOp(true, ctx.r3.u32, size, entry);
     auto& c = heapstat::t_counts;
@@ -1159,10 +954,10 @@ PPC_FUNC(sub_82BFB220)
     RollbackNoteHeapFree(ctx.r5.u32);
     RollbackHeapOp(false, ctx.r5.u32, 0, ctx);
     if (!hitch::On()) { __imp__sub_82BFB220(ctx, base); return; }
-    int64_t a, b;
-    a = hitch::Now();
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
     __imp__sub_82BFB220(ctx, base);
-    b = hitch::Now();
+    QueryPerformanceCounter(&b);
     auto& c = heapstat::t_counts;
     const double ms = heapstat::Ms(a, b);
     ++c.frees;
@@ -1305,9 +1100,9 @@ PPC_FUNC(sub_82A80AD8)
     uint64_t calls0 = 0, bytes0 = 0, calls1 = 0, bytes1 = 0;
     double io0 = 0, io1 = 0;
     ThreadIoTotals(calls0, bytes0, io0);
-    static const uint32_t mainThread = host_thread::CurrentId();
+    static const DWORD mainThread = GetCurrentThreadId();
     thread_local int depth = 0;
-    const bool outer = host_thread::CurrentId() == mainThread && depth++ == 0;
+    const bool outer = GetCurrentThreadId() == mainThread && depth++ == 0;
     if (outer) hitch::Begin(ctx, base);
     const heapstat::Counts heap0 = heapstat::t_counts;
     uint64_t ctabCalls0 = 0, ctabHits0 = 0;
@@ -1315,7 +1110,7 @@ PPC_FUNC(sub_82A80AD8)
     const auto start = std::chrono::steady_clock::now();
     __imp__sub_82A80AD8(ctx, base);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    if (host_thread::CurrentId() == mainThread) --depth;
+    if (GetCurrentThreadId() == mainThread) --depth;
     if (outer) hitch::End(ms, vtable);
     if (outer && ms >= 20.0 && hitch::On())
     {
@@ -1335,8 +1130,8 @@ PPC_FUNC(sub_82A80AD8)
         std::fprintf(stderr, "[frame]   file calls during it: %llu, %llu KB, %.1f ms\n", (unsigned long long)(calls1 - calls0),
                      (unsigned long long)((bytes1 - bytes0) / 1024), io1 - io0);
     if (ms > 8.0 && logged < 400)
-        std::fprintf(stderr, "[frame] slow task %08X vtable %08X step %08X %.1f ms (lr %08X) thread %u\n", task, vtable, step, ms, lr,
-                     host_thread::CurrentId());
+        std::fprintf(stderr, "[frame] slow task %08X vtable %08X step %08X %.1f ms (lr %08X) thread %lu\n", task, vtable, step, ms, lr,
+                     GetCurrentThreadId());
 }
 TIMED_HOOK(82258D60)
 TIMED_HOOK(825DEBD0)

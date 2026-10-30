@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <intrin.h>
 #include <unordered_map>
 
 extern "C" PPC_FUNC(__imp__sub_82C0DF78);   // D3DXGetShaderConstantTable(shader, &table) -> HRESULT
@@ -36,15 +37,14 @@ bool On()
 // Atomic add on the big-endian guest reference count; returns the new count.
 uint32_t AddCount(uint8_t* base, uint32_t object, int32_t delta)
 {
-    auto& word = *reinterpret_cast<uint32_t*>(base + object + 4);
-    std::atomic_ref<uint32_t> count(word);
-    uint32_t seen = count.load(std::memory_order_relaxed);
+    auto* word = reinterpret_cast<volatile long*>(base + object + 4);
+    long seen = *word;
     for (;;)
     {
-        const uint32_t next = __builtin_bswap32(__builtin_bswap32(seen) + uint32_t(delta));
-        if (count.compare_exchange_weak(seen, next, std::memory_order_acq_rel,
-                                        std::memory_order_relaxed))
-            return __builtin_bswap32(next);
+        const uint32_t next = _byteswap_ulong(_byteswap_ulong(uint32_t(seen)) + uint32_t(delta));
+        const long previous = _InterlockedCompareExchange(word, long(next), seen);
+        if (previous == seen) return _byteswap_ulong(next);
+        seen = previous;
     }
 }
 

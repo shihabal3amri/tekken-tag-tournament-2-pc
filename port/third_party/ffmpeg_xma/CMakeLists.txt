@@ -8,65 +8,16 @@
 # FFMPEG_SRC = the source tree, FFMPEG_BUILD = configure's output (config.h, avconfig.h, codec lists).
 cmake_minimum_required(VERSION 3.20)
 if(NOT DEFINED FFMPEG_SRC)
-    if(WIN32)
-        set(FFMPEG_SRC "C:/ttt2/tools/ffmpeg_dl/FFmpeg-n7.1")
-    else()
-        set(FFMPEG_SRC "${CMAKE_SOURCE_DIR}/../tools/ffmpeg_dl/FFmpeg-n7.1")
-    endif()
+    set(FFMPEG_SRC "C:/ttt2/tools/ffmpeg_dl/FFmpeg-n7.1")
 endif()
 if(NOT DEFINED FFMPEG_BUILD)
-    if(WIN32)
-        set(FFMPEG_BUILD "C:/ttt2/tools/ffmpeg_dl/build")
-    else()
-        set(FFMPEG_BUILD "${CMAKE_SOURCE_DIR}/../tools/ffmpeg_dl/build-linux-native")
-    endif()
+    set(FFMPEG_BUILD "C:/ttt2/tools/ffmpeg_dl/build")
 endif()
-if(NOT EXISTS "${FFMPEG_BUILD}/config.h")
-    message(FATAL_ERROR "FFmpeg configuration missing at ${FFMPEG_BUILD}; run tools/configure_ffmpeg_native.sh on Linux")
-endif()
-if(WIN32)
-    include(${CMAKE_CURRENT_LIST_DIR}/sources.cmake)
-else()
-    # Select the objects from this host's FFmpeg config.mak. The checked-in
-    # manifest was generated from the Windows configuration and differs where
-    # FFmpeg chooses platform-specific objects (for example file_open.c).
-    find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    set(_ff_source_script "${CMAKE_SOURCE_DIR}/tools/ffmpeg_sources.py")
-    execute_process(
-        COMMAND "${Python3_EXECUTABLE}" "${_ff_source_script}" "${FFMPEG_SRC}" "${FFMPEG_BUILD}"
-        OUTPUT_VARIABLE _ff_source_lines
-        ERROR_VARIABLE _ff_source_error
-        RESULT_VARIABLE _ff_source_result
-        OUTPUT_STRIP_TRAILING_WHITESPACE)
-    if(NOT _ff_source_result EQUAL 0 OR _ff_source_lines STREQUAL "")
-        message(FATAL_ERROR "Cannot read native FFmpeg sources: ${_ff_source_error}")
-    endif()
-    string(REPLACE "\n" ";" TTT2_FFMPEG_SOURCES "${_ff_source_lines}")
-    set(_ff_makefiles
-        "${FFMPEG_SRC}/libavutil/Makefile" "${FFMPEG_SRC}/libavcodec/Makefile")
-    file(STRINGS "${FFMPEG_BUILD}/ffbuild/config.mak" _ff_make_subdirs
-        REGEX "^(ARCH|INTRINSICS)=[A-Za-z0-9_]+$")
-    foreach(_ff_setting IN LISTS _ff_make_subdirs)
-        string(REGEX REPLACE "^[^=]+=" "" _ff_subdir "${_ff_setting}")
-        foreach(_ff_lib IN ITEMS libavutil libavcodec)
-            set(_ff_makefile "${FFMPEG_SRC}/${_ff_lib}/${_ff_subdir}/Makefile")
-            if(EXISTS "${_ff_makefile}")
-                list(APPEND _ff_makefiles "${_ff_makefile}")
-            endif()
-        endforeach()
-    endforeach()
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-        "${_ff_source_script}" "${FFMPEG_BUILD}/ffbuild/config.mak"
-        ${_ff_makefiles})
-endif()
+include(${CMAKE_CURRENT_LIST_DIR}/sources.cmake)
 
-# configure leaves libavutil/ffversion.h to make; provide it without touching
-# the compiled header on every CMake reconfigure.
-file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/ffgen/libavutil)
-file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/ffgen/libavutil/ffversion.h.in
+# configure leaves libavutil/ffversion.h to make; provide it.
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/ffgen/libavutil/ffversion.h
      "#ifndef AVUTIL_FFVERSION_H\n#define AVUTIL_FFVERSION_H\n#define FFMPEG_VERSION \"n7.1\"\n#endif\n")
-configure_file(${CMAKE_CURRENT_BINARY_DIR}/ffgen/libavutil/ffversion.h.in
-               ${CMAKE_CURRENT_BINARY_DIR}/ffgen/libavutil/ffversion.h COPYONLY)
 
 # Build-time changes to the XMA wrapper (the source tree stays as downloaded), all for
 # single-stream decoders, which is what a hardware XMA context is: one stream fed
@@ -116,36 +67,17 @@ foreach(f IN LISTS TTT2_FFMPEG_SOURCES)
         list(APPEND _ff_files "${FFMPEG_SRC}/${f}")
     endif()
 endforeach()
-if(WIN32)
-    add_library(ttt2_ffmpeg STATIC ${_ff_files})
-else()
-    add_library(ttt2_ffmpeg STATIC EXCLUDE_FROM_ALL ${_ff_files})
-endif()
+add_library(ttt2_ffmpeg STATIC ${_ff_files})
 target_include_directories(ttt2_ffmpeg
     PRIVATE ${FFMPEG_BUILD} ${CMAKE_CURRENT_BINARY_DIR}/ffgen ${FFMPEG_SRC}
-            ${FFMPEG_SRC}/compat/stdbit
+            ${FFMPEG_SRC}/compat/atomics/win32 ${FFMPEG_SRC}/compat/stdbit
     INTERFACE ${FFMPEG_BUILD} ${CMAKE_CURRENT_BINARY_DIR}/ffgen ${FFMPEG_SRC})
 target_compile_definitions(ttt2_ffmpeg PRIVATE
-    HAVE_AV_CONFIG_H _ISOC11_SOURCE _FILE_OFFSET_BITS=64 _LARGEFILE_SOURCE)
-if(WIN32)
-    target_include_directories(ttt2_ffmpeg PRIVATE ${FFMPEG_SRC}/compat/atomics/win32)
-    target_compile_definitions(ttt2_ffmpeg PRIVATE WIN32_LEAN_AND_MEAN
-        _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS _WIN32_WINNT=0x0600)
-    if(CMAKE_C_COMPILER_ID MATCHES "Clang")
-        target_compile_options(ttt2_ffmpeg PRIVATE /std:c17 /O2 -Wno-everything)
-    else()
-        target_compile_options(ttt2_ffmpeg PRIVATE /std:c17 /O2 /W0 /utf-8)
-    endif()
+    HAVE_AV_CONFIG_H _ISOC11_SOURCE _FILE_OFFSET_BITS=64 _LARGEFILE_SOURCE WIN32_LEAN_AND_MEAN
+    _USE_MATH_DEFINES _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS _WIN32_WINNT=0x0600)
+if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    target_compile_options(ttt2_ffmpeg PRIVATE /std:c17 /O2 -Wno-everything)
 else()
-    find_package(Threads REQUIRED)
-    # FFmpeg's Linux config.mak lists -pthread -lm -latomic for both libavcodec
-    # and libavutil. Keep the static archive's final link dependencies together.
-    target_link_libraries(ttt2_ffmpeg PUBLIC Threads::Threads m atomic)
-    target_compile_options(ttt2_ffmpeg PRIVATE -O2)
+    target_compile_options(ttt2_ffmpeg PRIVATE /std:c17 /O2 /W0 /utf-8)
 endif()
 set_target_properties(ttt2_ffmpeg PROPERTIES C_STANDARD 17)
-if(WIN32 AND CMAKE_C_COMPILER_ID STREQUAL "Clang")
-    target_compile_options(ttt2_ffmpeg PRIVATE
-        "/clang:-ffile-prefix-map=${FFMPEG_SRC}=ffmpeg"
-        "/clang:-ffile-prefix-map=${FFMPEG_BUILD}=ffmpeg-build")
-endif()

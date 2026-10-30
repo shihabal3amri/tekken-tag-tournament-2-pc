@@ -19,28 +19,34 @@ static const int    kMaxDepth = 16;          // a malformed or hostile image mus
 static const size_t kMaxEntries = 100000;
 
 bool XdvdfsImage::ReadAt(uint64_t off, void* buf, uint32_t n) {
-    return file_.Read(off, buf, n);
+    if (h_ == INVALID_HANDLE_VALUE) return false;
+    if (off + n > imageSize_) return false;
+    LARGE_INTEGER li; li.QuadPart = (LONGLONG)off;
+    if (!SetFilePointerEx(h_, li, nullptr, FILE_BEGIN)) return false;
+    uint8_t* p = (uint8_t*)buf;
+    uint32_t left = n;
+    while (left) {
+        DWORD got = 0;
+        if (!ReadFile(h_, p, left, &got, nullptr) || got == 0) return false;
+        p += got; left -= got;
+    }
+    return true;
 }
 
 void XdvdfsImage::Close() {
-    file_.Close();
+    if (h_ != INVALID_HANDLE_VALUE) { CloseHandle(h_); h_ = INVALID_HANDLE_VALUE; }
     entries_.clear();
 }
 
-bool XdvdfsImage::Open(const std::filesystem::path& path, std::string& err) {
+bool XdvdfsImage::Open(const wchar_t* isoPath, std::string& err) {
     Close();
-    if (!file_.Open(path)) { err = "Could not open a seekable input file."; return false; }
-    return Parse(err);
-}
-#ifndef _WIN32
-bool XdvdfsImage::OpenFd(int fd, std::string& err) {
-    Close();
-    if (!file_.OpenFd(fd)) { err = "This file cannot be read directly. Copy it to local storage and select it again."; return false; }
-    return Parse(err);
-}
-#endif
-bool XdvdfsImage::Parse(std::string& err) {
-    imageSize_ = file_.Size();
+    h_ = CreateFileW(isoPath, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                     FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h_ == INVALID_HANDLE_VALUE) { err = "The disc image could not be opened."; return false; }
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h_, &sz)) { err = "The disc image could not be read."; Close(); return false; }
+    imageSize_ = (uint64_t)sz.QuadPart;
+
     // XGD3 (redump), XGD2, then a rebuilt image whose game partition starts at 0.
     static const uint64_t kBases[] = { 0x2080000ull, 0xFD90000ull, 0x0ull, 0x18300000ull };
     uint8_t desc[kSector];
@@ -96,9 +102,6 @@ bool XdvdfsImage::WalkDir(uint32_t sector, uint32_t bytes, const std::string& pr
             continue;
         }
         std::string name((const char*)tbl.data() + pos + 14, nlen);
-        if (name == "." || name == ".." || name.find_first_of("/\\:") != std::string::npos || name.find('\0') != std::string::npos) {
-            err = "The disc image contains an invalid filename."; return false;
-        }
         std::string full = prefix.empty() ? name : prefix + "\\" + name;
         if (entries_.size() >= kMaxEntries) { err = "The disc image's directory table is corrupt."; return false; }
 
@@ -118,12 +121,12 @@ bool XdvdfsImage::WalkDir(uint32_t sector, uint32_t bytes, const std::string& pr
 
 const IsoEntry* XdvdfsImage::Find(const char* path) const {
     for (const IsoEntry& e : entries_)
-        if (!e.dir && CompareNames(e.path.c_str(), path) == 0) return &e;
+        if (!e.dir && _stricmp(e.path.c_str(), path) == 0) return &e;
     return nullptr;
 }
 
 bool XdvdfsImage::ReadEntry(const IsoEntry& e, std::vector<uint8_t>& out) {
-    if (e.dir || e.offset > imageSize_ || e.size > imageSize_ - e.offset || e.size > (256u << 20)) return false;
+    if (e.dir) return false;
     out.resize(e.size);
     return e.size == 0 || ReadAt(e.offset, out.data(), e.size);
 }

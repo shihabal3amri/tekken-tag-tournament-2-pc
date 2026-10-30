@@ -15,7 +15,6 @@ struct Item { int id; const wchar_t* name; };
 const Item kItems[] = {
     { IDR_GAME_EXE,        L"Tekken Tag Tournament 2.exe" },
     { IDR_STEAM_API,       L"steam_api64.dll" },
-    { IDR_SDL3,            L"SDL3.dll" },
     { IDR_MSVCP140,        L"msvcp140.dll" },
     { IDR_MSVCP140_ATOMIC, L"msvcp140_atomic_wait.dll" },
     { IDR_VCRUNTIME140,    L"vcruntime140.dll" },

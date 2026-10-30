@@ -9,11 +9,7 @@
 // returned. Calls the original did not make are new in the corrected timeline and run (a sound then
 // starts late by the rollback's depth instead of never). Main thread only.
 #include "kernel_shared.h"
-#include "host_thread.h"
-#include "host_vm.h"
-#if defined(_WIN32)
 #include <windows.h>
-#endif
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -31,23 +27,6 @@ const uint32_t kAddr[kCount] = { 0x82B1B0B0, 0x82B1B128, 0x82B1B140, 0x82B1B158,
 // take what their call sites set). Other registers hold the caller's leftovers and are not compared
 // (MEASURED: comparing them made re-simulated handle releases (B968, r3 only) look new - released twice).
 const uint8_t kArgs[kCount] = { 31, 3, 1, 1, 3, 0, 0, 1, 7, 7, 7, 7, 15, 15, 3, 3, 3, 1, 0, 0, 1, 1, 1, 1, 1, 3, 3, 1, 1, 1, 3, 3, 1, 7, 3, 7, 7, 3, 1, 15, 3, 3, 1, 1, 1, 1, 1, 3, 1, 15, 15, 3 };
-// Floating-point arguments are independent of r3-r7 in the guest ABI.
-// Compare only the live inputs: ignoring f1 can discard an unmute as a
-// duplicate mute, while comparing unused registers creates duplicate calls.
-uint8_t FloatArgs(int i)
-{
-    switch (kAddr[i])
-    {
-    case 0x82B1B8C0: case 0x82B1B8C8: // gain conversions
-    case 0x82B1BE70: case 0x82B1C498: // volume, pitch
-        return 1;
-    case 0x82B1BBF0: case 0x82B1BC78: case 0x82B1BD00: case 0x82B1CA40:
-        return 7;                   // three-component spatial parameters
-    default:
-        return 0;
-    }
-}
-bool FloatResult(int i) { return kAddr[i] == 0x82B1B8C0 || kAddr[i] == 0x82B1B8C8; }
 constexpr int kRing = 32;
 
 struct Call
@@ -56,7 +35,6 @@ struct Call
     bool used;
     bool out5, out6;
     uint32_t r3, r4, r5, r6, r7, lr, result, v5, v6;
-    uint64_t f1 = 0, f2 = 0, f3 = 0, floatResult = 0;
     std::vector<std::pair<uint32_t, uint8_t>> writes;     // the bytes it wrote into game objects
     uint32_t created = 0;                                  // the handle it stored in its out object
     uint32_t released = 0;                                 // B968: the handle whose reference it dropped
@@ -68,7 +46,7 @@ struct FrameCalls { uint64_t frame = ~0ull; std::vector<Call> calls; size_t curs
 FrameCalls g_frames[kRing];
 FrameCalls* g_rec = nullptr;          // live frame being recorded
 FrameCalls* g_rep = nullptr;          // re-simulated frame being replayed
-uint32_t g_main = 0;
+DWORD g_main = 0;
 uint64_t g_replayed = 0, g_executed = 0;
 // Calls the API makes into itself (sub_82B1BAC0 releasing an object's old handle through B968, ...)
 // run as they are: only the game's own calls are recorded and answered (an outer call that runs for
@@ -145,17 +123,10 @@ void ApplyDeferred(PPCContext& ctx, uint8_t* base, Call& c)
 // Handles (an instance in the sound arena, its reference count at +28): sub_82B1BAC0 stores a new one in
 // a game object (+4) and takes a reference (sub_82B1C6A0); B968 drops it (sub_82B1C6B0) and clears +4;
 // BA68 posts the instance a 'rele' (sub_82B1D318). Creating calls and the object they fill: B830 r3,
-// C0C8 r5, B570 / B5F8 / CAC8 r6. B570 and B5F8 create streamed music
-// instances too; discarding their timeline must release those instances.
+// C0C8 r5, CAC8 r6.
 int IndexOf(uint32_t addr) { for (int i = 0; i < kCount; ++i) if (kAddr[i] == addr) return i; return -1; }
 const int kB830 = IndexOf(0x82B1B830), kC0C8 = IndexOf(0x82B1C0C8), kCAC8 = IndexOf(0x82B1CAC8), kB968 = IndexOf(0x82B1B968);
-uint32_t OutObject(int i, uint32_t r3, uint32_t r5, uint32_t r6)
-{
-    if (i == kB830) return r3;
-    if (i == kC0C8) return r5;
-    if (i == kCAC8 || kAddr[i] == 0x82B1B570 || kAddr[i] == 0x82B1B5F8) return r6;
-    return 0;
-}
+uint32_t OutObject(int i, uint32_t r3, uint32_t r5, uint32_t r6) { return i == kB830 ? r3 : i == kC0C8 ? r5 : i == kCAC8 ? r6 : 0; }
 bool Handle(uint32_t h) { return h >= 0x00100000u && h < 0x40000000u && (h & 3) == 0; }
 
 // The main thread's guest stack (thread block at 0x40000000): out-pointers into it are the call's
@@ -203,23 +174,20 @@ bool CensusOn()
 template <class F>
 void Hook(int i, PPCContext& ctx, uint8_t* base, F original)
 {
-    if (host_thread::CurrentId() != g_main || !(g_rec || g_rep) || g_depth)
+    if (GetCurrentThreadId() != g_main || !(g_rec || g_rep) || g_depth)
     {
         SoundCall(original, ctx, base);
         return;
     }
     if (CensusOn()) { ++g_calls[i]; g_thisFrame[i] = true; }
     const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32, r6 = ctx.r6.u32, r7 = ctx.r7.u32;
-    const uint64_t f1 = ctx.f1.u64, f2 = ctx.f2.u64, f3 = ctx.f3.u64;
     if (g_rep)
     {
         const uint8_t m = kArgs[i];
-        const uint8_t fm = FloatArgs(i);
         const uint32_t lr = uint32_t(ctx.lr);
         auto same = [&](const Call& c) {
             return !c.used && c.fn == i && c.lr == lr && (!(m & 1) || c.r3 == r3) && (!(m & 2) || c.r4 == r4) &&
-                   (!(m & 4) || c.r5 == r5) && (!(m & 8) || c.r6 == r6) && (!(m & 16) || c.r7 == r7) &&
-                   (!(fm & 1) || c.f1 == f1) && (!(fm & 2) || c.f2 == f2) && (!(fm & 4) || c.f3 == f3);
+                   (!(m & 4) || c.r5 == r5) && (!(m & 8) || c.r6 == r6) && (!(m & 16) || c.r7 == r7);
         };
         std::vector<Call>& calls = g_rep->calls;
         Call* hit = nullptr;
@@ -234,7 +202,6 @@ void Hook(int i, PPCContext& ctx, uint8_t* base, F original)
             if (hit->out6) GWrite32(base, r6, hit->v6);
             for (const auto& [a, v] : hit->writes) base[a] = v;
             ctx.r3.u64 = hit->result;
-            if (FloatResult(i)) ctx.f1.u64 = hit->floatResult;
             ++g_replayed;
             return;
         }
@@ -258,7 +225,6 @@ void Hook(int i, PPCContext& ctx, uint8_t* base, F original)
         --g_depth;
         // It reached the engine: a later rollback into this frame must find it.
         Call c{ uint8_t(i), true, OnStack(r5), OnStack(r6), r3, r4, r5, r6, r7, lr, ctx.r3.u32, 0, 0 };
-        c.f1 = f1; c.f2 = f2; c.f3 = f3; c.floatResult = ctx.f1.u64;
         if (c.out5) c.v5 = GRead32(base, r5);
         if (c.out6) c.v6 = GRead32(base, r6);
         CaptureWrites(before, captured, c.writes);
@@ -279,7 +245,6 @@ void Hook(int i, PPCContext& ctx, uint8_t* base, F original)
     CollectCall(original, ctx, base);
     --g_depth;
     Call c{ uint8_t(i), false, OnStack(r5), OnStack(r6), r3, r4, r5, r6, r7, lr, ctx.r3.u32, 0, 0 };
-    c.f1 = f1; c.f2 = f2; c.f3 = f3; c.floatResult = ctx.f1.u64;
     if (c.out5) c.v5 = GRead32(base, r5);
     if (c.out6) c.v6 = GRead32(base, r6);
     CaptureWrites(before, captured, c.writes);
@@ -293,7 +258,7 @@ void Hook(int i, PPCContext& ctx, uint8_t* base, F original)
 extern "C" PPC_FUNC(__imp__sub_82B1C6B0);
 PPC_FUNC(sub_82B1C6B0)
 {
-    if (g_collect && host_thread::CurrentId() == g_main && Handle(ctx.r3.u32))
+    if (g_collect && GetCurrentThreadId() == g_main && Handle(ctx.r3.u32))
     {
         g_collected.push_back({ ctx.r3.u32, false });
         ++g_deferred;
@@ -303,7 +268,7 @@ PPC_FUNC(sub_82B1C6B0)
 }
 PPC_FUNC(sub_82B1D318)
 {
-    if (g_collect && host_thread::CurrentId() == g_main && ctx.r4.u32 == 0x72656C65 && Handle(ctx.r3.u32))
+    if (g_collect && GetCurrentThreadId() == g_main && ctx.r4.u32 == 0x72656C65 && Handle(ctx.r3.u32))
     {
         g_collected.push_back({ ctx.r3.u32, true });
         ++g_deferred;
@@ -382,7 +347,7 @@ void SoundRollbackFinal(PPCContext& ctx, uint8_t* base, uint64_t upTo)
 // live (record) or re-simulated (replay); frame = ~0 stops both.
 void SoundRollbackFrame(uint64_t frame, bool resim)
 {
-    g_main = host_thread::CurrentId();
+    g_main = GetCurrentThreadId();
     if (CensusOn())
     {
         static uint32_t frames = 0;

@@ -9,8 +9,6 @@
 #include "profiles.h"
 #include "sys_ui.h"
 #include "keyboard_keys.h"
-#include "host_keycodes.h"
-#include "host_input_sdl.h"
 #include "xlive.h"
 #include <algorithm>
 #include <atomic>
@@ -19,23 +17,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <filesystem>
 #include <string>
 #include <vector>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <utility>
-
-// SDL snapshots use the Xbox pad wire layout; these local host structures only
-// hold the cached state before the guest fields are written in big-endian order.
-struct XboxPadData { uint16_t wButtons = 0; uint8_t bLeftTrigger = 0, bRightTrigger = 0;
-    int16_t sThumbLX = 0, sThumbLY = 0, sThumbRX = 0, sThumbRY = 0; };
-struct XboxPadState { uint32_t dwPacketNumber = 0; XboxPadData Gamepad{}; };
-struct XboxPadCapabilities { uint8_t Type = 0, SubType = 0; uint16_t Flags = 0;
-    XboxPadData Gamepad{}; struct { uint16_t wLeftMotorSpeed = 0, wRightMotorSpeed = 0; } Vibration; };
-constexpr uint8_t XboxPadDeviceType = 1, XboxPadDeviceSubtype = 1;
-constexpr uint8_t XboxPadTriggerThreshold = 30;
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <Xinput.h>
 
 // --- ExGetXConfigSetting(category, setting, buffer, bufferSize, requiredSize) ---
 PPC_FUNC(__imp__ExGetXConfigSetting)
@@ -140,11 +130,11 @@ static void UserTrace(const char* fn, uint32_t lr, uint32_t user, uint32_t resul
     static std::mutex m;
     static std::unordered_map<uint64_t, int> seen;
     uint64_t key = (uint64_t(lr) << 32) ^ (uint64_t(user) << 24) ^ result ^ (uint64_t(uintptr_t(fn)) << 8);
-    if (*env == '2' && user) key ^= (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count()) * 0x9E3779B97F4A7C15ull ^ uint64_t(lr2) << 16;
+    if (*env == '2' && user) key ^= (GetTickCount64() / 1000) * 0x9E3779B97F4A7C15ull ^ uint64_t(lr2) << 16;
     std::lock_guard l(m);
     if (seen[key]++) return;
     std::fprintf(stderr, "[xam-user] %llu ms %s user %u lr %08X (%08X) -> %08X\n",
-                 (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), fn, user, lr, lr2, result);
+                 (unsigned long long)GetTickCount64(), fn, user, lr, lr2, result);
 }
 // The caller's caller: the saved LR in the caller's frame (back chain at r1, LR at -8 of the previous frame).
 static uint32_t Caller2(uint8_t* base, const PPCContext& ctx)
@@ -474,9 +464,8 @@ PPC_FUNC(__imp__XMsgInProcessCall)
 {
     KTrace("XMsgInProcessCall");
     uint32_t app = ctx.r3.u32, message = ctx.r4.u32, param1 = ctx.r5.u32;
-    static const bool trace = std::getenv("TTT2_XAM_TRACE") != nullptr;
     static int logged = 0;
-    if (trace && (logged < 40 || message != 0x7001B))
+    if (logged < 40 || message != 0x7001B)
     {
         ++logged;
         std::fprintf(stderr, "[xam] XMsgInProcessCall app=%08X msg=%08X lr=%08X\n", app, message, (uint32_t)ctx.lr);
@@ -484,7 +473,7 @@ PPC_FUNC(__imp__XMsgInProcessCall)
     // One-shot guest backtrace of the polling thread: walk the PPC backchain
     // ([r1] = caller frame; saved LR at [callerFrame - 8]) to find the boot loop.
     static std::atomic<int> calls{0};
-    if (trace && ++calls == 500)
+    if (++calls == 500)
     {
         char line[512];
         int n = std::snprintf(line, sizeof(line), "[xam] poll backtrace: lr=%08X", (uint32_t)ctx.lr);
@@ -608,21 +597,27 @@ PPC_FUNC(__imp__ExRegisterTitleTerminateNotification)
 {
     KTrace("ExRegisterTitleTerminateNotification"); ctx.r3.u32 = 0; }
 
-// --- input: SDL gamepads plus focused keyboard controls for player 0 ---
-// Guest users 0-3 receive Xbox-style pad values from SDL, assigned by use rather than
-// by SDL host slot: the first pad to press a button or trigger becomes user 0, the only
+// --- input: host XInput pads, plus focused keyboard controls for player 0 ---
+// Guest users 0-3 are the host XInput pads (big-endian gamepad struct; the Xbox 360
+// XAMINPUT layouts and button masks match PC XInput exactly), assigned by use rather than
+// by XInput slot: the first pad to press a button or trigger becomes user 0, the only
 // signed-in profile, the next one user 1, and so on (see PadPollState::guestOf).
 //
-// The guest polls inside a critical section shared with its main loop. The host
-// poll thread reads SDL's event snapshot rather than querying any device driver.
+// IMPORTANT: the guest polls input from inside a critical section its main loop also
+// takes, and host XInputGetState/GetCapabilities on DISCONNECTED pads can each take
+// hundreds of ms (driver enumeration) - calling them inline throttled the entire game
+// loop to ~0.5 Hz. A host poll thread keeps a snapshot (connected pads and the keyboard every
+// ~1 ms - a press reaches the game at most ~1 ms later than it could, it was 8 ms; disconnected
+// pads retried every 2 s per XInput guidance); guest calls read it instantly.
+#pragma comment(lib, "xinput9_1_0.lib")
 
 namespace {
 struct PadSnapshot
 {
     std::atomic<bool> connected{false};
     std::mutex m;
-    XboxPadState state{};
-    XboxPadCapabilities caps{};
+    XINPUT_STATE state{};
+    XINPUT_CAPABILITIES caps{};
     bool physical = false; // protected by m; separate from logical connected state
 };
 PadSnapshot g_pads[4];
@@ -635,11 +630,15 @@ std::atomic<bool> g_padThreadStarted{false};
 // arrows = D-pad, A/S/Z/X = A/B/X/Y, Q/W = shoulders, E/R = triggers, D/F = stick clicks,
 // Enter = START, Backspace = BACK); Space is an extra START while no control has it.
 struct KeyboardPad { uint16_t buttons = 0; bool leftTrigger = false, rightTrigger = false; };
-static KeyboardPad ReadKeyboardPad(const host_input::Snapshot& host)
+static KeyboardPad ReadKeyboardPad()
 {
     KeyboardPad pad;
-    if (!host.focused) return pad;
-    auto down = [&host](int vk) { return vk > 0 && vk < 256 && host.keys[vk]; };
+    DWORD foregroundProcess = 0;
+    HWND foreground = GetForegroundWindow();
+    if (!foreground) return pad;
+    GetWindowThreadProcessId(foreground, &foregroundProcess);
+    if (foregroundProcess != GetCurrentProcessId()) return pad;
+    auto down = [](int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0; };
     if (SysUiKeyCaptureActive()) return pad;              // the keys are being chosen
     if (SysUiTextEntryActive())
     {
@@ -664,6 +663,9 @@ static KeyboardPad ReadKeyboardPad(const host_input::Snapshot& host)
 struct PadPollState
 {
     bool physicalConnected[4]{};
+    uint64_t retryAtMs[4]{};                  // disconnected: next XInput probe (poll thread clock)
+    XINPUT_CAPABILITIES caps[4]{};            // connected: capabilities, refreshed once a second
+    uint64_t capsAtMs[4]{};
     bool keyboardEverPressed = false;
     // Host pad -> guest user, -1 until the pad is first used. A pad claims the lowest user no
     // other claimed pad holds on its first button or trigger press (sticks drift, so they do
@@ -746,12 +748,6 @@ static void PollInjectFile(PadScript& s, uint64_t now)
     // TTT2_INSTANCE=<tag>: pad_inject<tag>.txt, so two instances can be driven separately.
     static const std::string injectPath = [] {
         const char* tag = std::getenv("TTT2_INSTANCE");
-#if defined(__ANDROID__)
-        // ADB can place a command file here while the SDL activity is running.
-        if (const char* root = std::getenv("TTT2_DEBUG_ROOT"); root && *root)
-            return (std::filesystem::path(root).parent_path() / "config" /
-                    (std::string("pad_inject") + (tag ? tag : "") + ".txt")).string();
-#endif
         return std::string("C:/ttt2/port/pad_inject") + (tag ? tag : "") + ".txt";
     }();
     const char* path = injectPath.c_str();
@@ -800,7 +796,7 @@ static uint16_t ScriptButtons(PadScript& s, uint64_t now, int player = 0, uint8_
     return b;
 }
 // A scripted left stick (LSL / LSR / LSU / LSD bits) on a player's pad state.
-static void ApplyScriptStick(XboxPadState& state, uint8_t stick)
+static void ApplyScriptStick(XINPUT_STATE& state, uint8_t stick)
 {
     if (stick & 1) state.Gamepad.sThumbLX = -32768;
     if (stick & 2) state.Gamepad.sThumbLX = 32767;
@@ -808,24 +804,18 @@ static void ApplyScriptStick(XboxPadState& state, uint8_t stick)
     if (stick & 8) state.Gamepad.sThumbLY = -32768;
 }
 
-void PublishPad(uint32_t index, bool connected, bool physical,
-                const XboxPadState& state, const XboxPadCapabilities& caps)
+void PublishPad(DWORD index, bool connected, bool physical,
+                const XINPUT_STATE& state, const XINPUT_CAPABILITIES& caps)
 {
     auto& pad = g_pads[index];
     std::lock_guard lk(pad.m);
     // One guest packet sequence spans keyboard and physical input. Raw host and
     // keyboard packet counters may coincide at a source change, hiding a button
     // release or press from consumers that skip unchanged packet numbers.
-    uint32_t packet = pad.state.dwPacketNumber;
+    DWORD packet = pad.state.dwPacketNumber;
     if (connected != pad.connected.load() || physical != pad.physical ||
         std::memcmp(&state.Gamepad, &pad.state.Gamepad, sizeof(state.Gamepad)) != 0)
-    {
         ++packet;
-        static const bool timing = [] { const char* e = std::getenv("TTT2_INPUT_TIMING"); return e && *e == '1'; }();
-        if (timing && (state.Gamepad.wButtons || pad.state.Gamepad.wButtons))
-            std::fprintf(stderr, "[input] snapshot user=%u connected=%u physical=%u buttons=%04X\n",
-                         unsigned(index), unsigned(connected), unsigned(physical), state.Gamepad.wButtons);
-    }
     pad.state = state;
     pad.state.dwPacketNumber = packet;
     pad.caps = caps;
@@ -839,8 +829,7 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
     // controller 0 even when a physical pad is present or the window is inactive.
     const bool startPulse = autoStart && elapsedMs > 45000 && (elapsedMs % 9000) < 300;
     // Scripted presses join the keyboard's (controller 0, foreground not required).
-    const host_input::Snapshot host = host_input::Read();
-    const KeyboardPad keyboard = ReadKeyboardPad(host);
+    const KeyboardPad keyboard = ReadKeyboardPad();
     uint8_t stick1 = 0, stick2 = 0;
     const uint16_t keyboardButtons = keyboard.buttons | (script ? ScriptButtons(*script, elapsedMs, 0, &stick1) : 0);
     {
@@ -854,47 +843,49 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
     const uint16_t player2Buttons = script ? ScriptButtons(*script, elapsedMs, 1, &stick2) : 0;
     if (script && script->active) autoStart = true;        // keep pad 0 connected for the script
     polling.keyboardEverPressed |= keyboardButtons != 0 || keyboard.leftTrigger || keyboard.rightTrigger;
-    XboxPadState sampled[4]{};
-    XboxPadCapabilities hostCaps[4]{};
-    for (uint32_t i = 0; i < 4; ++i)
+    XINPUT_STATE sampled[4]{};
+    XINPUT_CAPABILITIES hostCaps[4]{};
+    for (DWORD i = 0; i < 4; ++i)
     {
-        const auto& p = host.pads[i];
-        polling.physicalConnected[i] = p.connected;
-        if (!p.connected) continue;
-        auto& g = sampled[i].Gamepad;
-        g.wButtons = p.buttons;
-        g.bLeftTrigger = p.leftTrigger;
-        g.bRightTrigger = p.rightTrigger;
-        g.sThumbLX = p.leftX;
-        g.sThumbLY = p.leftY;
-        g.sThumbRX = p.rightX;
-        g.sThumbRY = p.rightY;
-        auto& caps = hostCaps[i];
-        caps.Type = XboxPadDeviceType;
-        caps.SubType = XboxPadDeviceSubtype;
-        caps.Gamepad.wButtons = 0xF3FF;
-        caps.Gamepad.bLeftTrigger = caps.Gamepad.bRightTrigger = 255;
-        caps.Gamepad.sThumbLX = caps.Gamepad.sThumbLY = 32767;
-        caps.Gamepad.sThumbRX = caps.Gamepad.sThumbRY = 32767;
+        // Sampling depends only on the physical device, never on a synthesized
+        // keyboard pad's published connection flag. Probe slot 0 on startup too.
+        if (polling.physicalConnected[i] || elapsedMs >= polling.retryAtMs[i])
+        {
+            if (XInputGetState(i, &sampled[i]) == ERROR_SUCCESS)
+            {
+                if (!polling.physicalConnected[i] || elapsedMs >= polling.capsAtMs[i])
+                {
+                    XInputGetCapabilities(i, 0, &polling.caps[i]);
+                    polling.capsAtMs[i] = elapsedMs + 1000;
+                }
+                hostCaps[i] = polling.caps[i];
+                polling.physicalConnected[i] = true;
+                polling.retryAtMs[i] = 0;
+                continue;
+            }
+            sampled[i] = {};
+            polling.physicalConnected[i] = false;
+            polling.retryAtMs[i] = elapsedMs + 2000; // retry physical discovery in 2 s
+        }
     }
 
     auto claimed = [&](int user) {
-        for (uint32_t j = 0; j < 4; ++j)
+        for (DWORD j = 0; j < 4; ++j)
             if (polling.guestOf[j] == user) return true;
         return false;
     };
-    for (uint32_t i = 0; i < 4; ++i)
+    for (DWORD i = 0; i < 4; ++i)
     {
-        const XboxPadData& g = sampled[i].Gamepad;
-        const bool used = g.wButtons || g.bLeftTrigger > XboxPadTriggerThreshold ||
-                          g.bRightTrigger > XboxPadTriggerThreshold;
+        const XINPUT_GAMEPAD& g = sampled[i].Gamepad;
+        const bool used = g.wButtons || g.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD ||
+                          g.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
         if (!polling.physicalConnected[i] || polling.guestOf[i] >= 0 || !used) continue;
         for (int user = 0; user < 4; ++user)
             if (!claimed(user)) { polling.guestOf[i] = user; break; }
     }
     // Users 1-3 sign in as guests on their controller's first use (player 2's scripted presses count).
     uint32_t used = (script && script->player2 && player2Buttons) ? 2u : 0u;
-    for (uint32_t i = 0; i < 4; ++i)
+    for (DWORD i = 0; i < 4; ++i)
         if (polling.guestOf[i] > 0) used |= 1u << polling.guestOf[i];
     if (const uint32_t added = used & ~g_usedUsers.fetch_or(used))
         for (uint32_t user = 1; user < 4; ++user)
@@ -904,19 +895,19 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
                 XamNotifyEnqueueEvent(0x0000000Au, 1u << user);   // XN_SYS_SIGNINCHANGED
             }
     int source[4]{ -1, -1, -1, -1 };   // guest user -> host pad
-    for (uint32_t i = 0; i < 4; ++i)
+    for (DWORD i = 0; i < 4; ++i)
         if (polling.guestOf[i] >= 0 && polling.physicalConnected[i]) source[polling.guestOf[i]] = int(i);
-    for (uint32_t i = 0; i < 4; ++i)
+    for (DWORD i = 0; i < 4; ++i)
     {
         if (polling.guestOf[i] >= 0 || !polling.physicalConnected[i]) continue;
         for (int user = 0; user < 4; ++user)
             if (source[user] < 0 && !claimed(user)) { source[user] = int(i); break; }
     }
 
-    for (uint32_t user = 0; user < 4; ++user)
+    for (DWORD user = 0; user < 4; ++user)
     {
-        XboxPadState state{};
-        XboxPadCapabilities caps{};
+        XINPUT_STATE state{};
+        XINPUT_CAPABILITIES caps{};
         const bool physical = source[user] >= 0;
         bool connected = physical;
         if (physical)
@@ -932,8 +923,8 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
             if (!physical)
             {
                 connected = true;
-                caps.Type = XboxPadDeviceType;
-                caps.SubType = XboxPadDeviceSubtype;
+                caps.Type = XINPUT_DEVTYPE_GAMEPAD;
+                caps.SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
             }
         }
         if (user == 0)
@@ -952,8 +943,8 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
             {
                 polling.keyboardEverPressed |= buttons != 0 || keyboard.leftTrigger || keyboard.rightTrigger;
                 connected = polling.keyboardEverPressed || autoStart;
-                caps.Type = XboxPadDeviceType;
-                caps.SubType = XboxPadDeviceSubtype;
+                caps.Type = XINPUT_DEVTYPE_GAMEPAD;
+                caps.SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
             }
         }
         PublishPad(user, connected, physical, state, caps);
@@ -1008,18 +999,13 @@ uint16_t HostControllerButtons()
     {
         if (!pad.connected.load()) continue;
         std::lock_guard lk(pad.m);
-        const XboxPadData& g = pad.state.Gamepad;
+        const XINPUT_GAMEPAD& g = pad.state.Gamepad;
         b |= g.wButtons;
         if (g.sThumbLY > 16000) b |= 0x0001;
         if (g.sThumbLY < -16000) b |= 0x0002;
         if (g.sThumbLX < -16000) b |= 0x0004;
         if (g.sThumbLX > 16000) b |= 0x0008;
     }
-    static const bool timing = [] { const char* e = std::getenv("TTT2_INPUT_TIMING"); return e && *e == '1'; }();
-    static uint16_t last = 0;
-    if (timing && b != last)
-        std::fprintf(stderr, "[input] system UI buttons %04X\n", b);
-    last = b;
     return b;
 }
 
@@ -1031,8 +1017,8 @@ bool HostTriggerHeld()
     {
         if (!pad.connected.load()) continue;
         std::lock_guard lk(pad.m);
-        const XboxPadData& g = pad.state.Gamepad;
-        if (g.bLeftTrigger > XboxPadTriggerThreshold || g.bRightTrigger > XboxPadTriggerThreshold) return true;
+        const XINPUT_GAMEPAD& g = pad.state.Gamepad;
+        if (g.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD || g.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) return true;
     }
     return false;
 }
@@ -1047,10 +1033,10 @@ void HostPulseDown() { g_downPulseUntilMs = NowMs() + 80; }
 PPC_FUNC(__imp__XamInputGetCapabilities)
 {
     KTrace("XamInputGetCapabilities");
-    // r3=userIndex, r4=flags, r5=XboxPadCapabilities* out
+    // r3=userIndex, r4=flags, r5=XINPUT_CAPABILITIES* out
     EnsurePadThread();
     uint32_t user = ctx.r3.u32, out = ctx.r5.u32;
-    XboxPadCapabilities caps;
+    XINPUT_CAPABILITIES caps;
     if (user > 3 || !out || !g_pads[user].connected.load())
     {
         ctx.r3.u32 = 0x48F;   // ERROR_DEVICE_NOT_CONNECTED
@@ -1078,10 +1064,10 @@ PPC_FUNC(__imp__XamInputGetCapabilities)
 PPC_FUNC(__imp__XamInputGetState)
 {
     KTrace("XamInputGetState");
-    // r3=userIndex, r4=flags, r5=XboxPadState* out
+    // r3=userIndex, r4=flags, r5=XINPUT_STATE* out
     EnsurePadThread();
     uint32_t user = ctx.r3.u32, out = ctx.r5.u32;
-    XboxPadState st;
+    XINPUT_STATE st;
     if (user > 3 || !out || !g_pads[user].connected.load())
     {
         ctx.r3.u32 = 0x48F;
@@ -1092,7 +1078,7 @@ PPC_FUNC(__imp__XamInputGetState)
         st = g_pads[user].state;
     }
     if (SysUiOwnsInput())
-        st.Gamepad = XboxPadData{};          // a system screen has the controller
+        st.Gamepad = XINPUT_GAMEPAD{};          // a system screen has the controller
     else if (SysUiTitleWantsProfile())
         st.Gamepad.wButtons &= ~uint16_t(0x0010 | 0x1000);   // START / A open Select Profile instead
     else if (const uint16_t mask = SysUiGameButtonMask(); user == 0 && mask != 0xFFFF)

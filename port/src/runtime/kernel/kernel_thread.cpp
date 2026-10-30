@@ -1,9 +1,6 @@
 // Guest threads: ExCreateThread spawns a real host thread that sets up its own PCR/TLS/TEB/stack
 // and runs the guest start routine. Layout ported from Unleashed's GuestThreadContext.
 #include "kernel_shared.h"
-#include "../host_fault.h"
-#include "../host_thread.h"
-#include "../host_sleep.h"
 #include "kernel_trace.h"
 #include "guest_heap.h"
 #include "kernel_objects.h"
@@ -18,11 +15,10 @@
 #include <deque>
 #include <mutex>
 #include <vector>
+#include <process.h>
 #include <cstddef>
-#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#endif
 
 uint8_t* g_base = nullptr;
 
@@ -37,7 +33,7 @@ void KernelRegisterGuestThread(uint32_t entry, uint32_t ctxArg)
 {
     {
         std::lock_guard lk(g_gtMutex);
-        g_guestThreads.push_back({ host_thread::CurrentId(), entry, ctxArg });
+        g_guestThreads.push_back({ GetCurrentThreadId(), entry, ctxArg });
     }
     char name[32];
     std::snprintf(name, sizeof(name), "guest %08X", entry);
@@ -58,16 +54,13 @@ void KernelDumpGuestThreads()
 // field offsets so the reader does not depend on this build's register-config macros.
 struct GuestContextSlot { uint32_t tid; uint32_t entry; PPCContext* ctx; };
 static constexpr uint32_t GuestContextCapacity = 512;
-struct GuestContextRegistry
+extern "C" struct GuestContextRegistry
 {
     uint32_t magic, version, r1Offset, lrOffset, capacity;
     std::atomic<uint32_t> count;
     GuestContextSlot slots[GuestContextCapacity];
-};
-extern "C" {
-GuestContextRegistry g_guestContextRegistry = { 0x47435458u /* 'XTCG' */, 1, offsetof(PPCContext, r1),
+} g_guestContextRegistry = { 0x47435458u /* 'XTCG' */, 1, offsetof(PPCContext, r1),
                              offsetof(PPCContext, lr), GuestContextCapacity, {0}, {} };
-}
 
 namespace {
 thread_local GuestContextSlot* t_contextSlot = nullptr;
@@ -79,7 +72,7 @@ PPCContext* PublishGuestContext(PPCContext* ctx, uint32_t entry)
         const uint32_t index = g_guestContextRegistry.count.fetch_add(1);
         if (index >= GuestContextCapacity) return nullptr;
         t_contextSlot = &g_guestContextRegistry.slots[index];
-        t_contextSlot->tid = host_thread::CurrentId();
+        t_contextSlot->tid = GetCurrentThreadId();
     }
     PPCContext* previous = t_contextSlot->ctx;
     t_contextSlot->entry = entry;
@@ -162,7 +155,7 @@ void EnsureThreadBlock()
 void GuestSetCurrentCpu(uint8_t cpu)
 {
     EnsureThreadBlock();
-    GWrite8(g_base, t_pcr + 0x10C, cpu);
+    g_base[t_pcr + 0x10C] = cpu;
 }
 
 static void GuestInvoke(PPCFunc* fn, PPCContext& ctx);
@@ -191,16 +184,15 @@ void GuestCall2(uint32_t guestAddr, uint32_t arg0, uint32_t arg1)
     GuestRun2(guestAddr, arg0, arg1);
 }
 
-// Host-guarded invoke: a fault in a guest callback must be REPORTED, not silently kill
+// SEH-guarded invoke: a fault in a guest callback must be REPORTED, not silently kill
 // the process (unhandled exceptions in secondary threads terminate with no output).
 static void GuestInvoke(PPCFunc* fn, PPCContext& ctx)
 {
-    struct Call { PPCFunc* fn; PPCContext* ctx; } call{fn, &ctx};
-    if (!host_fault::Run([](void* arg) {
-            auto* c = static_cast<Call*>(arg);
-            c->fn(*c->ctx, g_base);
-        }, &call))
+    __try { fn(ctx, g_base); }
+    __except (GuestFaultReport(GetExceptionInformation()))
+    {
         std::fprintf(stderr, "[runtime] guest callback faulted (thread continues)\n");
+    }
 }
 
 void GuestCall4(uint32_t guestAddr, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
@@ -230,7 +222,7 @@ struct DpcItem { uint32_t routine, dpc, context, arg1, arg2; };
 std::mutex g_dpcMutex;
 std::condition_variable g_dpcCv;
 std::deque<DpcItem> g_dpcQueue;
-bool g_dpcThreadStarted = false; // guarded by g_dpcMutex
+std::atomic<bool> g_dpcThreadStarted{false};
 
 void DpcThread()
 {
@@ -247,28 +239,6 @@ void DpcThread()
         GpuProgress();          // the swap DPC writes the scratch tokens the GPU waits on
     }
 }
-
-bool QueueDpc(DpcItem item)
-{
-    {
-        std::lock_guard lk(g_dpcMutex);
-        if (!g_dpcThreadStarted)
-        {
-            // Create under the queue lock so another caller cannot enqueue to
-            // a dispatcher whose host thread failed to start.
-            if (!host_thread::StartDetached(8 * 1024 * 1024,
-                    [](void*) -> unsigned { DpcThread(); return 0; }, nullptr))
-            {
-                std::fputs("[dpc] cannot start dispatcher thread\n", stderr);
-                return false;
-            }
-            g_dpcThreadStarted = true;
-        }
-        g_dpcQueue.push_back(item);
-    }
-    g_dpcCv.notify_one();
-    return true;
-}
 } // namespace
 
 // Queue an arbitrary guest call to the DPC dispatcher thread (used for I/O APCs: they
@@ -276,7 +246,17 @@ bool QueueDpc(DpcItem item)
 void KernelQueueGuestCall(uint32_t fn, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3)
 {
     if (!fn) return;
-    QueueDpc({fn, a0, a1, a2, a3});
+    if (!g_dpcThreadStarted.exchange(true))
+    {
+        uintptr_t h = _beginthreadex(nullptr, 8 * 1024 * 1024,
+            [](void*) -> unsigned { DpcThread(); return 0; }, nullptr, 0, nullptr);
+        if (h) CloseHandle(reinterpret_cast<HANDLE>(h));
+    }
+    {
+        std::lock_guard lk(g_dpcMutex);
+        g_dpcQueue.push_back({fn, a0, a1, a2, a3});
+    }
+    g_dpcCv.notify_one();
 }
 
 // KeInitializeDpc(r3=KDPC, r4=DeferredRoutine, r5=DeferredContext)
@@ -294,8 +274,21 @@ PPC_FUNC(__imp__KeInsertQueueDpc)
     uint32_t routine = GRead32(base, ctx.r3.u32 + 16);
     uint32_t context = GRead32(base, ctx.r3.u32 + 20);
     if (routine)
-        ctx.r3.u32 = QueueDpc({routine, ctx.r3.u32, context, ctx.r4.u32, ctx.r5.u32}) ? 1 : 0;
-    else ctx.r3.u32 = 1; // preserve the existing result for an empty DPC
+    {
+        if (!g_dpcThreadStarted.exchange(true))
+        {
+            // 8 MB stack: DPC routines run deep guest chains.
+            uintptr_t h = _beginthreadex(nullptr, 8 * 1024 * 1024,
+                [](void*) -> unsigned { DpcThread(); return 0; }, nullptr, 0, nullptr);
+            if (h) CloseHandle(reinterpret_cast<HANDLE>(h));
+        }
+        {
+            std::lock_guard lk(g_dpcMutex);
+            g_dpcQueue.push_back({routine, ctx.r3.u32, context, ctx.r4.u32, ctx.r5.u32});
+        }
+        g_dpcCv.notify_one();
+    }
+    ctx.r3.u32 = 1;                                // was not already queued
 }
 
 PPC_FUNC(__imp__KeRemoveQueueDpc)
@@ -378,15 +371,30 @@ PPC_FUNC(__imp__NtYieldExecution)         { std::this_thread::yield(); }
 // (sub_824F5458: ten polls, then Sleep(1) per poll while idle) and the main thread waits on
 // those jobs several times a frame (sub_824F58B8), so the wake-up latency lands in the frame
 // time. std::this_thread::sleep_for(1 ms) lasts 1-2 ms on Windows even at timeBeginPeriod(1);
-// a high-resolution host wait keeps the requested length, including sub-millisecond
-// ones. TTT2_SLEEP_HIRES=0 restores sleep_for.
+// a high-resolution waitable timer (Windows 10 1803+) keeps the requested length, including
+// sub-millisecond ones. TTT2_SLEEP_HIRES=0 restores sleep_for.
 static void GuestDelay(int64_t ticks)
 {
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
     static const bool hires = [] { const char* e = std::getenv("TTT2_SLEEP_HIRES"); return !e || std::strcmp(e, "0") != 0; }();
     // TTT2_SLEEP_SCALE=<percent> shortens delays of 2 ms or less (poll-loop sleeps; experiment).
     static const int64_t scale = [] { const char* e = std::getenv("TTT2_SLEEP_SCALE"); return e ? (std::max<int64_t>)(1, std::atoll(e)) : 100; }();
     if (scale != 100 && ticks <= 20000) ticks = (std::max<int64_t>)(1, ticks * scale / 100);
-    host_sleep::For100ns(ticks, hires);
+    if (hires)
+    {
+        static thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                                   TIMER_ALL_ACCESS);
+        LARGE_INTEGER due;
+        due.QuadPart = -ticks;
+        if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+        {
+            WaitForSingleObject(timer, INFINITE);
+            return;
+        }
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds((ticks + 9) / 10));
 }
 
 // (WaitMode, Alertable, Interval*) - Interval is 100ns units, negative = relative delay.
@@ -398,8 +406,8 @@ PPC_FUNC(__imp__KeDelayExecutionThread)
     if (uint32_t p = ctx.r5.u32)
     {
         int64_t t = (int64_t)(((uint64_t)GRead32(g_base, p) << 32) | GRead32(g_base, p + 4));
-        const uint64_t relative = t < 0 ? uint64_t(0) - uint64_t(t) : 0;
-        ticks = int64_t((std::min<uint64_t>)(relative, 500000)); // 50 ms cap
+        ticks = t < 0 ? -t : 0;
+        if (ticks > 500000) ticks = 500000;       // 50 ms: keep watchdog-style long sleeps responsive
     }
     if (ticks <= 0) std::this_thread::yield();
     else GuestDelay(ticks);

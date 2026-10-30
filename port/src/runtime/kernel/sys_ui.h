@@ -60,13 +60,13 @@ bool SysUiTitleWantsProfile();
 // True while the name dialog takes typed text (letter keys are not mapped to buttons).
 bool SysUiTextEntryActive();
 
-// A character typed on the PC keyboard (SDL window event thread).
+// A character typed on the PC keyboard (window thread, WM_CHAR).
 void SysUiOnChar(uint32_t ch);
 
 // True while Controller Setup -> KEYBOARD waits for a key (keyboard_keys.h): keys are not mapped
 // to buttons, and the window passes each pressed key on.
 bool SysUiKeyCaptureActive();
-// A key pressed on the PC keyboard (SDL window event thread; left / right
+// A key pressed on the PC keyboard (window thread, WM_KEYDOWN / WM_SYSKEYDOWN; left / right
 // SHIFT, CTRL and ALT told apart).
 void SysUiOnKey(int vk);
 // The buttons player 1's game input keeps (0xFFFF = all): Controller Setup's KEYBOARD mode leaves

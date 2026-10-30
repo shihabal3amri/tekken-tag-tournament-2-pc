@@ -28,6 +28,10 @@ bool WTrace();
 // Before the process ends abruptly (TerminateProcess, crash report), wait for what is queued.
 void LogDrain(unsigned timeoutMs = 300);
 
+// Report a guest fault (main.cpp). Returns EXCEPTION_EXECUTE_HANDLER.
+struct _EXCEPTION_POINTERS;
+int GuestFaultReport(_EXCEPTION_POINTERS* ep);
+
 // Call a guest function by address on the current thread's context (used to launch guest threads).
 // The guest thread block is cached per host thread; GuestCall2 passes two arguments (r3, r4).
 void GuestCall(uint32_t guestAddr, uint32_t arg);

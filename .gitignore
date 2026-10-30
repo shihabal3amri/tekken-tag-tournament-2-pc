@@ -27,10 +27,6 @@
 !/port/third_party/
 
 /tools/*
-!/tools/step8_paths.sh
-!/tools/build_dxvk11_linux.sh
-!/tools/build_android_dxvk_native.sh
-!/tools/run_dxvk11_linux.sh
 !/tools/*.cmd
 !/tools/patches/
 !/tools/x_decompress/
@@ -117,28 +113,9 @@ Thumbs.db
 # README screenshots (.github/assets/screens/*.jpg): captures of the port running, added at the
 # owner's request (2026-10-14) - the only game imagery allowed in the repository.
 
-# Reproducible shared Linux/Android dependency provenance.
-!/tools/prepare_dxvk_native.py
-!/tools/write_shared_build_manifest.py
-!/port/android/
-/port/android/*
-!/port/android/include/
-!/port/android/game/
-/port/android/game/*
-!/port/android/game/CMakeLists.txt
-!/port/native/
-/port/native/*
-!/port/native/include/
-
-# Android first-run ISO/TU3 importer (source only).
-!/port/android/setup/
-
 # --- ttt2-server: local data, configuration and builds (keys, bans, logs never belong in git) ---
 server/data/
 server/server.toml
 server/dist/
 server/*.exe
 server/ttt2-server
-
-# Shared build helpers.
-!/port/cmake/

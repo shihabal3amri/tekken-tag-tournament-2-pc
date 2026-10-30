@@ -12,7 +12,6 @@
 #include "profiles.h"
 #include "xlive.h"
 #include <cstring>
-#include <cstdlib>
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
@@ -173,7 +172,6 @@ PPC_FUNC(__imp__XamContentCreateEx)
         if(const int32_t frame=RollbackSaveJournalFrame(); frame>=0) SaveJournalCapture(record,frame);
         result=SaveCreateContent(root,record,ctx.r6.u32&15,disposition);
     }
-    if (std::getenv("TTT2_IO_TRACE"))
     {
         // Record: device id @4, content type @8, display name (UTF-16BE) @12, file name @264.
         char file[43]={};std::memcpy(file,record.data()+264,42);

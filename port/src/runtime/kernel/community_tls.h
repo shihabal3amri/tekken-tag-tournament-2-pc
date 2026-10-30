@@ -3,8 +3,6 @@
 // caller pins the SHA-256 of the server key (SubjectPublicKeyInfo), trust on first use
 // (port/COMMUNITY_SERVER_PLAN.md 7b S1). TLS 1.2 minimum.
 #pragma once
-#include "community_platform.h"
-#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -17,10 +15,6 @@
 #endif
 #include <subauth.h>
 #include <schannel.h>
-#endif
-#ifndef _WIN32
-#include <openssl/ssl.h>
-#endif
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -63,15 +57,10 @@ private:
     int64_t deadlineUs_ = 0;
 
     SOCKET socket_ = INVALID_SOCKET;
-#ifdef _WIN32
     CredHandle cred_{};
     CtxtHandle ctx_{};
     bool haveCred_ = false, haveCtx_ = false;
     SecPkgContext_StreamSizes sizes_{};
-#else
-    SSL_CTX* sslContext_ = nullptr;
-    SSL* ssl_ = nullptr;
-#endif
     std::mutex ctxMutex_;                 // SChannel calls on the context
     std::mutex sendMutex_;                // encrypt + send in order
     std::vector<uint8_t> in_;             // encrypted bytes not yet decrypted

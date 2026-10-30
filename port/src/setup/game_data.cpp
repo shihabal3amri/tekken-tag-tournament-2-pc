@@ -3,10 +3,10 @@
 // instead of loading whole archives (the largest expands to 850 MB).
 #include "setup/game_data.h"
 
-#include <TinySHA1.hpp>
+#include <windows.h>
+#include <bcrypt.h>
 #include <algorithm>
 #include <cstdio>
-#include <memory>
 #include <cstring>
 
 #include "xex_patcher.h"
@@ -111,11 +111,9 @@ constexpr uint32_t kChunkAlign = 0x20000;
 std::string Sha1Hex(const void* data, size_t size)
 {
     uint8_t digest[20] = {};
-    sha1::SHA1 hash;
-    hash.processBytes(data, size);
-    hash.finalize(digest);
+    BCryptHash(BCRYPT_SHA1_ALG_HANDLE, nullptr, 0, (PUCHAR)data, (ULONG)size, digest, sizeof digest);
     char hex[41];
-    for (int i = 0; i < 20; ++i) snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    for (int i = 0; i < 20; ++i) sprintf_s(hex + i * 2, 3, "%02x", digest[i]);
     return std::string(hex, 40);
 }
 
@@ -125,10 +123,10 @@ std::string XexpTargetVersion(const std::vector<uint8_t>& d)
     const uint32_t count = Be32(d.data() + 0x14);
     for (uint32_t i = 0; i < count && 0x18 + i * 8 + 8 <= d.size(); ++i) {
         const uint32_t key = Be32(d.data() + 0x18 + i * 8), value = Be32(d.data() + 0x1C + i * 8);
-        if (key == 0x000005FF && uint64_t(value) + 12 <= d.size()) {      // DELTA_PATCH_DESCRIPTOR
+        if (key == 0x000005FF && value + 12 <= d.size()) {      // DELTA_PATCH_DESCRIPTOR
             const uint32_t v = Be32(d.data() + value + 4);
             char s[32];
-            snprintf(s, sizeof s, "%u.%u.%u.%u", (v >> 28) & 0xF, (v >> 24) & 0xF, (v >> 8) & 0xFFFF, v & 0xFF);
+            sprintf_s(s, "%u.%u.%u.%u", (v >> 28) & 0xF, (v >> 24) & 0xF, (v >> 8) & 0xFFFF, v & 0xFF);
             return s;
         }
     }
@@ -148,7 +146,7 @@ bool BuildGameImage(const std::vector<uint8_t>& baseXex, const std::vector<uint8
     // size in the security info at [+0x10] + 4).
     if (patched.size() < 0x18) { err = "The patched game is invalid."; return false; }
     const uint32_t headerSize = Be32(patched.data() + 0x08), securityOffset = Be32(patched.data() + 0x10);
-    if (uint64_t(securityOffset) + 8 > patched.size()) { err = "The patched game is invalid."; return false; }
+    if (securityOffset + 8 > patched.size()) { err = "The patched game is invalid."; return false; }
     const uint32_t imageSize = Be32(patched.data() + securityOffset + 4);
     if (uint64_t(headerSize) + imageSize > patched.size()) { err = "The patched game is truncated."; return false; }
     image.assign(patched.begin() + headerSize, patched.begin() + headerSize + imageSize);
@@ -184,7 +182,7 @@ bool IsLzxContainer(const uint8_t* p)
 }
 
 bool ExpandContainer(const SourceReader& read, uint64_t sourceSize, uint64_t expected,
-                     const std::filesystem::path& outPath, const ByteProgress& progress, std::string& err)
+                     const std::wstring& outPath, const ByteProgress& progress, std::string& err)
 {
     // Header: magic, version, hash, flags (bit 22: u32 sizes, else packed 20-bit sizes), then
     // one UNCOMPRESSED size per 0x20000-aligned chunk of the container.
@@ -209,19 +207,11 @@ bool ExpandContainer(const SourceReader& read, uint64_t sourceSize, uint64_t exp
         }
     }
     uint64_t sum = 0;
-    for (uint32_t v : table) {
-        if (v > (16u << 20)) { err = "an archive chunk is too large"; return false; }
-        sum += v;
-    }
+    for (uint32_t v : table) sum += v;
     if (sum != expected) { err = "an archive does not have the expected size"; return false; }
 
-    #ifdef _WIN32
-    FILE* out = _wfopen(outPath.c_str(), L"wb");
-#else
-    FILE* out = fopen(outPath.c_str(), "wb");
-#endif
-    if (!out) { err = "the install folder is not writable"; return false; }
-    std::unique_ptr<FILE, decltype(&fclose)> guard(out, fclose);
+    HANDLE out = CreateFileW(outPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (out == INVALID_HANDLE_VALUE) { err = "the install folder is not writable"; return false; }
     std::vector<uint8_t> in(kChunkAlign), chunk;
     uint64_t written = 0;
     bool ok = true;
@@ -241,17 +231,16 @@ bool ExpandContainer(const SourceReader& read, uint64_t sourceSize, uint64_t exp
         if (k == 0 && (chunk.size() < 12 || memcmp(chunk.data() + 4, "ftypnrfi", 8) != 0)) {
             err = "an archive decompressed to unexpected data"; ok = false; break;
         }
-        const size_t put = fwrite(chunk.data(), 1, chunk.size(), out);
-        if (put != chunk.size()) {
+        DWORD put = 0;
+        if (!WriteFile(out, chunk.data(), (DWORD)chunk.size(), &put, nullptr) || put != chunk.size()) {
             err = "the disk is full or the install folder is not writable"; ok = false; break;
         }
         written += put;
         if (progress && !progress(written)) { err = "Installation cancelled."; ok = false; break; }
     }
-    if (fclose(guard.release()) != 0) { err = "Could not finish writing the archive."; ok = false; }
+    CloseHandle(out);
     if (!ok || written != expected) {
-        std::error_code ignored;
-        std::filesystem::remove(outPath, ignored);
+        DeleteFileW(outPath.c_str());
         if (ok) err = "an archive came out the wrong size";
         return false;
     }

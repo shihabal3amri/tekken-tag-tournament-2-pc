@@ -3,14 +3,13 @@
 #include "kernel_trace.h"
 #include "guest_time.h"
 #include "guest_heap.h"
-#include "../host_clock.h"
-#include "../host_sleep.h"
-#include "../host_status.h"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <thread>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 // --- Xex module queries. The recompiler already resolved the game's own calls, so these serve
 //     optional runtime probing; a fake module handle + "not found" for arbitrary procs is safe. ---
@@ -57,7 +56,14 @@ PPC_FUNC(__imp__XexUnloadImage)
 PPC_FUNC(__imp__RtlNtStatusToDosError)
 {
     KTrace("RtlNtStatusToDosError");
-    ctx.r3.u32 = host_status::NtStatusToDosError(ctx.r3.u32);
+    // The file source distinguishes ERROR_HANDLE_EOF (38) from other failures.
+    // NTSTATUS low bits are not Win32 error numbers: STATUS_END_OF_FILE's are 17.
+    // Use Windows' documented mapping, including ERROR_MR_MID_NOT_FOUND for an
+    // unknown status, rather than inventing a successful or unrelated error code.
+    using StatusToDosError = ULONG (NTAPI*)(LONG);
+    static const StatusToDosError convert = reinterpret_cast<StatusToDosError>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlNtStatusToDosError"));
+    ctx.r3.u32 = convert ? convert(static_cast<LONG>(ctx.r3.u32)) : ERROR_MR_MID_NOT_FOUND;
 }
 
 // --- memory statistics: fill the guest MM_STATISTICS struct with plausible values ---
@@ -99,14 +105,16 @@ void KernelInstallTimeStampBundle(uint8_t* base)
         {
             const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - boot).count());
-            const uint64_t system = host_clock::SystemTime100ns();
+            FILETIME ft;
+            GetSystemTimeAsFileTime(&ft);
+            const uint64_t system = (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
             const uint64_t interrupt = ns / 100;
             GWrite32(base, guest + 0, uint32_t(interrupt >> 32));
             GWrite32(base, guest + 4, uint32_t(interrupt));
             GWrite32(base, guest + 8, uint32_t(system >> 32));
             GWrite32(base, guest + 12, uint32_t(system));
             GWrite32(base, guest + 16, uint32_t(ns / 1000000));
-            host_sleep::For100ns(10000, false);
+            Sleep(1);
         }
     }).detach();
     std::fprintf(stderr, "[kernel] KeTimeStampBundle -> %08X (import slot 0x82000720)\n", guest);
@@ -116,7 +124,8 @@ PPC_FUNC(__imp__KeQuerySystemTime)
 {
     KTrace("KeQuerySystemTime");
     // Xbox system time = 100 ns intervals since 1601 (same epoch as FILETIME).
-    uint64_t t = host_clock::SystemTime100ns();
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    uint64_t t = (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
     uint32_t p = ctx.r3.u32;
     if (p) { GWrite32(base, p + 0, uint32_t(t >> 32)); GWrite32(base, p + 4, uint32_t(t)); }  // BE 64-bit
 }

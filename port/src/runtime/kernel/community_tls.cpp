@@ -1,4 +1,3 @@
-#ifdef _WIN32
 // SChannel TLS client (community_tls.h).
 #include "community_tls.h"
 #include <ws2tcpip.h>
@@ -360,7 +359,3 @@ void TlsStream::Close()
 }
 
 } // namespace community
-
-#else
-#include "community_tls_posix.inc"
-#endif

@@ -6,12 +6,7 @@
 #include "gpu_shader_subset.h"
 #include <d3d11.h>
 #include <d3dcompiler.h>
-#include "../host_vm.h"
-#if defined(__linux__)
-#include "dxvk_native_com_ptr.h"
-#else
 #include <wrl/client.h>
-#endif
 #include <array>
 #include <chrono>
 #include <limits>
@@ -137,7 +132,8 @@ struct Backend {
                 Check(device->CreateTexture2D(&desc,nullptr,&texture),"CreatePlane");Check(device->CreateShaderResourceView(texture.Get(),nullptr,&view),"CreatePlaneView");plane.texture=texture;plane.view=view;
             }
             plane.info=t;plane.snapshot.resize(size_t(t.pitch)*(t.height-1)+t.width);
-            if(!host_vm::ReadMemory(g_base+t.base,plane.snapshot.data(),plane.snapshot.size()))throw std::runtime_error("Movie plane is unreadable");
+            SIZE_T bytes=0;
+            if(!ReadProcessMemory(GetCurrentProcess(),g_base+t.base,plane.snapshot.data(),plane.snapshot.size(),&bytes) || bytes!=plane.snapshot.size())throw std::runtime_error("Movie plane is unreadable");
         }
     }
     bool Draw(const uint32_t* regs,const Prepared& p,const std::string& hlsl,Surface& surface) {

@@ -4,8 +4,8 @@
 // 5 s. Matches do not touch the server (they run over Steam P2P); UDP is used only for the server list's INFO.
 #include "community_net.h"
 #include "community_tls.h"
-
-#include "community_platform.h"
+#include <ws2tcpip.h>
+#include <windows.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -19,7 +19,7 @@
 #include <set>
 #include <sstream>
 #include <thread>
-
+#include <bcrypt.h>
 
 namespace community {
 namespace {
@@ -511,10 +511,8 @@ bool Client::Connect(const Options& opts, Welcome& welcome, std::string& error)
     if (m.used) { error = "a client connects once"; return false; }
     m.used = true;
     m.opts = opts;
-#ifdef _WIN32
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
-#endif
     const std::string server = opts.host + ":" + std::to_string(opts.port);
     const int64_t deadline = NowUs() + int64_t(opts.timeoutMs) * 1000;   // one deadline for everything below
 
@@ -542,7 +540,7 @@ bool Client::Connect(const Options& opts, Welcome& welcome, std::string& error)
             return false;
         }
         uint32_t jitter = 0;
-        CommunityRandom(&jitter, sizeof(jitter));
+        BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&jitter), sizeof(jitter), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
         const int64_t wait = 250'000 + int64_t(jitter % 500'000);
         if (attempt >= 3 || error.find("during the TLS handshake") == std::string::npos || NowUs() + wait >= deadline) return false;
         std::this_thread::sleep_for(std::chrono::microseconds(wait));

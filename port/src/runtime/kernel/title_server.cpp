@@ -26,6 +26,8 @@
 // player's last upload (server/PROTOCOL.md "Player files"), else from that player's game while it
 // is connected to this one (xsocket.cpp) - never this player's own file (MEASURED 2026-10-23, the
 // user: the opponent's license showed "mine instead of the opponent", under their name).
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include "gin_service.h"
 #include "kernel_shared.h"
 #include "kernel_content.h"
@@ -136,15 +138,15 @@ std::vector<uint8_t> ReadFileBytes(const std::filesystem::path& file)
 // a room's license screen asks for the same players again and again. 1 found, 0 not found.
 int RemoteUserItem(uint64_t owner, const std::string& item, std::vector<uint8_t>& data)
 {
-    struct Known { int found; std::vector<uint8_t> data; uint64_t at; };
+    struct Known { int found; std::vector<uint8_t> data; ULONGLONG at; };
     static std::mutex m;
     static std::map<std::pair<uint64_t, std::string>, Known> known;
-    constexpr uint64_t kKeepMs = 20 * 1000, kKeepNoneMs = 5 * 1000;
+    constexpr ULONGLONG kKeepMs = 20 * 1000, kKeepNoneMs = 5 * 1000;
     const auto key = std::make_pair(owner, item);
     {
         std::lock_guard l(m);
         const auto it = known.find(key);
-        if (it != known.end() && uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()) - it->second.at < (it->second.found ? kKeepMs : kKeepNoneMs))
+        if (it != known.end() && GetTickCount64() - it->second.at < (it->second.found ? kKeepMs : kKeepNoneMs))
         {
             data = it->second.data;
             return it->second.found;
@@ -167,7 +169,7 @@ int RemoteUserItem(uint64_t owner, const std::string& item, std::vector<uint8_t>
                  found ? from : "nobody has it", data.size());
     std::lock_guard l(m);
     if (known.size() > 256) known.clear();
-    known[key] = { found, data, uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()) };
+    known[key] = { found, data, GetTickCount64() };
     return found;
 }
 

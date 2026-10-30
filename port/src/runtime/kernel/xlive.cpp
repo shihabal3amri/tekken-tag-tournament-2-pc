@@ -8,8 +8,9 @@
 //    friends / invites), XamApp (0xFE: deployment type 2 = no Online Pass needed).
 //  - Enumerators (XamCreateEnumeratorHandle): title servers, friends, marketplace - all empty.
 // TTT2_XLIVE_TRACE=1 logs every call (otherwise each kind once).
-#include "../host_random.h"
-#include "../guest_memory.h"
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <bcrypt.h>
 #include "kernel_shared.h"
 #include "kernel_trace.h"
 #include "kernel_content.h"
@@ -24,10 +25,8 @@
 #include "community_net.h"
 #include "matchmaking.h"
 #include <algorithm>
-#include <chrono>
 #include <thread>
 #include <atomic>
-#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -116,7 +115,7 @@ bool Enabled() { return TitleServerEnabled(); }
 
 void Random(void* out, size_t bytes)
 {
-    host_random::Fill(out, bytes);
+    BCryptGenRandom(nullptr, static_cast<PUCHAR>(out), ULONG(bytes), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 }
 
 uint64_t LocalPeerId()
@@ -230,11 +229,7 @@ PPC_FUNC(__imp__NetDll_XNetRandom)
 {
     KTrace("NetDll_XNetRandom");
     const uint32_t buffer = ctx.r4.u32, length = ctx.r5.u32;
-    if (buffer && length && XamGuestRange(buffer, length, 1))
-    {
-        const size_t ignored = guest_memory::GuardedPrefix(base, base + buffer, length);
-        if (ignored < length) xlive::Random(base + buffer + ignored, length - ignored);
-    }
+    if (buffer && length && XamGuestRange(buffer, length, 1)) xlive::Random(base + buffer, length);
     ctx.r3.u64 = 0;
 }
 
@@ -457,9 +452,9 @@ void FindUsers(uint8_t* base, uint32_t task, uint32_t results, uint32_t size)
 
     // names stay known a while (a TEKKEN CHANNEL page asks for the same players again and again)
     static std::mutex m;
-    static std::map<uint64_t, std::pair<std::string, uint64_t>> known;   // XUID -> name ("" = none), when asked
-    constexpr uint64_t kKeepMs = 10 * 60 * 1000, kKeepNoneMs = 60 * 1000;
-    const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    static std::map<uint64_t, std::pair<std::string, ULONGLONG>> known;   // XUID -> name ("" = none), when asked
+    constexpr ULONGLONG kKeepMs = 10 * 60 * 1000, kKeepNoneMs = 60 * 1000;
+    const ULONGLONG now = GetTickCount64();
     std::vector<uint64_t> ask;
     {
         std::lock_guard l(m);

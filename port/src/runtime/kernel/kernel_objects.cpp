@@ -7,8 +7,6 @@
 #include "xlive.h"
 #include "kernel_content.h"
 #include "timeline.h"
-#include "../host_thread.h"
-#include "../host_clock.h"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +18,14 @@
 #include <mutex>
 #include <condition_variable>
 #include <thread>
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <process.h>
+#undef STATUS_TIMEOUT   // winnt.h macro collides with our constant below
+#undef STATUS_INVALID_PARAMETER
+#undef STATUS_INVALID_HANDLE
+#undef MAXIMUM_WAIT_OBJECTS
 #include <chrono>
 #include <array>
 
@@ -128,7 +134,8 @@ int64_t GuestTimeout(uint8_t* base, uint32_t timeoutPtr)
     // Xbox timeouts are 100 ns units. Negative = relative delay; positive = absolute
     // deadline on the KeQuerySystemTime clock (FILETIME epoch) - compute the delta.
     if (t < 0) return (-t) / 10000 + ((-t) % 10000 != 0);
-    const int64_t now = static_cast<int64_t>(host_clock::SystemTime100ns());
+    FILETIME ft; GetSystemTimeAsFileTime(&ft);
+    int64_t now = (int64_t)(((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
     return t > now ? (t - now) / 10000 + ((t - now) % 10000 != 0) : 0;
 }
 
@@ -238,16 +245,7 @@ struct KSemaphore : KObject
     bool CanWaitMultiple() const override { return true; }
     bool IsSignaled(uint64_t) const override { return count > 0; }
     void ConsumeSignal() override { --count; }
-    void Release(int n)
-    {
-        std::lock_guard lk(m);
-        count += n;
-        // One permit can satisfy only one single-object waiter. Multi-object
-        // waits have separate registrations and are still notified below.
-        if (n == 1) cv.notify_one();
-        else cv.notify_all();
-        DispatcherChanged();
-    }
+    void Release(int n) { std::lock_guard lk(m); count += n; cv.notify_all(); DispatcherChanged(); }
     void Signal() override { Release(1); }
 };
 
@@ -285,11 +283,11 @@ struct KThread : KObject
     bool waitingForResume = false;
     std::mutex sm; std::condition_variable scv;
     std::mutex schedulingMutex;
-    host_thread::Handle* hostThread = nullptr;
+    HANDLE hostThread = nullptr;
     uint32_t guestAffinity = 1; // Initial KPCR CPU is zero, independently of host CPU numbering.
     int32_t guestPriority = 0;
     volatile uint8_t* guestCpuByte = nullptr;
-    ~KThread() override { host_thread::Close(hostThread); }
+    ~KThread() override { if (hostThread) CloseHandle(hostThread); }
     uint32_t Wait(int64_t t) override
     {
         std::unique_lock lk(m);
@@ -308,7 +306,7 @@ struct KThread : KObject
         // silently and kills the process with no fault output).
         struct Ctx { KThread* self; std::function<void()> fn; };
         auto* c = new Ctx{ this, std::move(fn) };
-        auto* h = host_thread::StartManaged(8 * 1024 * 1024,
+        uintptr_t h = _beginthreadex(nullptr, 8 * 1024 * 1024,
             [](void* p) -> unsigned {
                 std::unique_ptr<Ctx> c(static_cast<Ctx*>(p));
                 KThread* self = c->self;
@@ -322,19 +320,19 @@ struct KThread : KObject
                 {
                     std::lock_guard lk(self->schedulingMutex);
                     self->guestCpuByte = nullptr;
-                    host_thread::Close(self->hostThread);
+                    CloseHandle(self->hostThread);
                     self->hostThread = nullptr;
                 }
                 t_currentKernelThread = nullptr;
                 { std::lock_guard lk(self->m); self->done = true; self->DispatcherChanged(); }
                 self->cv.notify_all();
                 return 0;
-            }, c);
+            }, c, CREATE_SUSPENDED, nullptr);
         if (h)
         {
             // Publish the real handle before any callback can use its current-thread alias.
-            hostThread = h;
-            host_thread::ReleaseStart(hostThread);
+            hostThread = reinterpret_cast<HANDLE>(h);
+            ResumeThread(hostThread);
         }
         else
         {
@@ -459,13 +457,14 @@ namespace {
 KThread* CurrentKernelThread()
 {
     // The initial game entry and callback threads do not pass through ExCreateThread.
-    // Retain a host handle so their records can configure this thread.
+    // Duplicate the pseudo handle so their records can safely retain a real handle.
     static thread_local std::unique_ptr<KThread> attached;
     if (!t_currentKernelThread)
     {
         attached = std::make_unique<KThread>();
-        attached->hostThread = host_thread::Current();
-        if (!attached->hostThread) return nullptr;
+        if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                             &attached->hostThread, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            return nullptr;
         t_currentKernelThread = attached.get();
     }
     return t_currentKernelThread;
@@ -477,6 +476,24 @@ KThread* SchedulingThread(uint32_t handle)
     return dynamic_cast<KThread*>(KernelGetObject(handle));
 }
 
+// Xbox threads select one of six logical processors. Host numbering may be sparse
+// or constrained by the process mask; use its nth available CPU, wrapping only on
+// hosts with fewer than six available processors. Never widen process affinity.
+DWORD_PTR MapGuestCpu(uint32_t mask, DWORD_PTR allowed)
+{
+    if (!mask || (mask & (mask - 1)) || (mask & ~0x3Fu) || !allowed) return 0;
+    unsigned guestCpu = 0;
+    while ((mask >> guestCpu) != 1) ++guestCpu;
+    unsigned count = 0;
+    for (DWORD_PTR bits = allowed; bits; bits &= bits - 1) ++count;
+    unsigned index = guestCpu % count;
+    for (unsigned bit = 0; bit < sizeof(DWORD_PTR) * 8; ++bit)
+    {
+        const DWORD_PTR one = DWORD_PTR(1) << bit;
+        if ((allowed & one) && index-- == 0) return one;
+    }
+    return 0;
+}
 }
 
 void KernelBindCurrentThreadCpu(volatile uint8_t* cpuByte)
@@ -503,9 +520,16 @@ uint32_t KernelSetThreadAffinity(uint32_t handle, uint32_t mask, uint32_t& previ
     // window in the background (DWM composing it) the circus stage fell from 58 to 37-39 fps,
     // and unpinning them restored a flat 60. TTT2_THREAD_AFFINITY=1 pins as before (A/B).
     static const bool pinHost = [] { const char* e = std::getenv("TTT2_THREAD_AFFINITY"); return e && *e == '1'; }();
+    DWORD_PTR hostMask = 0;
+    if (pinHost)
+    {
+        DWORD_PTR allowed = 0, system = 0;
+        if (!GetProcessAffinityMask(GetCurrentProcess(), &allowed, &system)) return STATUS_UNSUCCESSFUL;
+        hostMask = MapGuestCpu(mask, allowed);
+        if (!hostMask) return STATUS_UNSUCCESSFUL;
+    }
     std::lock_guard lk(thread->schedulingMutex);
-    if (!thread->hostThread ||
-        (pinHost && !host_thread::PinToGuestCpu(thread->hostThread, mask)))
+    if (!thread->hostThread || (pinHost && !SetThreadAffinityMask(thread->hostThread, hostMask)))
         return STATUS_UNSUCCESSFUL;
     previous = thread->guestAffinity;
     thread->guestAffinity = mask;
@@ -526,7 +550,9 @@ int32_t KernelSetThreadPriority(uint32_t handle, int32_t priority)
     const int32_t previous = thread->guestPriority;
     // Preserve the guest request for query/restore, but limit its host effect to
     // normal process-relative priorities. Never request time-critical/realtime.
-    if (host_thread::SetRelativePriority(thread->hostThread, priority))
+    const int hostPriority = priority < THREAD_PRIORITY_LOWEST ? THREAD_PRIORITY_LOWEST :
+        priority > THREAD_PRIORITY_HIGHEST ? THREAD_PRIORITY_HIGHEST : priority;
+    if (thread->hostThread && SetThreadPriority(thread->hostThread, hostPriority))
         thread->guestPriority = priority;
     return previous;
 }

@@ -10,7 +10,6 @@
 #define IDR_VCRUNTIME140       105
 #define IDR_VCRUNTIME140_1     106
 #define IDR_README             107
-#define IDR_SDL3               108
 
 #define IDD_MAIN               200
 #define IDC_ISO_PATH           201

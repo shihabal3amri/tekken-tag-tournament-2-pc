@@ -12,7 +12,7 @@
 // C:/ttt2/re/srv_tools/gin_log/), and a local answer can be replaced without a rebuild by
 // C:/ttt2/re/srv_tools/gin_replies/<METHOD>_<path with '/' as '_'>.txt (the whole response) or .json (the body).
 #define WIN32_LEAN_AND_MEAN
-#include "community_platform.h"
+#include <windows.h>
 #include "gin_service.h"
 #include "community_net.h"
 #include "net_transport.h"
@@ -427,12 +427,10 @@ private:
         if (!body.empty()) std::fprintf(stderr, "[gin]     body (%zu): %.1500s\n", body.size(), body.c_str());
         std::string name = method + "_" + target.substr(0, target.find('?'));
         for (char& c : name) if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?') c = '_';
-        const char* root = std::getenv("TTT2_SAVE_ROOT");
-        const auto directory = std::filesystem::path(root && *root ? root : ".") / "gin_log";
-        std::error_code ec; std::filesystem::create_directories(directory, ec);
-        char filename[512];
-        std::snprintf(filename, sizeof(filename), "%03u%s.txt", requests_, name.c_str());
-        std::ofstream(directory / filename, std::ios::binary) << head << "\r\n\r\n" << body;
+        CreateDirectoryA("C:/ttt2/re/srv_tools/gin_log", nullptr);
+        char path[MAX_PATH];
+        std::snprintf(path, sizeof(path), "C:/ttt2/re/srv_tools/gin_log/%03u%s.txt", requests_, name.c_str());
+        std::ofstream(path, std::ios::binary) << head << "\r\n\r\n" << body;
     }
 
     std::mutex m_;

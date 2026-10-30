@@ -1,7 +1,7 @@
 // Audio HLE: each registered render client receives callbacks paced by completed
 // 256-sample / 48 kHz buffers. TTT2 creates multiple engines; replacing a callback
 // another stops the first engine's mixer and strands its queued Stop/Flush work.
-// PCM samples go to a bounded SDL audio stream. Each callback receives
+// PCM samples go to a bounded Windows XAudio2 output queue. Each callback receives
 // r3 = its own stable guest
 // cell holding the registration context, as in Xenia's AudioSystem::RegisterClient.
 #include "kernel_shared.h"
@@ -32,9 +32,7 @@ struct AudioClient
     bool active = true;                       // protected by execution
     uint32_t callback = 0;
     uint32_t paramCell = 0;
-    uint64_t nextRenderNs = 0;
     uint64_t pumped = 0;                       // protected by execution
-    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     uint64_t maxCallbackUs = 0;
     std::atomic<uint64_t> submitted{0};
     std::unique_ptr<AudioOutputClient> output;
@@ -56,30 +54,9 @@ static std::shared_ptr<AudioClient> FindAudioClient(uint32_t handle)
     return g_xaClients[index];
 }
 
-static bool PaceAudio()
-{
-    static const char* path = std::getenv("TTT2_AUDIO_PACE_FILE");
-    static auto next = std::chrono::steady_clock::time_point{};
-    static bool enabled = [] {
-        const char* value = std::getenv("TTT2_AUDIO_PACE");
-        return value && *value == '1';
-    }();
-    const auto now = std::chrono::steady_clock::now();
-    if (path && now >= next) {
-        next = now + std::chrono::seconds(1);
-        if (auto* file = std::fopen(path, "r")) {
-            int value = 0;
-            if (std::fscanf(file, "%d", &value) == 1) enabled = value != 0;
-            std::fclose(file);
-        }
-    }
-    return enabled;
-}
-
-static bool PumpAudioClients(uint64_t nowNs, uint64_t& waitNs)
+static bool PumpAudioClients(uint64_t nowNs = 0)
 {
     bool pumped = false;
-    const bool paced = PaceAudio();
     std::array<std::shared_ptr<AudioClient>, AUDIO_MAX_CLIENTS> clients;
     {
         std::lock_guard lock(g_xaClientsMutex);
@@ -91,15 +68,7 @@ static bool PumpAudioClients(uint64_t nowNs, uint64_t& waitNs)
         if (!client) continue;
         std::lock_guard execution(client->execution);
         if (!client->active) continue;
-        if (paced && nowNs < client->nextRenderNs) {
-            waitNs = std::min(waitNs, client->nextRenderNs - nowNs);
-            continue;
-        }
         if (!client->output->TryAcquireRenderCredit(nowNs)) continue;
-        // Retain credits for host back-pressure, but spread bursty device requests
-        // over guest render periods. Bound catch-up after a long suspension.
-        client->nextRenderNs = std::max(client->nextRenderNs + uint64_t(FRAME_NS),
-                                       nowNs + uint64_t(FRAME_NS) / 2);
         const auto began = std::chrono::steady_clock::now();
         GuestCall(client->callback, client->paramCell);
         const auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -109,14 +78,11 @@ static bool PumpAudioClients(uint64_t nowNs, uint64_t& waitNs)
         ++g_xaPumped;
         if (++client->pumped % 2048 == 0)
         {
-            const auto reported = std::chrono::steady_clock::now();
-            const double seconds = std::chrono::duration<double>(reported - client->lastReport).count();
-            client->lastReport = reported;
-            std::fprintf(stderr, "[snd] driver=%08X pump frames=%llu submits=%llu context=%08X render_hz=%.1f\n",
+            std::fprintf(stderr, "[snd] driver=%08X pump frames=%llu submits=%llu context=%08X\n",
                          AUDIO_DRIVER_KEY | uint32_t(index),
                          (unsigned long long)client->pumped,
                          (unsigned long long)client->submitted.load(),
-                         GRead32(g_base, client->paramCell), seconds > 0 ? 2048.0 / seconds : 0.0);
+                         GRead32(g_base, client->paramCell));
             const auto output = client->output->Stats();
             std::fprintf(stderr, "[snd-output] driver=%08X ready=%u failed=%u received=%llu submitted=%llu completed=%llu dropped=%llu queued=%u nonzero=%llu nonfinite=%llu deviceq=%u credits=%u starved=%llu starved_bytes=%llu max_callback_us=%llu\n",
                          AUDIO_DRIVER_KEY | uint32_t(index), unsigned(output.ready), unsigned(output.failed),
@@ -138,9 +104,8 @@ static void AudioPumpThread()
     {
         const uint64_t version = AudioOutputWakeVersion();
         const auto now = std::chrono::steady_clock::now().time_since_epoch();
-        uint64_t waitNs = FRAME_NS;
-        if (!PumpAudioClients(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count()), waitNs))
-            WaitAudioOutputWake(version, int64_t(waitNs)); // timeout only needed by silent fallback clients
+        if (!PumpAudioClients(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count())))
+            WaitAudioOutputWake(version, FRAME_NS); // timeout only needed by silent fallback clients
     }
 }
 
