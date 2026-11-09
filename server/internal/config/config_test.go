@@ -18,7 +18,7 @@ func TestDefaultFileParsesToDefault(t *testing.T) {
 	}
 	d := Default()
 	if c.Name != d.Name || c.Region != d.Region || c.Port != d.Port || c.MaxPlayers != d.MaxPlayers ||
-		len(c.AcceptedProtocols) != 1 || c.AcceptedProtocols[0] != "ttt2-port-10-rollback" || c.SteamAppID != 480 ||
+		len(c.AcceptedProtocols) != 1 || c.AcceptedProtocols[0] != "ttt2-port-13-rollback" || c.SteamAppID != 480 ||
 		c.KickMinutes != 10 || d.KickMinutes != 10 || c.KeepMatchesDays != 365 || d.KeepMatchesDays != 365 {
 		t.Fatalf("%+v", c)
 	}
@@ -84,6 +84,17 @@ func TestKickAndMatchKeeping(t *testing.T) {
 	}
 }
 
+func TestRanks(t *testing.T) {
+	if Default().Ranks != RanksServer {
+		t.Fatal(`a server's ranks are its own unless the owner says "player"`)
+	}
+	for text, want := range map[string]string{"": RanksServer, `ranks = "server"`: RanksServer, `ranks = "player"`: RanksPlayer} {
+		if c, err := parse(t, text); err != nil || c.Ranks != want {
+			t.Fatalf("%q: %+v %v", text, c, err)
+		}
+	}
+}
+
 func TestValues(t *testing.T) {
 	c, err := parse(t, `
 name = "TEKKEN ARABIA # 1"   # a comment after a value
@@ -114,6 +125,8 @@ func TestErrors(t *testing.T) {
 		`kick_minutes = 1441`,
 		`keep_matches_days = -5`,
 		`keep_matches_days = 36501`,
+		`ranks = "players"`,
+		`ranks = true`,
 		`admin_panel = yes`,
 		`admin_panel_port = 0`,
 		`admin_panel_port = 65536`,

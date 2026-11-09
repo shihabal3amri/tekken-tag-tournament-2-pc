@@ -10,6 +10,7 @@
 //
 // TTT2_RB_NACETRACE=1: one line per update during online fights (the first 400 of each fight, then
 // every update with a rollback, a stall or a prediction change).
+#include "online_2v2.h"
 #include "kernel_shared.h"
 #include "guest_heap.h"
 #include "display_settings.h"
@@ -59,12 +60,26 @@ void NodeFrames(int i, int32_t& newest, int32_t& current)
     current = R32(node + 724);
 }
 
+// The opponent's node. Node 0 is this machine; in a room of three or more the others include spectators, whose node
+// has +748 set (MEASURED 2026-10-24, rooms of three on loopback: the spectator's node flagged on every machine, its
+// newest frame -1 - it sends no input - and at a different index on each). 1 when nothing says otherwise (two).
+int OpponentNode()
+{
+    const int32_t count = R32(kSync + 4856);
+    for (int i = 1; i < count && i < 7; ++i)
+    {
+        const uint32_t node = GRead32(g_base, kSync + 4828 + 4 * i);
+        if (node && !GRead8(g_base, node + 748)) return i;
+    }
+    return 1;
+}
+
 void Event(const char* what, bool notable = false)
 {
     if (!TraceOn() || GetCurrentThreadId() != g_main) return;
     int32_t ln, lc, rn, rc;
     NodeFrames(0, ln, lc);
-    NodeFrames(1, rn, rc);
+    NodeFrames(OpponentNode(), rn, rc);
     char buf[256];
     std::snprintf(buf, sizeof(buf), " %s[rdy %u rb %d pred %s %d/%d miss %d rec %d/%d L %d/%d R %d/%d dly %d]", what,
                   GRead8(g_base, kNace + 6020), R32(kNace + 5936), GRead8(g_base, kNace + 5932) ? "on" : "off",
@@ -235,6 +250,11 @@ void TimeSyncReset();                  // below
 void TimeSyncStop();
 int g_steerSeen = -1;                  // the last reading's value (hysteresis)
 int g_steerAskedAgo = 1000;
+// PRIORITIZE RESPONSE's frame back (SessionYield): on for the rest of the match once either side's inputs keep
+// arriving a frame late; the window's sum of the larger of the two sides' prediction depths, and its updates.
+bool g_respLate = false;
+double g_respSum = 0;
+int g_respN = 0;
 
 int PredictFrames()
 {
@@ -274,6 +294,8 @@ bool SessionEnding() { return R32(kSync + 5040) >= 2; }
 int SessionPending() { return R32(kNace + 5944); }
 
 // rollback.cpp, at a session's start and end.
+// The end-of-battle request's session frame (sub_826F87B8 below; -1: none in this session).
+std::atomic<int32_t> g_endBattleFrame{ -1 };
 void SessionOwnPump(bool own)
 {
     // The game's own ring (36 bytes from its allocator) goes back at the end - the next battle's sync
@@ -281,9 +303,11 @@ void SessionOwnPump(bool own)
     // unless the sync itself stopped (then they no longer matter).
     static uint32_t gameRing = 0, gameCap = 0;
     g_ownPump = own;
+    g_endBattleFrame = -1;                             // a match's KO request: this session's own (none yet / any more)
     if (!own)
     {
         TimeSyncStop();                                    // the vblank schedule back to 60 Hz
+        online2v2::StreamReset();                          // the 2v2 input stream: the next match counts from 0
         if (!gameRing) return;
         if (R32(kNace + 5944) != 0)
             std::fprintf(stderr, "[rb-session] ended with %d predictions outstanding\n", R32(kNace + 5944));
@@ -304,6 +328,9 @@ void SessionOwnPump(bool own)
     g_steerWant = g_steerAsked = g_steerSeen = -1;
     TimeSyncReset();
     g_steerAskedAgo = 1000;
+    g_respLate = false;
+    g_respSum = 0;
+    g_respN = 0;
     // The larger prediction ring, installed while no prediction is outstanding.
     const int cap = PredictFrames();
     if (g_ring && R32(kNace + 5944) == 0 && R32(kNace + 5948) != cap)
@@ -384,6 +411,7 @@ void SteerDelay(PPCContext& ctx, uint8_t* base)
 // (after a misprediction it is: the oldest predicted frame's real record).
 int SessionPrePump(PPCContext& ctx, uint8_t* base, int32_t& real, bool& ready)
 {
+    online2v2::InjectStream(ctx, base);
     PPCContext c = ctx;
     c.r3.u64 = kNace;
     __imp__sub_826F13D0(c, base);
@@ -406,11 +434,19 @@ int32_t SessionConfirmedFrame()
 }
 // The loaded record's frame if it is a real one (consistency checks), else -1.
 int32_t SessionRealFrame() { return GRead8(g_base, kNace + 6020) ? RealRecordFrame() : -1; }
+// This machine watches the fight in the sync engine (node 0 a spectator's: an online 2v2 partner, online_2v2.cpp).
+bool SessionSpectator()
+{
+    if (R32(kSync + 4856) <= 0) return false;
+    const uint32_t node = GRead32(g_base, kSync + 4828);
+    return node && GRead8(g_base, node + 748) != 0;
+}
 
 // Before re-simulating the next frame (and before the live one after a rewind): the frame just
 // simulated is consumed, the next record fetched. `frame` as above.
 bool SessionNext(PPCContext& ctx, uint8_t* base)
 {
+    online2v2::InjectStream(ctx, base);
     PPCContext c = ctx;
     c.r3.u64 = kNace;
     __imp__sub_826F1390(c, base);
@@ -428,6 +464,7 @@ PPC_FUNC(sub_826F13D0)
         if (TraceOn()) Event("pump-owned");
         return;
     }
+    online2v2::InjectStream(ctx, base);
     __imp__sub_826F13D0(ctx, base);
     if (TraceOn()) Event("pump", R32(kNace + 5936) >= 0 || !GRead8(g_base, kNace + 6020));
 }
@@ -601,7 +638,7 @@ void ArmPeerWatch()
     if (armed || R32(kSync + 4856) < 2) return;
     const char* tag = std::getenv("TTT2_INSTANCE");
     if (tag && *tag) return;
-    const uint32_t node = GRead32(g_base, kSync + 4828 + 4);
+    const uint32_t node = GRead32(g_base, kSync + 4828 + 4 * OpponentNode());
     const uint32_t peer = node ? GRead32(g_base, node + 736) : 0;
     if (!peer) return;
     armed = true;
@@ -622,7 +659,6 @@ void ArmPeerWatch()
 // The end-of-battle request (sub_826F87B8 sets S+5084; the host then sends "end at F") - who asks for
 // it, in which frame, live or re-simulated. Its frame also names the end-of-battle save that follows
 // (rollback.cpp RollbackSaveJournalFrame).
-std::atomic<int32_t> g_endBattleFrame{ -1 };
 int32_t SessionEndBattleFrame() { return g_endBattleFrame.load(); }
 extern "C" PPC_FUNC(__imp__sub_826F87B8);
 PPC_FUNC(sub_826F87B8)
@@ -659,6 +695,61 @@ PPC_FUNC(sub_826F8230)
     SyncPairs(pairs, sizeof(pairs));
     std::fprintf(stderr, "[nace-sync] DESYNC reported (session frame %d%s):%s\n", RollbackSessionFrame(),
                  RollbackResimulating() ? ", re-simulating" : "", pairs);
+}
+
+// The battle setup's exchange before every online match (character select's end, our straight REMATCH / STAGE SELECT /
+// CHARACTER SELECT): the sync engine's WaitSynchronizePlayerEnv (sub_826F0DE0, r3 the engine = kNace) sends this PC's
+// setup header and its 14528-byte Profile as 30 chunks of 512 bytes, one item every T frames on its own frame counter
+// (+5924; slot p = counter % cycle: p 1 the header, p (i+1)T+1 chunk i), never waiting for an answer - an item every
+// node acked is skipped, one not acked comes again a cycle (+5920 = 31T frames) later. The idle state (sub_826F2018)
+// sets T = clamp(4 * nodes, 8, 30) (+5916, nodes +4920): about 7.7 KB/s per peer, the Xbox 360 era's upload budget. So
+// the exchange takes about 30T frames - 4.2 s with two PCs, 8.5 s with four (PAIR PLAY), after the last player is done
+// (MEASURED 2026-11-07: rm14c, t4 logs; research C:\ttt2wt\re\stage4\synth.txt). Here T is the node count (at least 2):
+// the same items and bytes, in about a quarter of the time (two PCs ~1.2 s, four ~2.2 s), at most ~30 items a second
+// per peer. Set once, on this exchange's first WaitSynchronizePlayerEnv frame (+5924 still 0: no item sent yet), never
+// below 2 (the chunk test (p - T) % T == 1 never holds for T 1) and never during a cycle. The exchange's timeout
+// (sub_826EF2E0: its counter +5912 against 1.5 cycles + 2700 frames) keeps its native deadline: the counter moves by
+// what the shorter cycle takes off. TTT2_SYNC_PACE=0 (a whole run): the game's own pace, for comparisons.
+namespace {
+bool SyncPaceOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_SYNC_PACE"); return !(e && *e == '0'); }();
+    return on;
+}
+unsigned long long g_paceStart = 0;    // the exchange's first WaitSynchronizePlayerEnv frame (ms, 0: none)
+}
+
+extern "C" PPC_FUNC(__imp__sub_826F0DE0);
+PPC_FUNC(sub_826F0DE0)
+{
+    const uint32_t nace = ctx.r3.u32;
+    const int32_t before = nace == kNace ? R32(nace + 5780) : 0;
+    if (before == 3 && R32(nace + 5924) == 0)
+    {
+        g_paceStart = online2v2::DiagMs();
+        const int32_t nodes = R32(nace + 4920), t = R32(nace + 5916), cycle = R32(nace + 5920);
+        const int32_t tn = (std::clamp)(nodes, 2, (std::max)(t, 2));
+        if (SyncPaceOn() && tn < t && cycle == 31 * t)
+        {
+            const int32_t counter = R32(nace + 5912);
+            const int32_t shift = (3 * cycle) / 2 - (3 * 31 * tn) / 2;
+            GWrite32(g_base, nace + 5916, uint32_t(tn));
+            GWrite32(g_base, nace + 5920, uint32_t(31 * tn));
+            GWrite32(g_base, nace + 5912, uint32_t(counter - shift));
+            std::fprintf(stderr, "[sync-pace] the battle setup's exchange: nodes %d, an item every %d frames (the game's %d), cycle %d "
+                         "(%d), timeout counter %d -> %d\n", nodes, tn, t, 31 * tn, cycle, counter, counter - shift);
+        }
+        else
+            std::fprintf(stderr, "[sync-pace] the battle setup's exchange: nodes %d, an item every %d frames, cycle %d (the game's pace%s)\n",
+                         nodes, t, cycle, SyncPaceOn() ? "" : ": TTT2_SYNC_PACE=0");
+    }
+    __imp__sub_826F0DE0(ctx, base);
+    if (before == 3 && R32(nace + 5780) == 4 && g_paceStart)
+    {
+        std::fprintf(stderr, "[sync-pace] the exchange is done after %d frames (%llu ms; cycle %d)\n", R32(nace + 5924),
+                     online2v2::DiagMs() - g_paceStart, R32(nace + 5920));
+        g_paceStart = 0;
+    }
 }
 
 extern "C" PPC_FUNC(__imp__sub_826F0488);
@@ -738,6 +829,20 @@ int GameLockstepDelay(double rtt)
     return rtt < 99 ? 3 : rtt < 133 ? 4 : rtt < 166 ? 5 : rtt < 183 ? 6 : rtt < 240 ? 7 : rtt < 300 ? 8 : 9;
 }
 
+// The ONLINE NETCODE that applies: the host's setting (its session record) when this instance joined; its own
+// otherwise. `custom`: its CUSTOM INPUT DELAY.
+int SessionNetcode(int& custom)
+{
+    int mode = display_settings::GetNetcode();
+    custom = display_settings::GetCustomDelay();
+    if (const uint32_t host = XSessionLocalHosts() ? 0 : XSessionHostNetcode(); host & 0x80000000u)
+    {
+        mode = int(host & 0xFF);
+        custom = std::clamp(int((host >> 8) & 0xFF), display_settings::kMinDelay, display_settings::kMaxCustomDelay);
+    }
+    return mode;
+}
+
 int SessionInputDelay(double rtt)
 {
     static const int forced = [] { const char* e = std::getenv("TTT2_RB_DELAY"); return e && *e ? std::atoi(e) : -1; }();
@@ -745,16 +850,10 @@ int SessionInputDelay(double rtt)
     // Relative to the game's lockstep delay G: NACE adds 2-3 frames of its own to the ping (MEASURED:
     // delay 1 at 130 ms -> 6.9 frames predicted on average, 8 the most, stalls at the ring's end).
     const int g = GameLockstepDelay(rtt);
-    // The host's setting (its session record) when this instance joined; its own otherwise.
-    int mode = display_settings::GetNetcode(), custom = display_settings::GetCustomDelay();
-    if (const uint32_t host = XSessionLocalHosts() ? 0 : XSessionHostNetcode(); host & 0x80000000u)
+    int custom = 0;
+    switch (SessionNetcode(custom))
     {
-        mode = int(host & 0xFF);
-        custom = std::clamp(int((host >> 8) & 0xFF), display_settings::kMinDelay, display_settings::kMaxCustomDelay);
-    }
-    switch (mode)
-    {
-    case display_settings::NetResponse: return (std::max)(g - 1, 1);
+    case display_settings::NetResponse: return (std::max)(g - (g_respLate ? 0 : 1), 1);
     case display_settings::NetGraphics: return g + 1;
     case display_settings::NetCustom: return custom;
     default: return g;
@@ -1160,11 +1259,43 @@ void RollbackTimeSyncReceive(const uint8_t* data, size_t size)
     g_tsRemoteFrame = r.frame;
 }
 
+// The side's input for NACE (sub_82664CE0): sub_8266D398 sends one every fight frame on a fighting machine, a
+// spectator never does - so a spectator, which runs a session too, neither paces itself by nor reports to the
+// fighters (MEASURED 2026-10-24: a spectator's reports reached both fighters, 20-27 a second).
+static std::atomic<int64_t> g_sideInputMs{ INT64_MIN / 2 };
+void Diag2v2Send(PPCContext& ctx, uint8_t* base);   // diag_2v2.cpp (TTT2_2V2_DIAG=1)
+extern "C" PPC_FUNC(__imp__sub_826EF378);           // NACE: this machine's side
+extern "C" PPC_FUNC(__imp__sub_82664CE0);
+PPC_FUNC(sub_82664CE0)
+{
+    g_sideInputMs.store(TsNowMs());
+    Diag2v2Send(ctx, base);
+    __imp__sub_82664CE0(ctx, base);
+    // The frame NACE stored it for: node 0's newest (+720). The side: this machine's (sub_826EF378(nace), as the sender).
+    int32_t newest, current;
+    NodeFrames(0, newest, current);
+    PPCContext c = ctx;
+    c.r3.u64 = kNace;
+    __imp__sub_826EF378(c, base);
+    online2v2::FighterSent(base, int(c.r3.u32), newest);
+}
+
+// NACE storing a received entry (r3 node, r4 entry; -1: refused): on a spectator, a refused one for a frame it holds
+// already is checked against the word the 2v2 stream gave it (online2v2::CheckRefused).
+extern "C" PPC_FUNC(__imp__sub_826F4698);
+PPC_FUNC(sub_826F4698)
+{
+    const uint32_t node = ctx.r3.u32, entry = ctx.r4.u32;
+    __imp__sub_826F4698(ctx, base);
+    if (int32_t(ctx.r3.u32) == -1 && node && entry) online2v2::CheckRefused(base, node, entry);
+}
+
 // rollback.cpp's SessionStep, before the pump: true = this update yields a frame (yield mode; the stretch
 // mode slows the vblank schedule instead and never yields).
 bool SessionYield()
 {
-    if (!TimeSyncOn() || !RoundPredicts() || R32(kSync + 4856) < 2)
+    const bool spectating = TsNowMs() - g_sideInputMs.load() > 1000;
+    if (!TimeSyncOn() || !RoundPredicts() || R32(kSync + 4856) < 2 || spectating)
     {
         g_tsHave = false;
         g_tsInteg = g_tsBucket = 0;
@@ -1172,7 +1303,7 @@ bool SessionYield()
         return false;
     }
     int32_t remoteNewest, remoteCurrent;
-    NodeFrames(1, remoteNewest, remoteCurrent);
+    NodeFrames(OpponentNode(), remoteNewest, remoteCurrent);
     const int32_t next = RollbackSessionLast() + 1;
     if (remoteNewest < 0 || next <= 0) { TsSetStretch(0); return false; }
     const double depth = double(next - remoteNewest);
@@ -1196,6 +1327,29 @@ bool SessionYield()
     double remote = remote256 / 256.0;
     const uint32_t echo = g_tsRemoteEcho.load();
     if (echo && echo <= g_tsSeq && g_tsSeq - echo < 64) remote += g_tsGiven - g_tsSentGiven[echo & 63];
+    // PRIORITIZE RESPONSE backs off: when over 3 s of a round either side ran a frame or more ahead of the other's
+    // newest input on average (it predicted every frame; the picture corrected several times a second), the delay
+    // takes STANDARD's frame back for the rest of the match (SessionInputDelay; the side that steers asks for it).
+    // Both sides see both depths, so either one can tell. MEASURED 2026-10-24 (a real match over a Steam relay,
+    // 30 ms, delay 2): depth 1.0-3.0 here, 0-2.0 there, 7-12 corrections a second, the deep ones re-simulating
+    // 5-8 frames (up to 23 ms - missed frames); a direct 6 ms match at delay 2: 7 corrections in 31 minutes.
+    if (!g_respLate)
+    {
+        g_respSum += (std::max)(g_tsDepth, remote);
+        if (++g_respN >= 180)
+        {
+            int custom = 0;
+            if (g_respSum / g_respN >= 1.0 && SessionNetcode(custom) == display_settings::NetResponse)
+            {
+                g_respLate = true;
+                std::fprintf(stderr, "[rb-session] PRIORITIZE RESPONSE: inputs kept arriving late (depth %.1f here, %.1f there; "
+                                     "%.1f on average over 3 s) - one frame more input delay for the rest of this match\n",
+                             g_tsDepth, remote, g_respSum / g_respN);
+            }
+            g_respSum = 0;
+            g_respN = 0;
+        }
+    }
     const double lead = (g_tsDepth - remote) / 2.0;
     // The effect check: a window of updates with frames given up in it must end with the lead lower than at
     // the first - unless the other side lost frames meanwhile (it advanced less than 60 Hz would in that

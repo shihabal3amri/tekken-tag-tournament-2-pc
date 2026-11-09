@@ -10,6 +10,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
+#include <intrin.h>
 #include <timeapi.h>
 #include <fcntl.h>
 #include <io.h>
@@ -17,11 +18,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <mutex>
 #include <filesystem>
+#include <vector>
 
 // 4 GiB reserved so (base + any 32-bit guest address) is always valid.
 // 4 GiB of guest space plus a 16 MiB zero tail: a garbage guest pointer near the top of the
@@ -87,57 +91,128 @@ static LONG CALLBACK NullPageVeh(EXCEPTION_POINTERS* ep)
 
 // Suspend every other thread and print each one's RIP plus in-module stack return addresses
 // (resolve offline via the linker map: tools/stackdump.ps1). `why` heads the dump.
+// The audio threads come first and are marked ("audio=<guest entry>", the pump "audio=pump"): XAudio2's engines
+// (82C3A4E0) and workers (82C3A540), NUSound (82D032D0), its streaming thread (82CFF418), the host audio pump.
+// MEASURED 2026-11-09: a player's dump of a sound stall ended at 64 threads, the audio threads not among them. The
+// captures live in a static buffer (192 threads, 32 return addresses each - the dumping thread's stack stays as it
+// was); concurrent dumps (frame / section / audio watchdogs) take turns.
+uint32_t KernelGuestThreadEntry(unsigned long tid);   // kernel_thread.cpp
+unsigned long AudioPumpThreadId();                    // kernel_audio.cpp
 void DumpAllStacks(const char* why)
 {
     uint64_t modBase = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
     DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return;
-    THREADENTRY32 te{ sizeof(te) };
     // Capture with threads suspended, but PRINT only after resuming them: a suspended
     // thread may hold the CRT stderr lock and printing would deadlock the dump.
-    struct Cap { DWORD tid; uint64_t rip; uint64_t rets[24]; int nret; };
-    Cap caps[64]; int ncap = 0;
-    for (BOOL ok = Thread32First(snap, &te); ok && ncap < 64; ok = Thread32Next(snap, &te))
+    constexpr int kMaxThreads = 192, kMaxRets = 32;
+    struct Cap { DWORD tid; uint32_t audio; uint64_t rip; uint64_t rets[kMaxRets]; int nret; };
+    static Cap caps[kMaxThreads];
+    static std::mutex dumpMutex;
+    std::lock_guard dumpLock(dumpMutex);
+    const DWORD pump = AudioPumpThreadId();
+    auto audioOf = [&](DWORD tid) -> uint32_t {
+        if (tid == pump) return 1;
+        const uint32_t e = KernelGuestThreadEntry(tid);
+        return e == 0x82C3A4E0u || e == 0x82C3A540u || e == 0x82D032D0u || e == 0x82CFF418u ? e : 0;
+    };
+    int ncap = 0, skipped = 0;
+    for (int pass = 0; pass < 2; ++pass)                  // the audio threads, then the rest
     {
-        if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
-        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
-        if (!h) continue;
-        if (SuspendThread(h) != (DWORD)-1)
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) break;
+        THREADENTRY32 te{ sizeof(te) };
+        for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
         {
-            CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-            if (GetThreadContext(h, &c))
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+            const uint32_t audio = audioOf(te.th32ThreadID);
+            if ((pass == 0) != (audio != 0)) continue;
+            if (ncap >= kMaxThreads) { ++skipped; continue; }
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+            if (!h) continue;
+            if (SuspendThread(h) != (DWORD)-1)
             {
-                Cap& cap = caps[ncap++];
-                cap.tid = te.th32ThreadID;
-                cap.rip = c.Rip - modBase;
-                cap.nret = 0;
-                for (int i = 0; i < 2048 && cap.nret < 24; ++i)
+                CONTEXT c{}; c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                if (GetThreadContext(h, &c))
                 {
-                    uint64_t v = 0;
-                    if (!ReadProcessMemory(GetCurrentProcess(),
-                        reinterpret_cast<void*>(c.Rsp + i * 8), &v, 8, nullptr)) break;
-                    if (v >= modBase && v < modBase + 0x20000000ull)
-                        cap.rets[cap.nret++] = v - modBase;
+                    Cap& cap = caps[ncap++];
+                    cap.tid = te.th32ThreadID;
+                    cap.audio = audio;
+                    cap.rip = c.Rip - modBase;
+                    cap.nret = 0;
+                    for (int i = 0; i < 2048 && cap.nret < kMaxRets; ++i)
+                    {
+                        uint64_t v = 0;
+                        if (!ReadProcessMemory(GetCurrentProcess(),
+                            reinterpret_cast<void*>(c.Rsp + i * 8), &v, 8, nullptr)) break;
+                        if (v >= modBase && v < modBase + 0x20000000ull)
+                            cap.rets[cap.nret++] = v - modBase;
+                    }
                 }
+                ResumeThread(h);
             }
-            ResumeThread(h);
+            CloseHandle(h);
         }
-        CloseHandle(h);
+        CloseHandle(snap);
     }
-    CloseHandle(snap);
     extern void KernelDumpGuestThreads();
     KernelDumpGuestThreads();
     std::fprintf(stderr, "[stacks] ==== thread dump (%s) ====\n", why);
     for (int i = 0; i < ncap; ++i)
     {
-        std::fprintf(stderr, "[stacks] tid=%lu rip=0x%llX", caps[i].tid,
-                     (unsigned long long)caps[i].rip);
+        if (caps[i].audio == 1) std::fprintf(stderr, "[stacks] tid=%lu audio=pump rip=0x%llX", caps[i].tid, (unsigned long long)caps[i].rip);
+        else if (caps[i].audio) std::fprintf(stderr, "[stacks] tid=%lu audio=%08X rip=0x%llX", caps[i].tid, caps[i].audio, (unsigned long long)caps[i].rip);
+        else std::fprintf(stderr, "[stacks] tid=%lu rip=0x%llX", caps[i].tid, (unsigned long long)caps[i].rip);
         for (int j = 0; j < caps[i].nret; ++j)
             std::fprintf(stderr, " 0x%llX", (unsigned long long)caps[i].rets[j]);
         std::fprintf(stderr, "\n");
     }
+    if (skipped) std::fprintf(stderr, "[stacks] (%d more threads not captured)\n", skipped);
     std::fprintf(stderr, "[stacks] ==== end dump ====\n");
+}
+
+// The PC the log comes from: processor model, cores / threads, memory, Windows version (the graphics card is the
+// "[gpu] adapter" lines). Asked for by a developer reading player logs.
+static void LogSystem()
+{
+    int regs[4] = {};
+    char brand[49] = {};
+    __cpuid(regs, 0x80000000);
+    if (unsigned(regs[0]) >= 0x80000004u)
+        for (int i = 0; i < 3; ++i)
+        {
+            __cpuid(regs, 0x80000002 + i);
+            std::memcpy(brand + i * 16, regs, 16);
+        }
+    const char* name = brand;
+    while (*name == ' ') ++name;
+    for (size_t n = std::strlen(brand); n && brand[n - 1] == ' '; --n) brand[n - 1] = 0;   // AMD pads it with spaces
+    DWORD cores = 0, len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len)
+    {
+        std::vector<uint8_t> buf(len);
+        if (GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data()), &len))
+            for (DWORD off = 0; off < len; ++cores)
+                off += reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buf.data() + off)->Size;
+    }
+    MEMORYSTATUSEX mem{ sizeof(mem) };
+    GlobalMemoryStatusEx(&mem);
+    RTL_OSVERSIONINFOW os{ sizeof(os) };
+    using RtlGetVersionFn = LONG(WINAPI*)(RTL_OSVERSIONINFOW*);
+    if (auto fn = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion"))) fn(&os);
+    // The build: the exe's link time (UTC), which tells the test builds apart.
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(GetModuleHandleW(nullptr));
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(dos) + dos->e_lfanew);
+    const __time64_t linked = nt->FileHeader.TimeDateStamp;
+    tm utc{};
+    char built[32] = "unknown";
+    if (!_gmtime64_s(&utc, &linked)) std::strftime(built, sizeof(built), "%Y-%m-%d %H:%M UTC", &utc);
+    std::fprintf(stderr, "[system] game exe %s %s, built %s; processor: %s, %lu cores / %lu threads; memory %.1f GB (%.1f GB free); "
+                         "Windows %lu.%lu build %lu\n",
+                 TTT2_VERSION_STR, sizeof(void*) == 8 ? "x64" : "x86", built,
+                 *name ? name : "unknown", (unsigned long)cores, (unsigned long)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS),
+                 double(mem.ullTotalPhys) / 1073741824.0, double(mem.ullAvailPhys) / 1073741824.0,
+                 (unsigned long)os.dwMajorVersion, (unsigned long)os.dwMinorVersion, (unsigned long)os.dwBuildNumber);
 }
 
 // TTT2_STACKDUMP=<seconds>: after that delay, the dump above, then the process ends.
@@ -408,12 +483,20 @@ static std::string InstalledLayout(int argc)
         const std::wstring folder = std::wstring(local) + L"\\TTT2Recomp";
         CreateDirectoryW(folder.c_str(), nullptr);
         bool reopened = false;
+        // The last run's log stays as log-previous.txt: a player whose game did not start usually
+        // starts it again before sending the log (0.1.8 TEST 8b: the log of the failed start was gone). A
+        // last run that still holds log.txt (closing, or stuck) keeps it whole: this one writes log-2.txt.
+        std::wstring name = L"\\log.txt";
+        if (!redirected && !MoveFileExW((folder + name).c_str(), (folder + L"\\log-previous.txt").c_str(), MOVEFILE_REPLACE_EXISTING) &&
+            GetLastError() != ERROR_FILE_NOT_FOUND)
+            name = L"\\log-2.txt";
         // _wfreopen, not _wfreopen_s: the _s variant opens without sharing, so the log could
         // not be opened (or sent) while the game runs.
-        if (!redirected) reopened = _wfreopen((folder + L"\\log.txt").c_str(), L"w", stderr) != nullptr;
+        if (!redirected) reopened = _wfreopen((folder + name).c_str(), L"w", stderr) != nullptr;
         if (FILE* f = _wfopen((folder + L"\\log_start.txt").c_str(), L"w"))
         {
-            std::fprintf(f, "standard error %p, type %lu, file \"%ls\"; %s\n", static_cast<void*>(err), type, errPath,
+            // The file as UTF-8 (kernel/log_utf8.h: %ls would end the line at a user name in another script).
+            std::fprintf(f, "standard error %p, type %lu, file \"%s\"; %s\n", static_cast<void*>(err), type, narrow(errName).c_str(),
                          redirected ? "kept (a launcher's redirect)" : reopened ? "log.txt opened" : "log.txt could not be opened");
             std::fclose(f);
         }
@@ -452,13 +535,27 @@ static void StartLogWriter()
     _close(pipeFd);                     // fd 2 keeps its own duplicate of the write end
     SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(fd)));
     g_logPipeRead = read;
+    // 0.1.8 TEST 14: stderr buffered while the writer owns the log; the writer flushes it every 20 ms, LogDrain
+    // first. Unbuffered (main's _IONBF), the CRT wrote an fprintf a character at a time: 124-170 us for a
+    // 260-character line here, 1.3 us buffered. The 5 s report (25 lines) held the command processor 2.3-2.9 ms
+    // here and dropped a frame every 5 s on a 2-core i3 (log 44: after 9 of 9 reports in a Paris fight). A hard
+    // crash loses the last 20 ms of lines, as it already lost what was still in the pipe.
+    std::setvbuf(stderr, nullptr, _IOFBF, 1 << 16);
     std::thread([read, target] {
+        // Above the game's threads: on a 4-thread CPU the frame threads (HIGHEST) left a normal writer no time,
+        // so the log fell behind the game (0.1.8 TEST 8b log 38 ended mid-line) and a full pipe would stall every
+        // thread that logs. TEST 14: it looks every 20 ms instead of waking for every write.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         static char buffer[1 << 16];
         for (;;)
         {
+            std::fflush(stderr);
+            DWORD queued = 0;
+            if (!PeekNamedPipe(read, nullptr, 0, nullptr, &queued, nullptr)) return;
+            if (!queued) { Sleep(20); continue; }
+            g_logWriting = true;            // before the read: LogDrain must not see an empty pipe and an idle writer
             DWORD n = 0;
-            if (!ReadFile(read, buffer, sizeof(buffer), &n, nullptr) || !n) return;
-            g_logWriting = true;
+            if (!ReadFile(read, buffer, sizeof(buffer), &n, nullptr) || !n) { g_logWriting = false; return; }
             DWORD written = 0;
             WriteFile(target, buffer, n, &written, nullptr);
             g_logWriting = false;
@@ -469,6 +566,7 @@ static void StartLogWriter()
 void LogDrain(unsigned timeoutMs)
 {
     if (!g_logPipeRead) return;
+    std::fflush(stderr);
     const ULONGLONG until = GetTickCount64() + timeoutMs;
     int quiet = 0;                      // two empty checks in a row: the writer has caught up
     while (quiet < 2 && GetTickCount64() < until)
@@ -511,6 +609,11 @@ int main(int argc, char** argv)
         extern int GpuTranslateFile(const char* kind, const char* path);
         return GpuTranslateFile(argv[2], argv[3]);
     }
+    if (argc >= 2 && std::strcmp(argv[1], "--warm-driver") == 0)        // the installer, after --build-shaders
+    {
+        extern int GpuWarmDriverShaders(const char* mode);
+        return GpuWarmDriverShaders(argc > 2 ? argv[2] : "all");
+    }
     if (argc >= 2 && std::strcmp(argv[1], "--build-shaders") == 0)
     {
         wchar_t self[MAX_PATH] = {};
@@ -529,8 +632,11 @@ int main(int argc, char** argv)
         return GpuPrebuildShaders({ game / "data002.bin", game / "data003.bin", image }, threads);
     }
     const std::string installedImage = InstalledLayout(argc);
-    std::setvbuf(stderr, nullptr, _IONBF, 0);   // unbuffered: trace survives a hard crash
+    std::setvbuf(stderr, nullptr, _IONBF, 0);   // unbuffered: trace survives a hard crash (StartLogWriter: buffered, its writer flushes)
     StartLogWriter();
+    // An exit through main (return 1: "cannot open image", ...) or exit() waits for the writer: it lost every line
+    // queued since StartLogWriter (MEASURED 2026-11-02: a game in a folder named "Jeux vid\u00E9o" left a one-line log).
+    std::atexit([] { LogDrain(); });
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_mainThreadHandle,
                     THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0);
     // An installed game whose shader prebuild is missing or from another build (the installer ran it
@@ -569,14 +675,24 @@ int main(int argc, char** argv)
         throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED |
                                  PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
         throttling.StateMask = 0;   // controlled + not set = never throttle
-        const BOOL throttleOk = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
-                                                      &throttling, sizeof(throttling));
+        BOOL throttleOk = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling,
+                                                &throttling, sizeof(throttling));
+        // Windows 10 has no IGNORE_TIMER_RESOLUTION and refuses the whole request (the low-end player's log 41:
+        // "FAILED"), so the execution-speed opt-out alone, as Windows 10 knows it.
+        const char* throttleHow = "ok";
+        if (!throttleOk)
+        {
+            throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+            throttleOk = SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
+            throttleHow = "ok (execution speed only)";
+        }
         const MMRESULT period = timeBeginPeriod(1);
         std::fprintf(stderr, "[runtime] timer resolution: timeBeginPeriod(1)=%s power-throttling-optout=%s\n",
-                     period == TIMERR_NOERROR ? "ok" : "FAILED", throttleOk ? "ok" : "FAILED");
+                     period == TIMERR_NOERROR ? "ok" : "FAILED", throttleOk ? throttleHow : "FAILED");
     }
     else
         std::fputs("[runtime] timer resolution: default (TTT2_TIMER_RES=0)\n", stderr);
+    LogSystem();
 
     // 1) Reserve AND commit the whole guest address space up front (as Unleashed does).
     //    The game's init code reads through would-be-null pointers and relies on those reads
@@ -586,17 +702,28 @@ int main(int argc, char** argv)
     // died before the process goes (run_user1 vanished with an empty log).
     SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
         auto* r = ep->ExceptionRecord;
+        // A thread naming itself for a debugger (the graphics driver's threads do, 0.1.8 TEST 8b log 38): carry on,
+        // as a debugger would.
+        if (r->ExceptionCode == 0x406D1388) return EXCEPTION_CONTINUE_EXECUTION;
         std::fprintf(stderr, "[fatal] unhandled exception %08lX at %p (tid %lu)\n",
                      r->ExceptionCode, r->ExceptionAddress, GetCurrentThreadId());
         std::fprintf(stderr, "[fatal] module base %p, RVA %llX\n", GetModuleHandleW(nullptr),
                      (unsigned long long)(reinterpret_cast<uint64_t>(r->ExceptionAddress) -
                                           reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr))));
         HMODULE mod = nullptr;
-        wchar_t modName[MAX_PATH] = L"?";
+        // Static, not on the faulting thread's stack: a stack overflow enters this filter with about 5 KB left, and a
+        // 780-byte buffer here made the fflush below fault again and lose the whole report (MEASURED 2026-11-02). No
+        // heap either. Two threads crashing at the same moment could garble the name, nothing worse.
+        static wchar_t modName[MAX_PATH];
+        static char modUtf8[MAX_PATH * 3];
+        modName[0] = L'?'; modName[1] = 0;
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                                static_cast<LPCWSTR>(r->ExceptionAddress), &mod) && mod)
             GetModuleFileNameW(mod, modName, MAX_PATH);
-        std::fprintf(stderr, "[fatal] in %ls +%llX; access %s %p\n", modName,
+        // The module's path as UTF-8 (kernel/log_utf8.h: %ls would end the line, offset and access included, at an
+        // install folder in another script). MAX_PATH UTF-16 units fit 3 bytes each.
+        if (!WideCharToMultiByte(CP_UTF8, 0, modName, -1, modUtf8, sizeof(modUtf8), nullptr, nullptr)) std::strcpy(modUtf8, "?");
+        std::fprintf(stderr, "[fatal] in %s +%llX; access %s %p\n", modUtf8,
                      (unsigned long long)(reinterpret_cast<uint64_t>(r->ExceptionAddress) - reinterpret_cast<uint64_t>(mod)),
                      r->NumberParameters >= 2 ? (r->ExceptionInformation[0] == 1 ? "write" : r->ExceptionInformation[0] == 8 ? "execute" : "read") : "?",
                      r->NumberParameters >= 2 ? reinterpret_cast<void*>(r->ExceptionInformation[1]) : nullptr);
@@ -697,6 +824,8 @@ int main(int argc, char** argv)
     extern void KernelRegisterGuestThread(uint32_t, uint32_t);
     extern void KernelPublishMainGuestContext(PPCContext*);
     KernelRegisterGuestThread(0xFFFFFFFF, 0);   // entry FFFFFFFF = the main (_xstart) thread
+    extern void KernelMarkFrameCriticalThread(const char* what);
+    KernelMarkFrameCriticalThread("the game's main");
 
     AddVectoredExceptionHandler(1, NullPageVeh);
     NullPageProtect(true);

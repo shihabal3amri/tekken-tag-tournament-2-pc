@@ -10,6 +10,7 @@
 #include "sys_ui.h"
 #include "keyboard_keys.h"
 #include "xlive.h"
+#include "online_2v2.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -25,7 +26,13 @@
 #include <utility>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+void DiagNameThread(const wchar_t* name);   // kernel_thread.cpp (TEST ONLY)
 #include <Xinput.h>
+// The online 2v2 controller code's names for the XInput structures.
+using XboxPadState = XINPUT_STATE;
+using XboxPadData = XINPUT_GAMEPAD;
+using XboxPadCapabilities = XINPUT_CAPABILITIES;
+constexpr BYTE XboxPadDeviceType = XINPUT_DEVTYPE_GAMEPAD, XboxPadDeviceSubtype = XINPUT_DEVSUBTYPE_GAMEPAD;
 
 // --- ExGetXConfigSetting(category, setting, buffer, bufferSize, requiredSize) ---
 PPC_FUNC(__imp__ExGetXConfigSetting)
@@ -318,6 +325,31 @@ PPC_FUNC(__imp__XamUserReadProfileSettings)
     ReadProfileSettings(ctx, base);
 }
 
+// XamUserCreateAchievementEnumerator(titleId, user, xuid, detailFlags, start, count, pcbBuffer, phEnum): the XUID is
+// one 64-bit register (r5), so the size pointer is r9 and the handle pointer r10. No achievements are kept here
+// (XUserWriteAchievements is answered S_OK and dropped, xsession.cpp): the create FAILS, both outputs zeroed. Its only
+// callers (through the XDK wrapper sub_82BEEE58) are sub_8255C108 - at the main menu after the save loads - and
+// sub_8255C2F0 - after each achievement written - both asking "is exactly one achievement left?"; on a non-zero
+// result they close their own event and answer 0. MEASURED 2026-11-02 (tester logs 46-51, the TEST 16 online logs):
+// the generated stub's success wrote neither output, so their size check (25000: 50 x 500-byte details) wrote
+// through NULL ([nullpage] in __imp__sub_8255C108 / __imp__sub_8255C2F0) and they enumerated a stack-garbage handle;
+// XamEnumerate completes that as a pending error, whose early return skips both CloseHandles (read from the code: an
+// event leaked per call - a real but empty enumerator would leak itself as well). Online the award also comes inside
+// rollback sessions and runs again when a rewind re-simulates its frame (MEASURED: record frames 1879 and 5345 of a
+// two-instance test): this answer keeps no state.
+PPC_FUNC(__imp__XamUserCreateAchievementEnumerator)
+{
+    KTrace("XamUserCreateAchievementEnumerator");
+    const uint32_t sizeOut = ctx.r9.u32, handleOut = ctx.r10.u32;
+    if (XamGuestRange(sizeOut, 4)) GWrite32(base, sizeOut, 0);
+    if (XamGuestRange(handleOut, 4)) GWrite32(base, handleOut, 0);
+    static std::atomic<bool> logged{ false };
+    if (!logged.exchange(true))
+        std::fprintf(stderr, "[xam] XamUserCreateAchievementEnumerator(user %u, %u items) -> failed: no achievements (first call)\n",
+                     ctx.r4.u32, ctx.r8.u32);
+    ctx.r3.u32 = 1627;   // ERROR_FUNCTION_FAILED: the callers test zero / non-zero only
+}
+
 // --- Xam notification listeners. A listener has an area mask and a FIFO of (id, param)
 // pairs; XNotifyGetNext is a non-blocking poll (r4 = exact-id filter, 0 = any). Nothing is
 // queued at boot (reference-runtime behavior); UI shims post XN_SYS_UI (9) when invoked. ---
@@ -464,11 +496,22 @@ PPC_FUNC(__imp__XMsgInProcessCall)
 {
     KTrace("XMsgInProcessCall");
     uint32_t app = ctx.r3.u32, message = ctx.r4.u32, param1 = ctx.r5.u32;
-    static int logged = 0;
-    if (logged < 40 || message != 0x7001B)
+    // The first 40 calls of each app/message pair, then every 100000th with its count. 0.1.8 TEST 19 logged every
+    // call of all but 0x7001B: the user's log of 2026-11-08 held 820,437 lines of app FC msg 5800E (about 325 a second,
+    // 56 MB in 42 minutes).
     {
-        ++logged;
-        std::fprintf(stderr, "[xam] XMsgInProcessCall app=%08X msg=%08X lr=%08X\n", app, message, (uint32_t)ctx.lr);
+        static std::mutex logLock;
+        static std::unordered_map<uint64_t, uint64_t> seen;
+        uint64_t count;
+        {
+            std::lock_guard l(logLock);
+            count = ++seen[(uint64_t(app) << 32) | message];
+        }
+        if (count <= 40)
+            std::fprintf(stderr, "[xam] XMsgInProcessCall app=%08X msg=%08X lr=%08X%s\n", app, message, (uint32_t)ctx.lr,
+                         count == 40 ? " (the last of this message logged; then every 100000th)" : "");
+        else if (count % 100000 == 0)
+            std::fprintf(stderr, "[xam] XMsgInProcessCall app=%08X msg=%08X: %llu calls\n", app, message, (unsigned long long)count);
     }
     // One-shot guest backtrace of the polling thread: walk the PPC backchain
     // ([r1] = caller frame; saved LR at [callerFrame - 8]) to find the boot loop.
@@ -683,12 +726,14 @@ struct PadPollState
 // BUTTONS is one or more names joined by '+': START BACK UP DOWN LEFT RIGHT A B X Y LB RB, and LSL LSR LSU LSD
 // (the left stick pushed fully left / right / up / down).
 // Presses go to player 1 (user 0); a P2 name sends them to player 2 (user 1), e.g.
-// "60000:P2+START:150" or "P2+DOWN+A 150" - user 1 then stays connected as a virtual pad.
+// "60000:P2+START:150" or "P2+DOWN+A 150" - user 1 then stays connected as a virtual pad. P3 / P4: users 2 / 3 the same
+// way (offline PAIR PLAY tests).
 struct ScriptedPress { uint64_t at = 0, until = 0; uint16_t buttons = 0; int player = 0; uint8_t stick = 0; };
 struct PadScript
 {
     std::vector<ScriptedPress> presses;
     bool active = false, player2 = false;
+    uint8_t extraPlayers = 0;              // users 2 / 3 scripted (bits 2 / 3): connected as virtual pads
     uint64_t injectBusyUntil = 0, nextInjectPoll = 0;
 };
 
@@ -708,6 +753,8 @@ static uint16_t ParseButtons(const std::string& names, int* player = nullptr, ui
         for (const auto& [n, v] : map)
             if (name == n) b |= v;
         if (name == "P2" && player) *player = 1;
+        if (name == "P3" && player) *player = 2;
+        if (name == "P4" && player) *player = 3;
         for (const auto& [n, v] : sticks)
             if (name == n && stick) *stick |= v;
         pos = end + 1;
@@ -733,6 +780,7 @@ static void LoadScript(PadScript& s, const char* text)
             p.until = p.at + std::strtoull(item.c_str() + c2 + 1, nullptr, 10);
             if (p.buttons || p.stick) s.presses.push_back(p);
             s.player2 |= (p.buttons || p.stick) && p.player == 1;
+            if ((p.buttons || p.stick) && p.player >= 2) s.extraPlayers |= uint8_t(1u << p.player);
         }
         pos = end + 1;
     }
@@ -771,6 +819,7 @@ static void PollInjectFile(PadScript& s, uint64_t now)
         const uint64_t start = together ? previous : at;
         s.presses.push_back({ start, start + hold, b, player, stick });
         s.player2 |= player == 1;
+        if (player >= 2) s.extraPlayers |= uint8_t(1u << player);
         if (logged < 2000 && ++logged)
             std::fprintf(stderr, "[input] inject %s at +%llums hold %u\n", names,
                          (unsigned long long)(start - now), hold);
@@ -823,6 +872,26 @@ void PublishPad(DWORD index, bool connected, bool physical,
     pad.connected.store(connected);
 }
 
+// Presses the port makes for a user (online2v2::SynthPress): {buttons, from, until} on the poll thread's clock.
+struct SynthState { uint16_t buttons = 0; int64_t from = 0, until = 0; };
+std::mutex g_synthLock;
+std::vector<SynthState> g_synth[4];
+int64_t SynthClockMs()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+uint16_t SynthButtons(uint32_t user, uint64_t)
+{
+    std::lock_guard l(g_synthLock);
+    const int64_t now = SynthClockMs();
+    uint16_t buttons = 0;
+    auto& list = g_synth[user & 3];
+    for (const SynthState& s : list)
+        if (now >= s.from && now < s.until) buttons |= s.buttons;
+    list.erase(std::remove_if(list.begin(), list.end(), [now](const SynthState& s) { return now >= s.until; }), list.end());
+    return buttons;
+}
+
 void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, PadScript* script = nullptr)
 {
     // AUTOSTART is an explicit unattended test mode. Apply its START pulse to
@@ -841,6 +910,9 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
         shown = keyboardButtons;
     }
     const uint16_t player2Buttons = script ? ScriptButtons(*script, elapsedMs, 1, &stick2) : 0;
+    uint8_t stickN[4] = {};
+    const uint16_t playerNButtons[4] = { 0, 0, script ? ScriptButtons(*script, elapsedMs, 2, &stickN[2]) : uint16_t(0),
+                                          script ? ScriptButtons(*script, elapsedMs, 3, &stickN[3]) : uint16_t(0) };
     if (script && script->active) autoStart = true;        // keep pad 0 connected for the script
     polling.keyboardEverPressed |= keyboardButtons != 0 || keyboard.leftTrigger || keyboard.rightTrigger;
     XINPUT_STATE sampled[4]{};
@@ -883,9 +955,26 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
         for (int user = 0; user < 4; ++user)
             if (!claimed(user)) { polling.guestOf[i] = user; break; }
     }
-    // Users 1-3 sign in as guests on their controller's first use (player 2's scripted presses count).
+    // Online 2v2 host: the partner's controller is user 1's (online_2v2.cpp), with presses the port makes for it
+    // (online2v2::SynthPress: joining the room, its character picked at character select).
+    // The partner's controller stays connected as user 1 while the team lasts (a pair's second controller going away
+    // would drop it from the pair), neutral outside fights (online2v2::ForwardRemote).
+    XboxPadState remote{};
+    const bool teamHost = online2v2::CurrentRole() == online2v2::Role::Host && online2v2::Teammate();
+    if (online2v2::PadData mate; online2v2::RemotePad(mate) && online2v2::ForwardRemote())
+        remote.Gamepad = XboxPadData{ mate.wButtons, mate.bLeftTrigger, mate.bRightTrigger, mate.sThumbLX, mate.sThumbLY, mate.sThumbRX,
+                                      mate.sThumbRY };
+    remote.Gamepad.wButtons |= SynthButtons(1, elapsedMs);
+    const bool remoteOn = teamHost;
+    // Users 1-3 sign in as guests on their controller's first use (player 2's scripted presses count, and the
+    // 2v2 partner's).
     uint32_t used = (script && script->player2 && player2Buttons) ? 2u : 0u;
-    for (DWORD i = 0; i < 4; ++i)
+    for (uint32_t u = 2; u < 4; ++u)
+        if (script && (script->extraPlayers >> u & 1) && playerNButtons[u]) used |= 1u << u;
+    // An online 2v2 host's guest is there from the moment the team is (no press needed: the room counts this machine's
+    // players when it is entered).
+    if (online2v2::CurrentRole() != online2v2::Role::None && online2v2::Teammate()) used |= 2u;   // and a partner's: its PAIR select
+    for (uint32_t i = 0; i < 4; ++i)
         if (polling.guestOf[i] > 0) used |= 1u << polling.guestOf[i];
     if (const uint32_t added = used & ~g_usedUsers.fetch_or(used))
         for (uint32_t user = 1; user < 4; ++user)
@@ -914,6 +1003,27 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
         {
             state = sampled[source[user]];
             caps = hostCaps[source[user]];
+        }
+        if (user == 1 && remoteOn)
+        {
+            state = remote;
+            caps.Type = XboxPadDeviceType;
+            caps.SubType = XboxPadDeviceSubtype;
+            caps.Gamepad.wButtons = 0xF3FF;
+            caps.Gamepad.bLeftTrigger = caps.Gamepad.bRightTrigger = 255;
+            connected = true;
+        }
+        if (user >= 2 && script && (script->extraPlayers >> user & 1))
+        {
+            state.Gamepad.wButtons |= playerNButtons[user];
+            ApplyScriptStick(state, stickN[user]);
+            caps.Gamepad.wButtons |= 0xF33F;
+            if (!physical)
+            {
+                connected = true;
+                caps.Type = XINPUT_DEVTYPE_GAMEPAD;
+                caps.SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+            }
         }
         if (user == 1 && script && script->player2)
         {
@@ -946,6 +1056,94 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
                 caps.Type = XINPUT_DEVTYPE_GAMEPAD;
                 caps.SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
             }
+            {
+                const XboxPadData& g = state.Gamepad;           // an online 2v2 partner's controller goes to its host
+                online2v2::PartnerPadPolled(online2v2::PadData{ g.wButtons, g.bLeftTrigger, g.bRightTrigger, g.sThumbLX, g.sThumbLY, g.sThumbRX,
+                                                                g.sThumbRY });
+            }
+            // The online PAIR PLAY screen: this PC's controller goes to the room host (before the port's own presses join
+            // it: the host's played back presses must not count again). Always seen, so a button already down when the
+            // screen opens (the host's A on TEAMS) is no press on it.
+            {
+                // the left stick steps sideways as the d-pad does (the screen's LEFT / RIGHT take both)
+                uint16_t keys = state.Gamepad.wButtons;
+                if (state.Gamepad.sThumbLX < -16000) keys |= 0x0004;
+                if (state.Gamepad.sThumbLX > 16000) keys |= 0x0008;
+                online2v2::PlacesLocalPad(keys);
+            }
+            // An online 2v2 host plays with its partner's delay (online2v2::EvenDelayMs): its own controller's state from
+            // that long ago.
+            {
+                static std::deque<std::pair<int64_t, XboxPadData>> history;
+                const int64_t now = SynthClockMs();
+                history.push_back({ now, state.Gamepad });
+                while (history.size() > 1 && now - history[1].first > 300) history.pop_front();
+                if (const int delay = online2v2::EvenDelayMs(); delay > 0)
+                {
+                    XboxPadData past = history.front().second;
+                    for (const auto& [t, g] : history)
+                        if (now - t >= delay) past = g;
+                    state.Gamepad = past;
+                }
+            }
+            // A partner watching its match: its controller plays on its host's game, not on this one (here B would
+            // leave the session) - only START (game chat) and BACK (the log's size) stay, as the spectator's key hints
+            // say; presses the port makes for it still count (online2v2::SynthPress).
+            if (online2v2::MaskLocalPad())
+            {
+                const uint16_t kept = state.Gamepad.wButtons & uint16_t(0x0010 | 0x0020);
+                state.Gamepad = XboxPadData{};
+                state.Gamepad.wButtons = kept | SynthButtons(0, elapsedMs);
+            }
+            else state.Gamepad.wButtons |= SynthButtons(0, elapsedMs);
+        }
+        // A 2v2 partner's character select (online2v2::PartnerSelectRemap): its own controller picks the second character
+        // (user 1); user 0, the first player, gets only the presses that mirror its leader's pick.
+        static XboxPadData partnerOwn{};
+        if (online2v2::PartnerSelectRemap())
+        {
+            if (user == 0)
+            {
+                partnerOwn = state.Gamepad;
+                partnerOwn.wButtons &= uint16_t(~SynthButtons(0, elapsedMs));
+                state.Gamepad = XboxPadData{};
+                state.Gamepad.wButtons = SynthButtons(0, elapsedMs);
+            }
+            else if (user == 1)
+            {
+                state.Gamepad = partnerOwn;
+                // its team's stage choice is the leader's (online2v2::PartnerStageHold): only START / BACK stay - a
+                // safeguard, the stage step reads only user 0's slot (9 + side) here
+                if (online2v2::PartnerStageHold())
+                {
+                    const uint16_t kept = state.Gamepad.wButtons & uint16_t(0x0010 | 0x0020);
+                    state.Gamepad = XboxPadData{};
+                    state.Gamepad.wButtons = kept;
+                }
+                state.Gamepad.wButtons |= SynthButtons(1, elapsedMs);
+                caps.Type = XboxPadDeviceType;
+                caps.SubType = XboxPadDeviceSubtype;
+                caps.Gamepad.wButtons = 0xF3FF;
+                caps.Gamepad.bLeftTrigger = caps.Gamepad.bRightTrigger = 255;
+                connected = true;
+            }
+        }
+        // The online PAIR PLAY screen (online2v2::PlacesActive): the game's controllers 1-4 are the room's members - it
+        // sees only the presses every PC plays for them, the others none.
+        if (online2v2::PlacesActive())
+        {
+            state = XboxPadState{};
+            connected = false;
+            if (int(user) < online2v2::PlacesControllers())
+            {
+                state.Gamepad.wButtons = SynthButtons(user, elapsedMs);
+                caps = XboxPadCapabilities{};
+                caps.Type = XboxPadDeviceType;
+                caps.SubType = XboxPadDeviceSubtype;
+                caps.Gamepad.wButtons = 0xF3FF;
+                caps.Gamepad.bLeftTrigger = caps.Gamepad.bRightTrigger = 255;
+                connected = true;
+            }
         }
         PublishPad(user, connected, physical, state, caps);
     }
@@ -960,6 +1158,7 @@ static bool AutoStartEnabled(const char* value)
 
 void PadPollThread()
 {
+    DiagNameThread(L"pad-poll");
     PadPollState polling;
     const bool autoStart = AutoStartEnabled(std::getenv("TTT2_AUTOSTART"));
     std::fprintf(stderr, "[input] automatic Start %s\n", autoStart ? "enabled" : "disabled");
@@ -1192,4 +1391,25 @@ PPC_FUNC(__imp__RtlUnicodeToMultiByteN)
     }
     if (written) GWrite32(base, written, n);
     ctx.r3.u32 = 0;
+}
+
+void online2v2::SynthPress(uint32_t user, uint16_t buttons, int holdMs, int delayMs)
+{
+    std::lock_guard l(g_synthLock);
+    const int64_t from = SynthClockMs() + delayMs;
+    g_synth[user & 3].push_back({ buttons, from, from + holdMs });
+}
+
+uint16_t online2v2::PadButtons(uint32_t user)
+{
+    if (user > 3) return 0;
+    std::lock_guard lk(g_pads[user].m);
+    return g_pads[user].state.Gamepad.wButtons;
+}
+
+// Every press the port still had to make (the online PAIR PLAY screen closed: its last ones must not reach the room).
+void online2v2::SynthClear()
+{
+    std::lock_guard l(g_synthLock);
+    for (auto& list : g_synth) list.clear();
 }

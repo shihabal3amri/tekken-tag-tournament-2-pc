@@ -36,6 +36,10 @@ struct AudioOutputStats
     uint32_t queued = 0;
     uint32_t deviceQueued = 0;
     uint32_t renderCredits = 0;
+    uint32_t engineGlitches = 0;    // XAudio2's mixing passes that missed their deadline (all clients)
+    uint32_t engineLatency = 0;     // XAudio2's latency, samples
+    uint64_t maxPassGapUs = 0;      // since the previous Stats(): the longest time between two of XAudio2's passes
+    uint32_t latePasses = 0;        //   over this voice, and the gaps over 20 ms (XAudio2 mixes 10 ms a pass)
     bool ready = false;
     bool started = false;
     bool failed = false;
@@ -56,8 +60,9 @@ public:
     // One initial prefill credit per frame, then one credit per device buffer
     // completion. Failed devices fall back to a monotonic 48kHz silent clock.
     bool TryAcquireRenderCredit(uint64_t nowNs);
+    uint32_t Queued() const;                     // frames handed over and not yet played
     void Close();
-    AudioOutputStats Stats() const;
+    AudioOutputStats Stats() const;              // takes (clears) the pass gap fields: once per [snd-output] line
 
 private:
     std::shared_ptr<AudioOutputState> state_;

@@ -28,6 +28,8 @@ const (
 	MatchEvent   = 16 // only to a server whose WELCOME has flag bit 3 (matches are recorded)
 	FilePut      = 17 // FilePut, FileGet: only to a server whose WELCOME has flag bit 4 (player files are kept)
 	FileGet      = 18
+	OwnRanks     = 19 // OwnRanks, FileDel: only to a server whose WELCOME has flag bit 5 (the ranks are its own)
+	FileDel      = 20
 	Welcome      = 101
 	Error        = 102
 	Pong         = 103

@@ -39,6 +39,8 @@
 #include <mutex>
 #include <thread>
 
+namespace online2v2 { bool PairMode(); }   // online_2v2_pair.cpp: PAIR PLAY's pages are open
+
 namespace steamnet {
 namespace {
 
@@ -492,9 +494,13 @@ void RemoveLobby(uint64_t sessionId)
     g_out.Frame(kRemove, head, 8);
 }
 
+// The search the game makes: PAIR PLAY's lobbies when its PAIR PLAY pages are open (online_2v2_pair.cpp) - the helper
+// is told with the request's top bit of `max`.
+constexpr uint32_t kListPair = 0x80000000u;
 std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs)
 {
-    if (g_inproc) return direct::ListLobbies(max, timeoutMs);
+    const bool pair = online2v2::PairMode();
+    if (g_inproc) return direct::ListLobbies(max, timeoutMs, pair);
     std::vector<std::vector<uint8_t>> out;
     if (!g_running) { static std::atomic<int> logged{ 0 }; NoteStopped("a lobby search", logged); return out; }
     uint32_t request;
@@ -504,7 +510,7 @@ std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs)
     }
     uint8_t body[12];
     Put32(body, request);
-    Put32(body + 4, uint32_t(max));
+    Put32(body + 4, uint32_t(max) | (pair ? kListPair : 0u));
     Put32(body + 8, uint32_t(timeoutMs));
     if (!g_out.Frame(kList, body, 12)) return out;
     std::unique_lock l(g_mutex);
@@ -623,6 +629,7 @@ void ModuleOf(const void* addr, char* out, size_t n, uintptr_t& offset)
         const DWORD len = GetModuleFileNameW(mod, path, MAX_PATH);
         const wchar_t* name = path;
         for (DWORD i = 0; i < len; ++i) if (path[i] == L'\\' || path[i] == L'/') name = path + i + 1;
+        // %ls: a module name above U+00FF (log_utf8.h) only leaves "" here, which the callers print as "?".
         std::snprintf(out, n, "%ls", name);
         offset = uintptr_t(addr) - uintptr_t(mod);
     }
@@ -820,9 +827,11 @@ int RunBridge(int argc, char** argv)
         else if (type == kList && p.size() >= 12)
         {
             const uint32_t request = Get32(p.data());
-            const int max = int(Get32(p.data() + 4)), timeoutMs = int(Get32(p.data() + 8));
-            std::thread([request, max, timeoutMs] {
-                const auto records = direct::ListLobbies(max, timeoutMs);
+            const uint32_t maxWord = Get32(p.data() + 4);
+            const int max = int(maxWord & ~kListPair), timeoutMs = int(Get32(p.data() + 8));
+            const bool pair = (maxWord & kListPair) != 0;
+            std::thread([request, max, timeoutMs, pair] {
+                const auto records = direct::ListLobbies(max, timeoutMs, pair);
                 std::vector<uint8_t> body(8);
                 Put32(body.data(), request);
                 Put32(body.data() + 4, uint32_t(records.size()));

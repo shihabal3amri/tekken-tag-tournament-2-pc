@@ -9,10 +9,12 @@
 #include "kernel_objects.h"
 #include "kernel_content.h"
 #include "save_store.h"
+#include "dlc_content.h"
 #include "profiles.h"
 #include "xlive.h"
 #include <cstring>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <unordered_map>
 
@@ -28,6 +30,8 @@ struct ContentEnumerator { uint32_t bufferBytes; std::vector<SaveContentRecord> 
 std::mutex g_contentMutex;
 std::unordered_map<uint32_t, ContentEnumerator> g_contentEnumerators;
 uint32_t g_nextContentHandle = CONTENT_HANDLE_BEGIN;
+// Save containers that failed to open, flush or close (unlock_all.cpp: did its save reach the disk).
+std::atomic<uint64_t> g_saveFailures{0};
 
 bool OptionalWord(uint32_t address) { return !address || XamGuestRange(address, 4); }
 uint32_t HResult(uint32_t result) { return result ? 0x80070000u | result : 0; }
@@ -84,7 +88,7 @@ bool TryCloseContentEnumerator(uint32_t handle, uint32_t& status)
 void RollbackNoteIo(bool frameOnly, const char* op = "", const PPCContext* ctx = nullptr);   // rollback.cpp: no rewind across a save's I/O
 void RollbackSaveOpen(bool open);   // rollback.cpp: a save container opened / closed (rewinds wait for the save)
 int32_t RollbackSaveJournalFrame(); // rollback.cpp: the frame of a save a rewind may still re-simulate, else -1
-
+void RollbackSaveJobMark(const char* what, bool request, double ms);   // rollback.cpp: the save job's timeline (log only)
 PPC_FUNC(__imp__XamContentCreateEnumerator)
 {
     KTrace("XamContentCreateEnumerator");
@@ -101,6 +105,7 @@ PPC_FUNC(__imp__XamContentCreateEnumerator)
     std::vector<SaveContentRecord> records;
     if(ctx.r5.u32==1)if(uint32_t e=SaveListContent(records)){
         std::fprintf(stderr,"[content] enumerate type=%u -> error %u\n",ctx.r5.u32,e);ctx.r3.u32=e;return;}
+    if(ctx.r5.u32==dlc::kContentType)records=dlc::List();      // the player's own downloadable content
     std::fprintf(stderr,"[content] enumerate user=%u device=%u type=%u count=%u -> %zu records\n",
                  ctx.r3.u32,ctx.r4.u32,ctx.r5.u32,ctx.r7.u32,records.size());
     std::lock_guard lock(g_contentMutex);
@@ -152,7 +157,10 @@ PPC_FUNC(__imp__XamEnumerate)
 
 // The ninth argument (overlapped) follows the qword in r10 at caller SP+0x54.
 PPC_FUNC(__imp__XamContentCreateEx)
-{ RollbackSaveOpen(true); RollbackNoteIo(false, "XamContentCreateEx");
+{
+    // Downloadable content (type 2, dlc_content.h) is read-only and no save: no save bookkeeping for rewinds.
+    const bool dlcRecord=XamGuestRange(ctx.r5.u32,CONTENT_RECORD_BYTES)&&GRead32(base,ctx.r5.u32+4)==dlc::kContentType;
+    if(!dlcRecord){RollbackSaveJobMark("container create", false, -1); RollbackSaveOpen(true); RollbackNoteIo(false, "XamContentCreateEx");}
     KTrace("XamContentCreateEx");
     if (!XamGuestRange(ctx.r1.u32, 0x58) || !OptionalWord(ctx.r7.u32) ||
         !OptionalWord(ctx.r8.u32) || !XamGuestRange(ctx.r4.u32, 1, 1) ||
@@ -167,10 +175,19 @@ PPC_FUNC(__imp__XamContentCreateEx)
     std::memcpy(record.data(),base+ctx.r5.u32,record.size());
     if(ctx.r3.u32!=0)result=XAM_NO_SUCH_USER;
     else if(!ContentRoot(base,ctx.r4.u32,root))result=XAM_INVALID_PARAMETER;
+    else if(dlcRecord) {
+        result=dlc::Open(root,record,ctx.r6.u32&15,disposition);
+        if(!result)GWrite32(base,ctx.r8.u32,0xFFFFFFFFu);          // licence mask: the player's own packages, all licences
+    }
     else {
-        // Online: a save in a frame a rewind may still re-simulate is copied first (save_store.cpp).
-        if(const int32_t frame=RollbackSaveJournalFrame(); frame>=0) SaveJournalCapture(record,frame);
+        // Online: a save in a frame a rewind may still re-simulate is journaled first (save_store.cpp).
+        if(const int32_t frame=RollbackSaveJournalFrame(); frame>=0){
+            const auto c0=std::chrono::steady_clock::now();
+            SaveJournalCapture(record,frame);
+            RollbackSaveJobMark("save journal copy done",false,std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-c0).count());
+        }
         result=SaveCreateContent(root,record,ctx.r6.u32&15,disposition);
+        RollbackSaveJobMark("container created",false,-1);
     }
     {
         // Record: device id @4, content type @8, display name (UTF-16BE) @12, file name @264.
@@ -179,20 +196,42 @@ PPC_FUNC(__imp__XamContentCreateEx)
                      root.c_str(),file,ctx.r6.u32&15,ctx.r6.u32,result,disposition);
     }
     GWrite32(base,ctx.r7.u32,disposition);
-    if (result != 0) RollbackSaveOpen(false);                  // nothing opened
+    if (result != 0 && !dlcRecord) { RollbackSaveOpen(false); g_saveFailures.fetch_add(1); }    // nothing opened
     ctx.r3.u32 = XamCompleteOverlapped(base, overlapped, result, disposition, HResult(result));
 }
 
-static void ContentCloseOrFlush(PPCContext& ctx,uint8_t* base,bool close)
+// true: `root` was a downloadable content mount (dlc_content.h) - read-only, no save bookkeeping.
+static bool ContentCloseOrFlush(PPCContext& ctx,uint8_t* base,bool close)
 {
     const uint32_t ov=ctx.r4.u32;std::string root;
-    if(uint32_t e=XamValidateOverlapped(base,ov)){ctx.r3.u32=e;return;}
-    uint32_t result=ContentRoot(base,ctx.r3.u32,root)?SaveCloseContent(root,close):XAM_INVALID_PARAMETER;
-    std::fprintf(stderr,"[content] %s root=%s -> %u\n",close?"close":"flush",root.c_str(),result);
+    if(uint32_t e=XamValidateOverlapped(base,ov)){ctx.r3.u32=e;return false;}
+    const bool named=ContentRoot(base,ctx.r3.u32,root);
+    const bool dlcRoot=named&&dlc::Close(root,close);
+    uint32_t result=dlcRoot?0:named?SaveCloseContent(root,close):XAM_INVALID_PARAMETER;
+    if(result&&!dlcRoot)g_saveFailures.fetch_add(1);
+    std::fprintf(stderr,"[content] %s root=%s -> %u%s\n",close?"close":"flush",root.c_str(),result,dlcRoot?" (dlc)":"");
     ctx.r3.u32=XamCompleteOverlapped(base,ov,result,0,HResult(result));
+    return dlcRoot;
 }
-PPC_FUNC(__imp__XamContentClose) { KTrace("XamContentClose");RollbackNoteIo(false, "XamContentClose");ContentCloseOrFlush(ctx,base,true);RollbackSaveOpen(false); }
-PPC_FUNC(__imp__XamContentFlush) { KTrace("XamContentFlush");RollbackNoteIo(false, "XamContentFlush");ContentCloseOrFlush(ctx,base,false); }
+uint64_t SaveFailures() { return g_saveFailures.load(); }
+static bool IsDlcRoot(uint8_t* base,uint32_t address)
+{
+    std::string root,host;
+    return ContentRoot(base,address,root)&&dlc::Resolve(root+":",host);
+}
+PPC_FUNC(__imp__XamContentClose)
+{
+    KTrace("XamContentClose");
+    if(IsDlcRoot(base,ctx.r3.u32)){ContentCloseOrFlush(ctx,base,true);return;}
+    RollbackNoteIo(false, "XamContentClose");ContentCloseOrFlush(ctx,base,true);RollbackSaveOpen(false);
+    RollbackSaveJobMark("container closed",false,-1);
+}
+PPC_FUNC(__imp__XamContentFlush)
+{
+    KTrace("XamContentFlush");
+    if(!IsDlcRoot(base,ctx.r3.u32))RollbackNoteIo(false, "XamContentFlush");
+    ContentCloseOrFlush(ctx,base,false);
+}
 PPC_FUNC(__imp__XamContentDelete)
 { RollbackNoteIo(false, "XamContentDelete");
     KTrace("XamContentDelete");const auto ov=ctx.r5.u32;

@@ -10,6 +10,7 @@
 #include <thread>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+void DiagNameThread(const wchar_t* name);   // kernel_thread.cpp (TEST ONLY)
 
 // --- Xex module queries. The recompiler already resolved the game's own calls, so these serve
 //     optional runtime probing; a fake module handle + "not found" for arbitrary procs is safe. ---
@@ -100,6 +101,7 @@ void KernelInstallTimeStampBundle(uint8_t* base)
     std::memset(cell, 0, 0x18);
     GWrite32(base, 0x82000720u, guest);
     std::thread([base, guest] {
+        DiagNameThread(L"clock-cell");
         const auto boot = std::chrono::steady_clock::now();
         for (;;)
         {

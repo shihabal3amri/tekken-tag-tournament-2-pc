@@ -4,7 +4,10 @@
 #define _WIN32_WINNT 0x0A00
 #endif
 #include <windows.h>
+void DiagNameThread(const wchar_t* name);   // kernel_thread.cpp (TEST ONLY)
 #include <xaudio2.h>
+#include <mmdeviceapi.h>
+#include <devicetopology.h>
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -13,6 +16,8 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cwchar>
+#include <cwctype>
 #include <deque>
 #include <mutex>
 #include <thread>
@@ -64,6 +69,11 @@ struct VoiceEvents final : IXAudio2VoiceCallback
     explicit VoiceEvents(AudioOutputState* owner) : owner(owner) {}
     AudioOutputState* owner;
     std::atomic<HRESULT> error{S_OK};
+    // XAudio2's pass starts on this voice, written in OnVoiceProcessingPassStart only; Stats() takes and clears
+    // the last two.
+    std::atomic<int64_t> lastPassNs{0};
+    std::atomic<uint64_t> maxPassGapUs{0};
+    std::atomic<uint32_t> latePasses{0};
     void STDMETHODCALLTYPE OnVoiceProcessingPassStart(UINT32 bytesRequired) override;
     void STDMETHODCALLTYPE OnVoiceProcessingPassEnd() override {}
     void STDMETHODCALLTYPE OnStreamEnd() override {}
@@ -71,6 +81,15 @@ struct VoiceEvents final : IXAudio2VoiceCallback
     void STDMETHODCALLTYPE OnBufferEnd(void* context) override;
     void STDMETHODCALLTYPE OnLoopEnd(void*) override {}
     void STDMETHODCALLTYPE OnVoiceError(void*, HRESULT hr) override { error.store(hr); WakeOutputWorker(); }
+};
+
+// 0.1.8 TEST 17: only OnCriticalError is used; the output worker logs it (no logging on XAudio2's thread).
+struct EngineEvents final : IXAudio2EngineCallback
+{
+    std::atomic<HRESULT> error{S_OK};
+    void STDMETHODCALLTYPE OnProcessingPassStart() override {}
+    void STDMETHODCALLTYPE OnProcessingPassEnd() override {}
+    void STDMETHODCALLTYPE OnCriticalError(HRESULT hr) override { error.store(hr); WakeOutputWorker(); }
 };
 } // namespace
 
@@ -94,6 +113,9 @@ struct AudioOutputState
     ~AudioOutputState() { if (dump) std::fclose(dump); }
 };
 
+// XAudio2's performance data, read by the output worker after each pass (AudioOutputStats).
+static std::atomic<uint32_t> g_engineGlitches{0}, g_engineLatency{0};
+
 // Diagnostic capture of what each render client submits: TTT2_AUDIO_DUMP=<path prefix> writes
 // <prefix>_<driver>.f32, raw little-endian float32, 6 interleaved channels, 48 kHz.
 static std::FILE* OpenAudioDump(uint32_t driver)
@@ -107,9 +129,122 @@ static std::FILE* OpenAudioDump(uint32_t driver)
     return f;
 }
 
+// 0.1.8 TEST 17: what the sound plays into, once when XAudio2 has opened the device. The tester hears stutter that
+// no counter here shows (TEST 16 logs 48-51: starved=0, engine_glitches=0, NUSound underruns only at loads), so:
+// the default output's kind (speakers, headphones, HDMI/DisplayPort, SPDIF, headset...), its adapter (the driver's
+// name, e.g. "NVIDIA High Definition Audio", or just "Bluetooth" - never the endpoint's own name, which the user can
+// edit, nor a Bluetooth device's, often its owner's), the format
+// Windows mixes for it (Sound control panel: Default Format) and what XAudio2's mastering voice mixes. MEASURED
+// (scratch harness, dev PC, 2.2-2.7 ms once): a virtual headphones device, format 8ch 96000Hz 24bit, XAudio2 mixes
+// 8 channels at 96000Hz - so engine_latency's ~3800 samples there are ~39 ms; the tester's ~1800 are ~38 ms only if
+// their device runs at 48 kHz (inferred; this line will say).
+// The keys as mmdeviceapi.h / functiondiscoverykeys_devpkey.h define them: no SDK library defines the first and the
+// last (uuid.lib, in CMake's default libraries, has only the adapter name's), so like the float subtype below all
+// three are spelled out.
+static const PROPERTYKEY ENDPOINT_FORM_FACTOR_KEY = {{0x1da5d803, 0xd492, 0x4edd, {0x8c, 0x23, 0xe0, 0xc0, 0xff, 0xee, 0x7f, 0x0e}}, 0};
+static const PROPERTYKEY ADAPTER_NAME_KEY = {{0x026e516e, 0xb814, 0x414b, {0x83, 0xcd, 0x85, 0x6d, 0x6f, 0xef, 0x48, 0x22}}, 2};
+static const PROPERTYKEY DEVICE_FORMAT_KEY = {{0xf19f064d, 0x082c, 0x4e27, {0xbc, 0x73, 0x68, 0x82, 0xa1, 0xbb, 0x8e, 0x4c}}, 0};
+
+// Whether the endpoint's adapter is a Bluetooth device: its connector leads to a device interface the Bluetooth stack
+// enumerated (BTHENUM: A2DP, BTHHFENUM: hands-free, BTHLE...: LE Audio). Such a name is the one the device was given
+// ("AirPods de Juan", "Max's AirPods"), so it is not logged.
+static bool BluetoothEndpoint(IMMDevice* device)
+{
+    bool bluetooth = false;
+    IDeviceTopology* topology = nullptr;
+    IConnector* connector = nullptr;
+    LPWSTR id = nullptr;
+    if (SUCCEEDED(device->Activate(__uuidof(IDeviceTopology), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&topology))) &&
+        SUCCEEDED(topology->GetConnector(0, &connector)) && SUCCEEDED(connector->GetDeviceIdConnectedTo(&id)) && id)
+    {
+        for (wchar_t* c = id; *c; ++c) *c = wchar_t(std::towupper(*c));
+        bluetooth = std::wcsstr(id, L"BTH") != nullptr;
+    }
+    if (id) CoTaskMemFree(id);
+    if (connector) connector->Release();
+    if (topology) topology->Release();
+    return bluetooth;
+}
+
+// On the output worker, which CoInitializeEx'd itself (MTA) in Initialize. What cannot be read prints "unknown".
+static void LogOutputDevice(IXAudio2MasteringVoice* master)
+{
+    static const char* const FORMS[] = {"remote network device", "speakers", "line level", "headphones",
+        "microphone", "headset", "handset", "digital passthrough", "SPDIF", "HDMI/DisplayPort", "unknown"};
+    const char* form = "unknown";
+    char adapter[128] = "unknown";
+    char format[48] = "unknown";
+    IMMDeviceEnumerator* enumerator = nullptr;
+    IMMDevice* device = nullptr;
+    IPropertyStore* store = nullptr;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, IID_PPV_ARGS(&enumerator))) &&
+        SUCCEEDED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device)) &&
+        SUCCEEDED(device->OpenPropertyStore(STGM_READ, &store)))
+    {
+        PROPVARIANT value;
+        PropVariantInit(&value);
+        if (SUCCEEDED(store->GetValue(ENDPOINT_FORM_FACTOR_KEY, &value)) && value.vt == VT_UI4 && value.ulVal < std::size(FORMS))
+            form = FORMS[value.ulVal];
+        PropVariantClear(&value);
+        if (BluetoothEndpoint(device))
+            std::snprintf(adapter, sizeof(adapter), "Bluetooth (its name is not logged)");
+        else if (SUCCEEDED(store->GetValue(ADAPTER_NAME_KEY, &value)) && value.vt == VT_LPWSTR && value.pwszVal)
+        {
+            // In case a Bluetooth device got past the check above, whose name is often its owner's ("Name's AirPods"):
+            // from the last apostrophe (0x27 or the typographic 0x2019) on, after a '*'.
+            const wchar_t* name = value.pwszVal;
+            for (const wchar_t* c = value.pwszVal; *c; ++c)
+                if (*c == 0x27 || *c == 0x2019) name = c;
+            const int cut = name != value.pwszVal;
+            adapter[0] = '*';
+            if (!WideCharToMultiByte(CP_UTF8, 0, name, -1, adapter + cut, int(sizeof(adapter)) - 1 - cut, nullptr, nullptr))
+                std::snprintf(adapter, sizeof(adapter), "unknown");
+        }
+        PropVariantClear(&value);
+        if (SUCCEEDED(store->GetValue(DEVICE_FORMAT_KEY, &value)) && value.vt == VT_BLOB && value.blob.pBlobData &&
+            value.blob.cbSize >= sizeof(WAVEFORMATEX))
+        {
+            const auto* wave = reinterpret_cast<const WAVEFORMATEX*>(value.blob.pBlobData);
+            std::snprintf(format, sizeof(format), "%uch %luHz %ubit", unsigned(wave->nChannels),
+                          (unsigned long)wave->nSamplesPerSec, unsigned(wave->wBitsPerSample));
+        }
+        PropVariantClear(&value);
+    }
+    if (store) store->Release();
+    if (device) device->Release();
+    if (enumerator) enumerator->Release();
+    XAUDIO2_VOICE_DETAILS details{};
+    master->GetVoiceDetails(&details);
+    DWORD mask = 0;
+    master->GetChannelMask(&mask);
+    std::fprintf(stderr, "[snd-output] output device: %s, adapter \"%s\", format %s; XAudio2 mixes %u channels (mask %08lX) at %uHz\n",
+                 form, adapter, format, details.InputChannels, (unsigned long)mask, details.InputSampleRate);
+}
+
 namespace {
+// 0.1.8 TEST 17: when XAudio2's passes come. It mixes 10 ms a pass (XAUDIO2_QUANTUM_DENOMINATOR 100 in xaudio2.h,
+// SDK 10.0.26100). MEASURED (scratch probe, dev PC, a voice like ours, 30 s): 3001 pass starts, mean gap 10.0 ms,
+// longest 11.9 ms, none in pairs, none over 20 ms. A gap over LATE_PASS_US = that pass came at least a pass late.
+// MEASURED (scratch harness on this file, dev PC): every other thread, XAudio2's included, stalled for 25 / 60 /
+// 150 ms gave max_pass_gap_us 45913 / 69271 / 159471, pass_gaps_over_20ms 1 each - and engine_glitches stayed 0,
+// so XAudio2's own count does not show a late pass. Each [snd-output] line prints the longest gap and the late
+// count since the line before (per voice; every voice sees the same passes).
+constexpr uint64_t LATE_PASS_US = 20000;
+
 void VoiceEvents::OnVoiceProcessingPassStart(UINT32 bytesRequired)
 {
+    // Every pass, first: one clock read and relaxed atomics, no lock (MEASURED ~19 ns a call on the dev PC).
+    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    const int64_t last = lastPassNs.load(std::memory_order_relaxed);
+    lastPassNs.store(now, std::memory_order_relaxed);
+    if (last)
+    {
+        const uint64_t gapUs = uint64_t(now - last) / 1000;
+        uint64_t longest = maxPassGapUs.load(std::memory_order_relaxed);
+        while (gapUs > longest && !maxPassGapUs.compare_exchange_weak(longest, gapUs, std::memory_order_relaxed)) {}
+        if (gapUs > LATE_PASS_US) latePasses.fetch_add(1, std::memory_order_relaxed);
+    }
     if (!bytesRequired) return;
     std::lock_guard lock(owner->mutex);
     if (owner->stats.started && !owner->closing && !owner->stats.failed)
@@ -153,7 +288,13 @@ void DiscardFrames(AudioOutputState& state)
 class AudioOutputSystem
 {
 public:
-    AudioOutputSystem() { std::thread([this] { Run(); }).detach(); }
+    AudioOutputSystem()
+    {
+        std::thread([this] {
+            SetThreadDescription(GetCurrentThread(), L"audio-output");     // DIAGNOSTIC BUILD (p72): per-thread report
+            Run();
+        }).detach();
+    }
 
     void Add(const std::shared_ptr<AudioOutputState>& state)
     {
@@ -176,6 +317,7 @@ private:
         if (SUCCEEDED(hr)) { operation = "XAudio2Create"; hr = XAudio2Create(&audio_); }
         if (SUCCEEDED(hr))
         {
+            audio_->RegisterForCallbacks(&engineEvents_);   // 0.1.8 TEST 17: OnCriticalError, logged by Run
             operation = "CreateMasteringVoice";
             hr = audio_->CreateMasteringVoice(&master_);
         }
@@ -188,6 +330,7 @@ private:
         }
         std::fprintf(stderr, "[snd-output] XAudio2 ready: 48000Hz float32, 6 channels, queue=%zu prime=%zu frames/client, completion pacing\n",
                      AUDIO_OUTPUT_QUEUE_FRAMES, AUDIO_OUTPUT_PRIME_FRAMES);
+        LogOutputDevice(master_);
     }
 
     void DestroySource(AudioOutputState& state)
@@ -296,6 +439,7 @@ private:
 
     void Run()
     {
+        DiagNameThread(L"audio-output");
         Initialize();
         for (;;)
         {
@@ -309,6 +453,18 @@ private:
                     std::lock_guard stateLock(state->mutex); return state->closed;
                 });
             }
+            // 0.1.8 TEST 14: a tester hears the sound stutter while our queue never ran short (log 44:
+            // starved=0, queued 7-8) - a mixing pass that misses its deadline is counted only here.
+            if (audio_)
+            {
+                XAUDIO2_PERFORMANCE_DATA perf{};
+                audio_->GetPerformanceData(&perf);
+                g_engineGlitches.store(perf.GlitchesSinceEngineStarted, std::memory_order_relaxed);
+                g_engineLatency.store(perf.CurrentLatencyInSamples, std::memory_order_relaxed);
+                // XAudio2's documentation: after a critical error it must be closed down and restarted (not done here).
+                if (const HRESULT error = engineEvents_.error.exchange(S_OK); FAILED(error))
+                    std::fprintf(stderr, "[snd-output] XAudio2 critical error hr=%08X (OnCriticalError)\n", unsigned(error));
+            }
             // Notifications received during processing remain visible, so a
             // submit cannot lose its wake and wait another whole audio quantum.
             workVersion_.wait(version);
@@ -317,6 +473,7 @@ private:
 
     IXAudio2* audio_ = nullptr;
     IXAudio2MasteringVoice* master_ = nullptr;
+    EngineEvents engineEvents_;
     std::mutex mutex_;
     std::atomic<uint64_t> workVersion_{0};
     std::vector<std::shared_ptr<AudioOutputState>> clients_;
@@ -402,10 +559,20 @@ bool AudioOutputClient::TryAcquireRenderCredit(uint64_t nowNs)
     return true;
 }
 
+uint32_t AudioOutputClient::Queued() const
+{
+    std::lock_guard lock(state_->mutex);
+    return state_->stats.queued;
+}
+
 AudioOutputStats AudioOutputClient::Stats() const
 {
     std::lock_guard lock(state_->mutex);
     auto result = state_->stats;
     result.renderCredits = state_->renderCredits;
+    result.engineGlitches = g_engineGlitches.load(std::memory_order_relaxed);
+    result.engineLatency = g_engineLatency.load(std::memory_order_relaxed);
+    result.maxPassGapUs = state_->events.maxPassGapUs.exchange(0, std::memory_order_relaxed);
+    result.latePasses = state_->events.latePasses.exchange(0, std::memory_order_relaxed);
     return result;
 }

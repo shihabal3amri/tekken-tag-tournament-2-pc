@@ -341,8 +341,10 @@ class ReadProcess:
         return b"".join(chunks)
 
     def resolve_guest_base(self, linker):
-        # An installed copy is renamed ("Tekken Tag Tournament 2.exe"); the PE timestamp below is the real check.
-        if Path(self.module["name"]).stem.lower() not in (linker["name"].lower(), "tekken tag tournament 2"):
+        # An installed copy is renamed ("Tekken Tag Tournament 2.exe", test copies "TTT2 mNNN.exe"); the PE timestamp below
+        # is the real check.
+        stem = Path(self.module["name"]).stem.lower()
+        if stem not in (linker["name"].lower(), "tekken tag tournament 2") and not stem.startswith(("ttt2 m", "ttt2 d")):
             raise ValueError("Map image name does not match process main module")
         header = self.read(self.module["base"], 64)
         if header[:2] != b"MZ":

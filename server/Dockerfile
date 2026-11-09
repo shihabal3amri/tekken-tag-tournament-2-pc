@@ -1,5 +1,5 @@
 # ttt2-server in a container (server/README.md "Docker"). Build from the server folder:
-#   docker build -t ttt2-server --build-arg VERSION=0.1.7 .
+#   docker build -t ttt2-server --build-arg VERSION=0.1.8 .
 # Run with a folder for server.toml and data/ (the first start writes server.toml and stops - edit it, start again):
 #   docker run -it --name ttt2 -p 28200:28200/tcp -p 28200:28200/udp -v /srv/ttt2:/srv/ttt2 ttt2-server
 # -it keeps the admin console (docker attach ttt2; detach with Ctrl+P Ctrl+Q); without it, admin commands go through

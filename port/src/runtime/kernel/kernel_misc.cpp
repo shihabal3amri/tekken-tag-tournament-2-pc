@@ -16,6 +16,9 @@
 #include <unordered_map>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+uint64_t DiagMainOffBegin();                // kernel_thread.cpp (DIAGNOSTIC BUILD, p72): the main thread's waits
+void DiagMainOffEnd(int kind, uint64_t t0);
+double DiagMainWaitMs(uint64_t t0);         // kernel_thread.cpp (TEST 13: [mainwait])
 
 PPC_FUNC(__imp__KeGetCurrentProcessType)
 {
@@ -106,6 +109,7 @@ static CsEntry& CsFor(uint32_t ga)
     return *e;
 }
 
+namespace sync_stats { extern std::atomic<uint64_t> g_csEnters, g_csContended; }
 PPC_FUNC(__imp__RtlInitializeCriticalSection)
 {
     KTrace("RtlInitializeCriticalSection");
@@ -123,8 +127,11 @@ PPC_FUNC(__imp__RtlEnterCriticalSection)
 {
     KTrace("RtlEnterCriticalSection");
     CsEntry& cs = CsFor(ctx.r3.u32);
+    static const bool stats = [] { const char* e = std::getenv("TTT2_SYNC_STATS"); return e && *e == '1'; }();
+    if (stats) ++sync_stats::g_csEnters;
     if (!cs.m.try_lock())
     {
+        if (stats) ++sync_stats::g_csContended;
         auto t0 = std::chrono::steady_clock::now();
         const unsigned long self = GetCurrentThreadId();
         {
@@ -137,7 +144,19 @@ PPC_FUNC(__imp__RtlEnterCriticalSection)
             return true;
         }();
         (void)watch;
+        const uint64_t off0 = DiagMainOffBegin();
         cs.m.lock();
+        DiagMainOffEnd(2, off0);
+        // TEST 13: the main thread's own over 50 ms ("[cs] slow acquire" below is shared with the job workers' idle
+        // waits, and those use up its 60 lines early in a session).
+        if (const double mainMs = DiagMainWaitMs(off0); mainMs >= 50.0)
+        {
+            static int mainLogged = 0;                // the main thread only
+            if (mainLogged++ < 200)
+                std::fprintf(stderr, "[mainwait] %.1f ms in RtlEnterCriticalSection cs=%08X lr=%08X: the section's last owner took it at %08X "
+                                     "(host thread %lu)\n", mainMs, ctx.r3.u32, (uint32_t)ctx.lr,
+                             cs.ownerLr.load(std::memory_order_relaxed), cs.ownerTid.load(std::memory_order_relaxed));
+        }
         {
             std::lock_guard l(g_csWaitLock);
             g_csWaiting.erase(self);

@@ -54,6 +54,7 @@ void Report()
                  (unsigned long long)s.resets, (unsigned long long)s.ringFull, (unsigned long long)s.loops,
                  (unsigned long long)s.sendErrors, (unsigned long long)s.decodeErrors,
                  (unsigned long long)s.badFrames);
+    g_xma.ReportMusic(stderr);
     static const bool voices = EnvIs("TTT2_XMA_LOG", "1");
     if (voices) g_xma.ReportVoices(stderr);
 }

@@ -88,6 +88,27 @@ inline uint32_t ReadBits(const uint8_t* data, uint32_t bit, uint32_t n)
     return v;
 }
 
+// Copies n bits, most significant first, from src at bit `from` to dst at bit `to`: whole bytes once dst is byte
+// aligned. Bit by bit, assembling and repacking frames cost as much as decoding them (~1.5% of the sound thread).
+inline void CopyBits(uint8_t* dst, uint32_t to, const uint8_t* src, uint32_t from, uint32_t n)
+{
+    auto copyBit = [&] {
+        const uint8_t mask = uint8_t(0x80u >> (to & 7));
+        if ((src[from >> 3] >> (7 - (from & 7))) & 1u) dst[to >> 3] |= mask;
+        else dst[to >> 3] &= uint8_t(~mask);
+        ++from, ++to, --n;
+    };
+    while (n && (to & 7)) copyBit();
+    const uint32_t bytes = n >> 3, shift = from & 7;
+    const uint8_t* s = src + (from >> 3);
+    uint8_t* d = dst + (to >> 3);
+    if (!shift) std::memcpy(d, s, bytes);
+    else
+        for (uint32_t i = 0; i < bytes; ++i) d[i] = uint8_t(s[i] << shift | s[i + 1] >> (8 - shift));
+    from += bytes * 8, to += bytes * 8, n -= bytes * 8;
+    while (n) copyBit();
+}
+
 // First frame start at or after `bit` (buffer coordinates), found by walking the length
 // prefixes from the first frame of the packet that holds it. Loop starts need not sit exactly
 // on a frame: a TTT2 ambience loop gives 0x664B for the frame at 0x664C (its sub-frame fields
@@ -181,6 +202,8 @@ public:
         h.index = index;
         h.engine = engine;
         h.lastKickMs = SteadyMs();
+        if (!h.winFirstMs) h.winFirstMs = h.lastKickMs, h.winFirstFill = true;
+        h.winLastMs = h.lastKickMs;
         ++h.totalKicks;
         ++stats_.kicks;
         uint32_t dw[10];
@@ -299,6 +322,29 @@ public:
             h.periodKicks = h.periodBlocks = h.periodStarved = h.periodNotValid = 0;
         }
     }
+    // The music (NUSound's busiest stereo voice since the last call): how fast its stream was decoded against
+    // the clock. Decoding stops when the voice's ring is full, so this is how fast the game played it: below
+    // 100% the music ran slow (no input in time, or NUSound mixed late: [snd-nus]). Skipped under 5 s of play.
+    void ReportMusic(std::FILE* out)
+    {
+        int best = -1;
+        for (uint32_t i = 0; i < kContextCount; ++i)
+            if (host_[i].engine == 1 && host_[i].channels == 2 && host_[i].winBlocks &&
+                (best < 0 || host_[i].winBlocks > host_[best].winBlocks))
+                best = int(i);
+        if (best >= 0)
+        {
+            const Host& h = host_[best];
+            const uint64_t spanMs = h.winLastMs - h.winFirstMs;
+            const double samples = double(h.winBlocks) * kBlockBytes / 4.0;   // stereo, 16-bit
+            const uint32_t rate = kRates[h.rateCode];
+            if (spanMs >= 5000)
+                std::fprintf(out, "[xma] music: voice %d %u Hz played at %.1f%% of real time over %.1f s (no input at %llu kicks)\n",
+                             best, rate, samples * 1000.0 / double(spanMs) / rate * 100.0, spanMs / 1000.0,
+                             (unsigned long long)h.winDry);
+        }
+        for (Host& h : host_) h.winBlocks = h.winDry = h.winFirstMs = h.winLastMs = 0, h.winFirstFill = false;
+    }
     void SetLogKicks(bool on) { logKicks_ = on; }
 
 private:
@@ -323,6 +369,10 @@ private:
         int logged = 0;
         // Per-voice activity since the last ReportVoices (diagnostics).
         uint64_t periodKicks = 0, periodBlocks = 0, periodStarved = 0, periodNotValid = 0;
+        // Since the last ReportMusic: blocks written after the first decode (the span runs from the first kick to
+        // the last), kicks that found room but no input, first and last kick.
+        uint64_t winBlocks = 0, winDry = 0, winFirstMs = 0, winLastMs = 0;
+        bool winFirstFill = false;
         int engine = 0;                 // 1 = NUSound kick, 2 = XAudio2 kick
         uint32_t lastDw[10] = {};
         // Lifetime (diagnostics): allocation, last kick, last kick that produced output.
@@ -390,13 +440,8 @@ private:
 
     void AppendBits(Host& h, const uint8_t* data, uint32_t bit, uint32_t n)
     {
-        for (uint32_t i = 0; i < n; ++i, ++bit, ++h.have)
-        {
-            const uint32_t b = (data[bit >> 3] >> (7 - (bit & 7))) & 1u;
-            uint8_t& out = h.frameBits[h.have >> 3];
-            const uint8_t mask = uint8_t(0x80u >> (h.have & 7));
-            out = b ? uint8_t(out | mask) : uint8_t(out & ~mask);
-        }
+        CopyBits(h.frameBits.data(), h.have, data, bit, n);
+        h.have += n;
     }
 
     // Walk the input bit stream to the end of the next frame (into h.frameBits). False when the
@@ -498,12 +543,7 @@ private:
             const uint32_t frames = sent ? 0 : 1, continuation = sent ? std::min(length - sent, 0x7FFFu) : 0;
             const uint32_t header = (frames << 26) | (continuation << 11);
             p[0] = uint8_t(header >> 24); p[1] = uint8_t(header >> 16); p[2] = uint8_t(header >> 8); p[3] = uint8_t(header);
-            for (uint32_t i = 0; i < n; ++i)
-            {
-                const uint32_t src = sent + i, dst = kPacketHeaderBits + i;
-                if (!((h.frameBits[src >> 3] >> (7 - (src & 7))) & 1u))
-                    p[dst >> 3] &= uint8_t(~(0x80u >> (dst & 7)));
-            }
+            CopyBits(p, kPacketHeaderBits, h.frameBits.data(), sent, n);
             const int r = avcodec_send_packet(h.codec, h.packet);
             if (r < 0)
             {
@@ -629,8 +669,10 @@ private:
         }
         stats_.bytesOut += written;
         h.periodBlocks += written / kBlockBytes;
+        if (h.winFirstFill) h.winFirstFill = false;
+        else h.winBlocks += written / kBlockBytes;
         if (written) h.lastOutputMs = SteadyMs();
-        if (!written && space >= kBlockBytes) ++h.periodStarved;   // room in the ring, no input
+        if (!written && space >= kBlockBytes) ++h.periodStarved, ++h.winDry;   // room in the ring, no input
         dw[0] = WithBits(dw[0], 27, 5, write / kBlockBytes);
         // A full ring reads as write == read; the hardware then drops "output valid" until the
         // title has consumed blocks and set it again.

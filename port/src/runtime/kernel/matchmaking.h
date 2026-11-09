@@ -29,6 +29,8 @@ struct SessionRecord
     uint32_t netcode = 0;
 };
 constexpr uint32_t kNetcodeKnown = 0x80000000u;
+// A PAIR PLAY session (online_2v2_pair.cpp): only PAIR PLAY's searches list it, Player Match's never do.
+constexpr uint32_t kPairRoom = 0x40000000u;
 
 void Publish(const SessionRecord& record);     // add or update (host)
 void Remove(uint64_t id);

@@ -21,8 +21,12 @@ bool ResolveSaveFile(const std::string& guest, std::filesystem::path& host,
 // File handles retain host ownership across close/read races. Implemented in I/O.
 uint32_t FlushSaveFiles(const std::filesystem::path& container, bool requireClosed);
 // Online rollback (save_store.cpp): a container opened in a frame a rewind may still re-simulate is
-// copied first; a rewind to that frame or before puts the files back; confirmed frames drop the copy.
+// journaled first (its file list; a file's bytes right before the save changes it); a rewind to that
+// frame or before puts the files back; confirmed frames drop the journal.
 void SaveJournalCapture(const SaveContentRecord& record, int32_t frame);
+// kernel_io.cpp: `file` in `container` is about to be written, truncated, deleted or replaced.
+void SaveJournalBeforeChange(const std::filesystem::path& container, const std::filesystem::path& file);
 int SaveJournalUndo(int32_t fromFrame);        // the number of saves undone
 void SaveJournalPrune(int32_t confirmedFrame);
 void SaveJournalClear();
+bool SaveJournalHas(int32_t frame);            // a save of that frame is journaled (TTT2_RB_KOREPLAY's line)

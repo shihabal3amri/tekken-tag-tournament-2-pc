@@ -19,7 +19,7 @@ import (
 	"ttt2-server/internal/wire"
 )
 
-const proto = "ttt2-port-10-rollback"
+const proto = "ttt2-port-13-rollback"
 
 type server struct {
 	h   *Hub
@@ -121,7 +121,19 @@ func (s *server) udpConn(t *testing.T) *net.UDPConn {
 	return u
 }
 
+// login logs in as the current game does: on a server whose ranks are its own (WELCOME flag bit 5) it says it takes
+// its rank from there (OWN_RANKS).
 func (s *server) login(t *testing.T, peer uint64, name string) *client {
+	t.Helper()
+	cl, flags := s.loginOld(t, peer, name)
+	if flags&32 != 0 {
+		cl.send(wire.OwnRanks, nil)
+	}
+	return cl
+}
+
+// loginOld logs in as a game from before "Ranks" (it never sends OWN_RANKS); the WELCOME flags.
+func (s *server) loginOld(t *testing.T, peer uint64, name string) (*client, uint8) {
 	t.Helper()
 	c, typ, r := s.handshake(t, hello, auth(peer, name, nil, ""))
 	if typ != wire.Welcome {
@@ -130,11 +142,11 @@ func (s *server) login(t *testing.T, peer uint64, name string) *client {
 	if r.U64() != peer {
 		t.Fatal("WELCOME peer")
 	}
-	r.U8()
+	flags := r.U8()
 	if r.Str() == "" || r.Err() != nil {
 		t.Fatal("WELCOME: flags, server name, region, message")
 	}
-	return &client{t: t, s: s, c: c, peer: peer}
+	return &client{t: t, s: s, c: c, peer: peer}, flags
 }
 
 func (cl *client) send(typ uint8, build func(*wire.Writer)) {

@@ -83,6 +83,9 @@ type Player struct {
 	frames, puts, lists, invites, gins, statWrites, statReadRate, arbs, logs, peerChecks, names bucket
 	matchEvents, matchOpens, filePuts, fileGets                                                 bucket
 	ownXUID                                                                                     uint64 // the online XUID the player's game reported (statistics), reader goroutine only
+	// The ranks are this server's own (config ranks = "server", told in WELCOME: fixed for the connection), and the
+	// game said it takes its own license from here (OWN_RANKS; an older game never does) - reader goroutine only.
+	serverRanks, ownRanks bool
 }
 
 type session struct {
@@ -533,6 +536,7 @@ func (h *Hub) login(c *tls.Conn, raw net.Conn, ip, prefix string) (*Player, erro
 	p := &Player{
 		Peer: peer, Name: CleanName(name), Proto: proto, Verified: verified, ip: ip, prefix: prefix, conn: c, raw: raw,
 		out: make(chan []byte, sendQueue), closed: make(chan struct{}), since: time.Now(),
+		serverRanks: h.keepsFiles() && cfg.Ranks == config.RanksServer,
 	}
 	h.mu.Lock()
 	old := h.players[peer]
@@ -573,6 +577,9 @@ func (h *Hub) login(c *tls.Conn, raw net.Conn, ip, prefix string) (*Player, erro
 	}
 	if h.keepsFiles() {
 		flags |= 16 // player files are kept: FILE_PUT, FILE_GET
+	}
+	if p.serverRanks {
+		flags |= 32 // the ranks are this server's own: OWN_RANKS, FILE_DEL ("Ranks")
 	}
 	w.U8(flags)
 	w.Str(cfg.Name)
@@ -773,7 +780,10 @@ func (h *Hub) frame(p *Player, typ uint8, payload []byte) error {
 				return nil
 			}
 			err := errors.New("not the XUID this connection uses")
-			if h.claimXUID(p, own) {
+			if p.serverRanks && !p.ownRanks {
+				// an older game plays with the rank on its PC: its ranked results never count here ("Ranks")
+				err = errors.New("the game does not take its rank from this server (an older version)")
+			} else if h.claimXUID(p, own) {
 				err = h.rankedRegister(p, session, opponent, now)
 			}
 			if err != nil {
@@ -850,6 +860,19 @@ func (h *Hub) frame(p *Player, typ uint8, payload []byte) error {
 			return h.filePut(p, &r, now)
 		}
 		return h.fileGet(p, &r, now)
+	case wire.OwnRanks, wire.FileDel:
+		// only to a server whose WELCOME says the ranks are its own (to any other an unknown frame type)
+		if !p.serverRanks {
+			return errors.New("the ranks are not this server's own")
+		}
+		if typ == wire.OwnRanks {
+			if len(r.B) != 0 {
+				return errors.New("bad OWN_RANKS")
+			}
+			p.ownRanks = true
+			return nil
+		}
+		return h.fileDel(p, &r, now)
 	case wire.InviteSend:
 		to, id := r.U64(), r.U64()
 		if r.Err() != nil {

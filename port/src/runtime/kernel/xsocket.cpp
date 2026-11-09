@@ -19,6 +19,7 @@
 #include "xlive.h"
 #include "xsocket_service.h"
 #include "title_server.h"
+#include "online_2v2.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -76,14 +77,33 @@ bool Trace() { static const bool on = std::getenv("TTT2_NET_TRACE") != nullptr; 
 // ---- wire format ----
 // TimeSync: rollback sessions' frame-advantage reports (rollback_session.cpp), never a socket's.
 // FileAsk / FileData: a player's license asked of the games connected to this one (title_server.cpp), never a socket's.
-enum class Op : uint8_t { Datagram = 1, Syn = 2, SynAck = 3, Reset = 4, Data = 5, Fin = 6, TimeSync = 7, FileAsk = 8, FileData = 9 };
+// Team2v2: online 2v2 between teammates (online_2v2.cpp), never a socket's.
+enum class Op : uint8_t { Datagram = 1, Syn = 2, SynAck = 3, Reset = 4, Data = 5, Fin = 6, TimeSync = 7, FileAsk = 8, FileData = 9,
+                          Team2v2 = 10 };
 #pragma pack(push, 1)
 struct Header { Op op; uint8_t proto; uint8_t toConnector; uint8_t pad; uint16_t srcPort, dstPort; uint32_t connId; };
 #pragma pack(pop)
 
+// Diagnostics (TTT2_2V2_DIAG=1, port/ONLINE_2V2_PLAN.md phase 0): packets per peer, direction and op, for
+// XSocketTrafficDiag (who talks to whom in a room of three or four).
+bool TrafficOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_2V2_DIAG"); return e && *e == '1'; }();
+    return on;
+}
+std::mutex g_trafficLock;
+std::map<std::pair<uint64_t, int>, uint32_t> g_traffic;         // (peer, +op sent / -op received) -> packets
+void CountTraffic(uint64_t peer, int op)
+{
+    if (!TrafficOn()) return;
+    std::lock_guard l(g_trafficLock);
+    ++g_traffic[{ peer, op }];
+}
+
 bool SendPacket(uint64_t peer, net::Channel channel, Op op, uint8_t proto, bool toConnector, uint16_t src, uint16_t dst,
                 uint32_t connId, const uint8_t* data, size_t size)
 {
+    CountTraffic(peer, int(op));
     thread_local std::vector<uint8_t> packet;
     packet.resize(sizeof(Header) + size);
     Header h{ op, proto, uint8_t(toConnector), 0, src, dst, connId };
@@ -109,8 +129,8 @@ void TraceBytes(const char* what, uint32_t handle, uint32_t addr, uint16_t port,
     char hex[4100] = {};
     int at = 0;
     for (int i = 0; i < n && i < limit; ++i) at += std::snprintf(hex + at, sizeof(hex) - at, "%02X", data[i]);
-    std::fprintf(stderr, "[xsocket] %s %08X %u.%u.%u.%u:%u %d bytes %s\n", what, handle, addr >> 24, (addr >> 16) & 0xFF,
-                 (addr >> 8) & 0xFF, addr & 0xFF, port, n, hex);
+    std::fprintf(stderr, "[xsocket] t=%llu %s %08X %u.%u.%u.%u:%u %d bytes %s\n", online2v2::DiagMs(), what, handle, addr >> 24,
+                 (addr >> 16) & 0xFF, (addr >> 8) & 0xFF, addr & 0xFF, port, n, hex);
 }
 
 uint16_t Ephemeral()
@@ -212,6 +232,29 @@ void FileReceive(uint64_t from, Op op, const uint8_t* p, size_t n)
     g_fileCv.notify_all();
 }
 
+// The match's peer: the one NACE's datagrams come from most, counted over a second (MEASURED 2026-10-24, a room of
+// three on loopback: the two fighters exchange ~60 a second each way, the room host feeds a spectator ~8, the other
+// pair ~2). It used to be the last sender of a datagram or a time-sync report, so a spectator took it over at times:
+// fighters took the spectator's time-sync reports ("depth -5.0 there") and slowed their clocks 6 %.
+std::mutex g_peerRateLock;
+std::map<uint64_t, uint32_t> g_peerRate;
+std::chrono::steady_clock::time_point g_peerRateStart;
+void NoteMatchDatagram(uint64_t from)
+{
+    std::lock_guard l(g_peerRateLock);
+    if (!g_timeSyncPeer.load()) g_timeSyncPeer.store(from);     // the first sender until a second is counted
+    ++g_peerRate[from];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_peerRateStart < std::chrono::seconds(1)) return;
+    uint64_t busiest = 0;
+    uint32_t most = 0;
+    for (const auto& [peer, count] : g_peerRate)
+        if (count > most) { most = count; busiest = peer; }
+    if (busiest) g_timeSyncPeer.store(busiest);
+    g_peerRate.clear();
+    g_peerRateStart = now;
+}
+
 // ---- incoming packets (transport thread) ----
 void Receive(uint64_t from, net::Channel, const uint8_t* data, size_t size)
 {
@@ -227,8 +270,8 @@ void Receive(uint64_t from, net::Channel, const uint8_t* data, size_t size)
     const size_t payloadSize = size - sizeof(h);
     if (h.op == Op::TimeSync)
     {
-        g_timeSyncPeer.store(from);
-        RollbackTimeSyncReceive(payload, payloadSize);
+        // Only the match peer's: a spectator in the room runs a session too, and its reports are not the opponent's.
+        if (from == g_timeSyncPeer.load()) RollbackTimeSyncReceive(payload, payloadSize);
         return;
     }
     if (h.op == Op::FileAsk || h.op == Op::FileData)
@@ -236,7 +279,13 @@ void Receive(uint64_t from, net::Channel, const uint8_t* data, size_t size)
         FileReceive(from, h.op, payload, payloadSize);
         return;
     }
-    if (h.op == Op::Datagram) g_timeSyncPeer.store(from);   // the match's peer (NACE's datagrams)
+    if (h.op == Op::Team2v2)
+    {
+        online2v2::Receive(from, payload, payloadSize);
+        return;
+    }
+    if (h.op == Op::Datagram) NoteMatchDatagram(from);       // the match's peer (NACE's datagrams)
+    CountTraffic(from, -int(h.op));
     std::lock_guard l(g_m);
     const uint32_t fromAddr = xlive::AddrOfPeer(from);
     if (Trace())
@@ -348,7 +397,32 @@ void Finish(uint64_t peer, uint32_t conn)
 } // namespace xsvc
 
 uint64_t XSocketMatchPeer() { return g_timeSyncPeer.load(); }
-void XSocketForgetMatchPeer() { g_timeSyncPeer.store(0); }
+// Packets since the last call, per peer: "peer: sent op=n ... received op=n ..." (TTT2_2V2_DIAG=1).
+std::string XSocketTrafficDiag()
+{
+    std::map<std::pair<uint64_t, int>, uint32_t> t;
+    {
+        std::lock_guard l(g_trafficLock);
+        t.swap(g_traffic);
+    }
+    std::string out;
+    uint64_t last = 0;
+    for (const auto& [key, count] : t)
+    {
+        char b[64];
+        if (key.first != last) { std::snprintf(b, sizeof(b), "%s %016llX:", out.empty() ? "" : ";", (unsigned long long)key.first); out += b; last = key.first; }
+        std::snprintf(b, sizeof(b), " %s%d=%u", key.second > 0 ? "tx" : "rx", key.second > 0 ? key.second : -key.second, count);
+        out += b;
+    }
+    out += "; match peer " + std::to_string(g_timeSyncPeer.load() & 0xFFFF);
+    return out;
+}
+void XSocketForgetMatchPeer()
+{
+    std::lock_guard l(g_peerRateLock);
+    g_timeSyncPeer.store(0);
+    g_peerRate.clear();
+}
 
 // rollback_session.cpp: a frame-advantage report to the match's peer (the last one whose datagrams
 // arrived - a 1v1 match has one).
@@ -381,6 +455,22 @@ int XSocketAskPeersForFile(uint64_t owner, const std::string& item, std::vector<
     if (!wait.found) return 0;
     data = std::move(wait.data);
     return 1;
+}
+
+// Every peer heard from in the last 5 s but `except` (the room: online 2v2 sends a fighter's inputs to the others).
+size_t XSocketRoomPeers(uint64_t* out, size_t max, uint64_t except)
+{
+    std::lock_guard l(g_fileMutex);
+    const auto now = std::chrono::steady_clock::now();
+    size_t n = 0;
+    for (const auto& [peer, at] : g_heardFrom)
+        if (n < max && peer != except && now - at < std::chrono::seconds(5)) out[n++] = peer;
+    return n;
+}
+
+bool XSocketSend2v2(uint64_t peer, const void* data, size_t size)
+{
+    return peer && SendPacket(peer, net::Channel::Unreliable, Op::Team2v2, 0, false, 0, 0, 0, static_cast<const uint8_t*>(data), size);
 }
 
 bool RollbackTimeSyncSend(const void* data, size_t size)

@@ -124,8 +124,10 @@ target_compile_definitions(community_net_test PRIVATE _CRT_SECURE_NO_WARNINGS)
 
 # --- Version, icon -------------------------------------------------------------------------
 # One version for the game executable's VERSIONINFO, the installer and Add or remove programs.
-set(TTT2_VERSION "0.1.7")
+set(TTT2_VERSION "0.2.0")
 string(REPLACE "." "," TTT2_VERSION_COMMAS "${TTT2_VERSION},0")
+# The log's [system] line (main.cpp only: a define for the whole target would rebuild the recompiled code).
+set_property(SOURCE "${CMAKE_SOURCE_DIR}/src/runtime/main.cpp" APPEND PROPERTY COMPILE_DEFINITIONS TTT2_VERSION_STR="${TTT2_VERSION}")
 # Original art (port/tools/make_icon.py), not the game's.
 set(TTT2_SETUP_ICON "${CMAKE_SOURCE_DIR}/src/setup/ttt2.ico")
 configure_file(src/runtime/game.rc.in "${CMAKE_BINARY_DIR}/game.rc" @ONLY)
@@ -163,12 +165,23 @@ if(TTT2_CRT_DIRS AND TTT2_EDITBIN AND EXISTS "${TTT2_STEAM_DLL}" AND EXISTS "${X
         DEPENDS tekken_recomp
         COMMENT "Game executable for the installer (GUI subsystem)"
         VERBATIM)
-    add_custom_target(ttt2_game_exe DEPENDS "${TTT2_GAME_EXE}")
+    # The checksums of everything the installer carries (it checks them before and after writing each file).
+    set(TTT2_PAYLOAD_HASHES "${TTT2_PAYLOAD_DIR}/payload.sha256")
+    add_custom_command(OUTPUT "${TTT2_PAYLOAD_HASHES}"
+        COMMAND ${CMAKE_COMMAND} "-DOUT=${TTT2_PAYLOAD_HASHES}" "-DF101=${TTT2_GAME_EXE}" "-DF102=${TTT2_STEAM_DLL}"
+                "-DF103=${CRT_MSVCP140}" "-DF104=${CRT_MSVCP140_ATOMIC}" "-DF105=${CRT_VCRUNTIME140}"
+                "-DF106=${CRT_VCRUNTIME140_1}" "-DF107=${TTT2_README_TXT}" -P "${CMAKE_SOURCE_DIR}/tools/hash_payload.cmake"
+        DEPENDS "${TTT2_GAME_EXE}" "${TTT2_STEAM_DLL}" "${CRT_MSVCP140}" "${CRT_MSVCP140_ATOMIC}" "${CRT_VCRUNTIME140}"
+                "${CRT_VCRUNTIME140_1}" "${TTT2_README_TXT}" "${CMAKE_SOURCE_DIR}/tools/hash_payload.cmake"
+        COMMENT "Installer payload checksums"
+        VERBATIM)
+    add_custom_target(ttt2_game_exe DEPENDS "${TTT2_GAME_EXE}" "${TTT2_PAYLOAD_HASHES}")
 
     # Disc / title-update readers + XenonUtils' XEX delta patcher (MIT) and its dependencies.
     add_library(ttt2_setup_core STATIC
         src/setup/xdvdfs.cpp
         src/setup/stfs.cpp
+        src/setup/dlc_install.cpp
         src/setup/game_data.cpp
         "${XENON_UTILS}/xex_patcher.cpp"
         "${XENON_UTILS}/memory_mapped_file.cpp"
@@ -197,7 +210,7 @@ if(TTT2_CRT_DIRS AND TTT2_EDITBIN AND EXISTS "${TTT2_STEAM_DLL}" AND EXISTS "${X
         # The .rc pulls these in by PATH: without OBJECT_DEPENDS a rebuilt game exe would not
         # relink the installer, which would silently ship the previous build (T&J lesson).
         set_source_files_properties("${CMAKE_BINARY_DIR}/${variant}.rc" PROPERTIES OBJECT_DEPENDS
-            "${TTT2_GAME_EXE};${TTT2_SETUP_ICON};${TTT2_README_TXT};${TTT2_STEAM_DLL};${TTT2_SETUP_MANIFEST}")
+            "${TTT2_GAME_EXE};${TTT2_PAYLOAD_HASHES};${TTT2_SETUP_ICON};${TTT2_README_TXT};${TTT2_STEAM_DLL};${TTT2_SETUP_MANIFEST}")
         add_executable(${variant} WIN32
             src/setup/setup_main.cpp
             src/setup/payload.cpp

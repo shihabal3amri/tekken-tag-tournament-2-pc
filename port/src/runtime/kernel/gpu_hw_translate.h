@@ -27,6 +27,7 @@ struct PsTranslation
     uint32_t textureSlots = 0;   // bitmask of fetch-constant slots sampled
     uint32_t cubeSlots = 0;      // of those, slots fetched as cubes (bound as Texture2DArray)
     bool writesDepth = false;    // exports oDepth (export 61, X): the function sets eDepth / wroteDepth
+    uint32_t constRegs = 256;    // p105: the ALU constants it reads are [0, constRegs) (256: relative addressing)
     std::string unsupported;     // non-empty: the shader cannot be translated
 };
 
@@ -218,6 +219,8 @@ public:
     // addressable (AluConst), and vertex fetches read the per-draw vertex data.
     bool vertex = false;
     uint32_t constCount = 256;
+    uint32_t constUsed = 0;           // p77: highest constant register read directly + 1
+    bool constAddressed = false;      // p77: a relative-addressed constant read (XC): any register
     std::vector<VsFetch> fetches;
     uint32_t lastSlot = ~0u, lastStride = 0;   // vfetch_mini state, in program order (as RunShader)
     bool r0Written = false;           // the vertex index register may no longer hold the index
@@ -243,8 +246,14 @@ public:
         case 2:  addressed = in.srcSelect(1) ? in.const0Relative() : in.const1Relative(); break;
         default: addressed = (in.srcSelect(1) && in.srcSelect(2)) ? in.const0Relative() : in.const1Relative(); break;
         }
-        if (addressed) return std::string("XC(") + Num(reg) + (in.carRelative() ? " + a0)" : " + aL)");
-        return reg < constCount ? "c[" + Num(reg) + "]" : "float4(0, 0, 0, 0)";
+        if (addressed)
+        {
+            constAddressed = true;
+            return std::string("XC(") + Num(reg) + (in.carRelative() ? " + a0)" : " + aL)");
+        }
+        if (reg >= constCount) return "float4(0, 0, 0, 0)";
+        constUsed = std::max(constUsed, reg + 1);
+        return "c[" + Num(reg) + "]";
     }
 
     std::string VecOperand(const Alu& in, int n)
@@ -291,7 +300,8 @@ public:
         {
             const bool relative = scalarUnit ? in.scalarDestRelative() : ((in.w0 >> 6) & 1) != 0;
             target = relative ? RRel(dst) : R(dst);
-            if (relative || (dst & 63) == 0) r0Written = true;
+            // Writes to y/z/w keep the vertex index in r0.x; relative x writes may alias r0.
+            if ((mask & 1) && (relative || (dst & 63) == 0)) r0Written = true;
         }
         for (int i = 0; i < 4; ++i)
         {
@@ -615,7 +625,9 @@ public:
             out << "        { uint s = (sw >> " << (3 * c) << ") & 7; if (s < 6) " << d << " = XSel(f, s); }\n";
         }
         out << "    }\n";
-        if ((in.dstRegister() & 63) == 0) r0Written = true;
+        // Only a fetch that writes x destroys the index (swizzles 6/7 leave a component alone, as ExecVertexFetch).
+        // This is each run-time microcode's swizzle: SharedVertexShader translates the game's copy again.
+        if ((in.dstRegister() & 63) == 0 && (in.dstSwizzle() & 7) < 6) r0Written = true;
     }
 
     // The instructions of one exec block.
@@ -660,13 +672,121 @@ inline Cf CfAt(const std::vector<uint32_t>& code, uint32_t index)
     return pair[index & 1];
 }
 
+// Control flow as HLSL ifs and loops. The program-counter form (EmitProgram) runs every CF instruction from one loop
+// that switches on xpc, so every register stays live across that loop and the compiler can reuse none. MEASURED
+// 2026-10-27: the character-texture bake's 954-dword pixel shader (13 predicated forward skips and a loop) compiled
+// to 177 temps and ~2,000 instruction slots; its one quad over the 1024x1024 bake took 0.6-3 ms on an RX 9070 XT and
+// 60 ms to 1.8 s on a GT 730 - the freezes at character select and the VS screen in player logs 13-21. Programs
+// whose jumps only skip forward inside their region (COND_JMP) and whose counted loops end with their LOOP_END
+// right before the exit, jumping back to the first body instruction (LOOP_START ... LOOP_END), all properly nested,
+// keep RunShader's semantics in this form: their worst case stays under the interpreter's step limit and 4 loops
+// deep (both checked here), so neither limit can apply. Calls, returns and any other shape keep the counter form.
+
+// [a, b) of the CF program (b <= cfCount): false unless structured as above; adds its worst-case CF steps (every
+// skipped block run, every loop at 255 iterations) to `steps`.
+inline bool ScanStructured(const std::vector<uint32_t>& code, uint32_t a, uint32_t b, uint32_t cfCount, uint32_t loops,
+                           uint64_t& steps)
+{
+    for (uint32_t k = a; k < b; ++k)
+    {
+        const Cf cf = CfAt(code, k);
+        const uint32_t op = cf.op();
+        ++steps;
+        if (cf.isExec())
+        {
+            if (cf.isEnd() && loops) return false;               // an END would only leave the HLSL loop
+            continue;
+        }
+        if (op == CF_COND_JMP)
+        {
+            const uint32_t target = std::min<uint32_t>(cf.lo & 0x1FFF, cfCount);   // past the end: the program ends
+            if (target <= k || target > b || !ScanStructured(code, k + 1, target, cfCount, loops, steps)) return false;
+            k = target - 1;
+        }
+        else if (op == CF_LOOP_START)
+        {
+            const uint32_t exit = cf.lo & 0x1FFF;
+            if (exit < k + 2 || exit > b || loops == 4) return false;
+            const Cf end = CfAt(code, exit - 1);
+            if (end.op() != CF_LOOP_END || (end.lo & 0x1FFF) != k + 1) return false;
+            uint64_t body = 0;
+            if (!ScanStructured(code, k + 1, exit - 1, cfCount, loops + 1, body)) return false;
+            steps += 255 * (body + 1);
+            k = exit - 1;
+        }
+        else if (op == CF_LOOP_END || op == CF_COND_CALL || op == CF_RETURN) return false;
+        if (steps > 65536) return false;
+    }
+    return true;
+}
+
+// Emits [a, b) of a program ScanStructured accepted; false when an exec cannot be translated (w.unsupported).
+inline bool EmitStructured(const std::vector<uint32_t>& code, Writer& w, uint32_t a, uint32_t b, uint32_t cfCount,
+                           uint32_t loops)
+{
+    for (uint32_t k = a; k < b; ++k)
+    {
+        const Cf cf = CfAt(code, k);
+        const uint32_t op = cf.op();
+        if (cf.isExec())
+        {
+            const std::string cond = Writer::ExecCondition(cf);
+            if (!cond.empty()) w.out << "    if (" << cond << ") {\n";
+            if (!w.Exec(code, cf)) return false;
+            if (cf.isEnd()) w.out << "    break;\n";               // out of the do / while (false) wrapper
+            if (!cond.empty()) w.out << "    }\n";
+            if (cf.isEnd() && cond.empty()) return true;           // the rest of this block never runs
+        }
+        else if (op == CF_COND_JMP)
+        {
+            const uint32_t target = std::min<uint32_t>(cf.lo & 0x1FFF, cfCount);
+            if (!((cf.lo >> 13) & 1))                              // an unconditional jump: the block never runs
+            {
+                const char* want = cf.cond() ? "true" : "false";
+                w.out << "    if (!(" << (((cf.lo >> 14) & 1) ? std::string("p0 == ") + want
+                                                                : "XBool(" + Num(cf.boolAddr()) + ") == " + want) << ")) {\n";
+                if (!EmitStructured(code, w, k + 1, target, cfCount, loops)) return false;
+                w.out << "    }\n";
+            }
+            k = target - 1;
+        }
+        else if (op == CF_LOOP_START)
+        {
+            const uint32_t exit = cf.lo & 0x1FFF;
+            const Cf end = CfAt(code, exit - 1);
+            const std::string d = Num(loops), lc = "lc" + d, n = "loopN" + d;
+            w.out << "    {\n"
+                     "    uint " << lc << " = XLoop(" << Num((cf.lo >> 16) & 0x1F) << "); int " << n << " = (int)(" << lc << " & 0xFF);\n"
+                     "    if (" << n << " != 0) {\n"
+                     "    int loopAL" << d << " = aL;\n";
+            if (!((cf.lo >> 13) & 1)) w.out << "    aL = (int)((" << lc << " >> 8) & 0xFF);\n";
+            w.out << "    [loop] while (true) {\n";
+            if (!EmitStructured(code, w, k + 1, exit - 1, cfCount, loops + 1)) return false;
+            w.out << "    aL += ((int)(XLoop(" << Num((end.lo >> 16) & 0x1F) << ") << 8)) >> 24;\n"
+                     "    " << n << " -= 1;\n"
+                     "    if (" << n << " <= 0" << (((end.lo >> 21) & 1) ? std::string(" || p0 == ") + (end.cond() ? "true" : "false") : "")
+                  << ") break;\n"
+                     "    }\n"
+                     "    aL = loopAL" << d << ";\n"
+                     "    }\n"
+                     "    }\n";
+            k = exit - 1;
+        }
+        // NOP, ALLOC, MARK_VS_FETCH_DONE: nothing runs.
+    }
+    return true;
+}
+
 } // namespace detail
 
 // The control-flow program of non-empty microcode into w.out (shared by both shader types).
-// branching: the program-counter form was used (no break-based wrapper).
-inline void EmitProgram(const std::vector<uint32_t>& code, detail::Writer& w, bool& branching, std::string& unsupported)
+// branching: the program-counter form was used (no break-based wrapper). controlFlow: the program has
+// jumps, loops or calls, in either form (its order of instructions is not always the order they run in).
+inline void EmitProgram(const std::vector<uint32_t>& code, detail::Writer& w, bool& branching, std::string& unsupported,
+                        bool* controlFlow = nullptr)
 {
     branching = false;
+    if (controlFlow) *controlFlow = false;
     if (code.size() < 3 || code.size() > 8192)
         unsupported = "invalid shader length";
     else
@@ -715,8 +835,16 @@ inline void EmitProgram(const std::vector<uint32_t>& code, detail::Writer& w, bo
                 if (cf.isEnd() && cond.empty()) break;     // nothing after an unconditional end runs
             }
         }
+        else if (uint64_t steps = 0; detail::ScanStructured(code, 0, cfCount, cfCount, 0, steps))
+        {
+            // Structured ifs and loops (see ScanStructured) inside the break-based wrapper.
+            if (controlFlow) *controlFlow = true;
+            branching = false;
+            detail::EmitStructured(code, w, 0, cfCount, cfCount, 0);
+        }
         else
         {
+            if (controlFlow) *controlFlow = true;
             // Program-counter form (loops / calls / jumps), same semantics as RunShader.
             const std::string end = detail::Num(cfCount);
             w.out << "    uint xpc = 0; uint loopDepth = 0; uint callDepth = 0;\n"
@@ -824,6 +952,7 @@ inline PsTranslation TranslatePixelShader(const std::vector<uint32_t>& code, boo
     result.textureSlots = w.textures;
     result.cubeSlots = w.cubeSlots;
     result.writesDepth = w.depthExport;
+    result.constRegs = w.constAddressed ? 256 : w.constUsed;
     return result;
 }
 
@@ -868,6 +997,7 @@ struct VsTranslation
     std::string function;                 // HLSL: XVs XenosVs(uint index)
     std::vector<detail::VsFetch> fetches; // dword ranges the draw must upload
     std::string unsupported;
+    uint32_t constRegs = 512;             // p77: the ALU constants it reads are [0, constRegs) (512: relative addressing)
 };
 
 // Per-draw vertex-stage state (b1). vfRegion[slot] = { vdata dword of guest dword 0 of the
@@ -983,12 +1113,13 @@ inline VsTranslation TranslateVertexShader(const std::vector<uint32_t>& code)
     detail::Writer w;
     w.vertex = true;
     w.constCount = 512;
-    bool branching = false;
+    bool branching = false, controlFlow = false;
     if (code.empty()) result.unsupported = "empty vertex shader";
-    else EmitProgram(code, w, branching, result.unsupported);
+    else EmitProgram(code, w, branching, result.unsupported, &controlFlow);
+    result.constRegs = w.constAddressed ? 512 : w.constUsed;
     // With loops/calls the program order is not the execution order: a register-0 write could
     // precede a fetch at run time. Only straight-line shaders get the index-range guarantee.
-    if (result.unsupported.empty() && branching && w.r0Written &&
+    if (result.unsupported.empty() && controlFlow && w.r0Written &&
         std::any_of(w.fetches.begin(), w.fetches.end(), [](const detail::VsFetch& f) { return f.dwords != 0; }))
         result.unsupported = "vertex fetch after a possible index-register write (branching)";
     if (!result.unsupported.empty()) return result;

@@ -20,6 +20,9 @@ struct SysUiMessageBox
     int active = 0;                         // the focused button at first
     int cancel = -1;
     std::function<void(int choice)> done;
+    // The game's own box (XamShowMessageBoxUI): only the player's answer ends it - SysUiDismissBox leaves it alone (its
+    // caller polls until `done` completes the request; a "Save Error" box dropped unanswered would hang the save job).
+    bool system = false;
 };
 // False while another message box is showing.
 bool SysUiShowMessageBox(SysUiMessageBox box);
@@ -40,7 +43,7 @@ struct SysUiTextBox
 // False while a message box or text box is showing.
 bool SysUiShowTextBox(SysUiTextBox box);
 // Closes the message box or text box on screen without an answer (its `done` does not run), e.g. "Connecting..."
-// once the connection is made.
+// once the connection is made. The game's own boxes (`system`) stay until the player answers them.
 void SysUiDismissBox();
 // True while a message box or text box is showing or about to (another one has to wait).
 bool SysUiBoxBusy();

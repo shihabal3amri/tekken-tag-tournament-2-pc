@@ -29,6 +29,8 @@
 
 bool SessionEnabled();   // rollback_session.cpp: rollback sessions (TTT2_ROLLBACK)
 
+namespace online2v2 { bool PairMode(); }   // online_2v2_pair.cpp: PAIR PLAY's pages are open
+
 namespace {
 
 constexpr uint32_t S_OK_ = 0, E_FAIL_ = 0x80004005u, E_INVALIDARG_ = 0x80070057u;
@@ -90,6 +92,7 @@ Session* Lookup(uint8_t* base, uint32_t objectPtr)
     return it == g_sessions.end() ? nullptr : &it->second;
 }
 
+
 // A host's matchmaking / peer-network session, as searchers see it (under g_mutex).
 void Publish(const Session& s)
 {
@@ -109,6 +112,7 @@ void Publish(const Session& s)
     if (SessionEnabled())
         r.netcode = mm::kNetcodeKnown | uint32_t(display_settings::GetNetcode()) | uint32_t(display_settings::GetCustomDelay()) << 8 |
                     uint32_t(display_settings::GetCustomRollback()) << 16;
+    if (online2v2::PairMode()) r.netcode |= mm::kPairRoom;
     mm::Publish(r);
 }
 
@@ -184,7 +188,9 @@ uint32_t SetState(uint8_t* base, uint32_t b, State state, const char* name)
     Session* s = Lookup(base, GRead32(base, b));
     if (!s) return STATUS_INVALID_HANDLE_;
     s->state = state;
-    Log(name, "XSession%s(%016llX)", name, (unsigned long long)s->id);
+    // every start and end (a room's matches, and the ones started from the end menu: online_straight.cpp)
+    static uint64_t calls = 0;
+    Log(std::string(name) + std::to_string(++calls), "XSession%s(%016llX)", name, (unsigned long long)s->id);
     return S_OK_;
 }
 
@@ -305,6 +311,7 @@ uint32_t Search(uint8_t* base, uint32_t b)
         {
             if (found.size() >= numResults) break;
             if (r.maxPublic <= r.filledPublic) continue;
+            if (((r.netcode & mm::kPairRoom) != 0) != online2v2::PairMode()) continue;   // PAIR PLAY's and Player Match's apart
             bool match = true;
             for (const auto& [id, value] : wanted)
                 for (const mm::Context& c : r.contexts)

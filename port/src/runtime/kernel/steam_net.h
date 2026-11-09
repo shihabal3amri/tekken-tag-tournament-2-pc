@@ -58,7 +58,7 @@ uint64_t LocalId();
 bool Send(uint64_t peer, bool reliable, const void* data, size_t size);
 void PublishLobby(uint64_t sessionId, const std::vector<uint8_t>& record);
 void RemoveLobby(uint64_t sessionId);
-std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs);
+std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs, bool pair);   // pair: PAIR PLAY's lobbies only
 bool TakeJoinRequest(std::vector<uint8_t>& record);
 bool WebApiTicket(const std::string& identity, std::string& hex, uint32_t& handle, int timeoutMs);
 void CancelTicket(uint32_t handle);

@@ -2,6 +2,7 @@
 // files. Metadata is versioned and deterministic; all guest path components are
 // constrained and existing reparse points are rejected before file operations.
 #include "save_store.h"
+#include "log_utf8.h"
 #include "profiles.h"
 #include <cwchar>
 #include <cstdio>
@@ -106,6 +107,7 @@ uint32_t WriteMetadata(const std::filesystem::path& path,const SaveContentRecord
     if(!MoveFileExW(temp.c_str(),(path/META).c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))return GetLastError();
     return 0;
 }
+void JournalCopyAllLocked(const std::filesystem::path& dir);   // the save journal, below (g_saveMutex held)
 uint32_t DeleteTree(const std::filesystem::path& path)
 {
     std::filesystem::path root;uint32_t e=Root(root);if(e)return e;
@@ -113,6 +115,7 @@ uint32_t DeleteTree(const std::filesystem::path& path)
     if(path.parent_path()!=root || !Component(path.filename().string()))return ERROR_ACCESS_DENIED;
     if((e=NoReparse(path)))return e;
     if((e=FlushSaveFiles(path,true)))return e;
+    JournalCopyAllLocked(path);
     std::error_code ec;
     for(auto it=std::filesystem::recursive_directory_iterator(path,ec);!ec&&it!=std::filesystem::recursive_directory_iterator();it.increment(ec))
         if((e=NoReparse(it->path())))return e;
@@ -132,22 +135,36 @@ uint32_t SaveUserRoot(std::filesystem::path& root) { return Root(root); }
 // game showed "Save Error" (MEASURED 2026-10-21: three saves of one KO on the host of a three-player
 // room, the last rewind in the middle of an open save, the heap broken; the next match froze in
 // RtlAllocateHeap's free-list walk; in two-instance tests 2-6 "Save Error" boxes per run). So a
-// container opened in a frame a rewind may still re-simulate is copied first (every file, its
-// bytes); a rewind to that frame or before puts the copy back; a confirmed frame drops it.
+// container opened in a frame a rewind may still re-simulate is journaled first; a rewind to that
+// frame or before puts it back; a confirmed frame drops it.
+// The journal lists the container's files (names, sizes, write times) when it opens and copies a file's
+// bytes only right before the save changes it - opened to write or delete, the target of a rename, the
+// whole container deleted (kernel_io.cpp calls SaveJournalBeforeChange). MEASURED 2026-11-09 (m174): copying
+// all of them at the open (143 files, ~460 KB) took 49-72 ms of the save job's 66-95 ms, under the save
+// lock the main thread takes every update - a ~50 ms hitch at every online KO; a save changes 4 of them
+// (writes NN_000_x, deletes the other slot).
 namespace {
 struct JournalFile
 {
     std::wstring name;
+    uint64_t size = 0;                         // as listed when the container opened
+    FILETIME listed{};
+    bool copied = false;                       // `bytes` hold it as it was before the save changed it
+    bool failed = false;                       // that copy failed: left as it is on undo (logged)
+    unsigned long error = 0;                   // its Win32 error
     std::vector<uint8_t> bytes;
     FILETIME written{};                        // as copied: an unchanged file is left alone on undo
 };
 struct JournalEntry
 {
     int32_t frame = 0;
+    uint64_t id = 0;
     std::filesystem::path dir;
     bool existed = false;
-    std::vector<JournalFile> files;
+    bool broken = false;                       // a copy failed: undo leaves every file as the save left them
+    std::vector<JournalFile> files;            // every regular file when it opened (`copied`: its bytes too)
 };
+uint64_t g_journalIds = 0;                     // under g_saveMutex
 bool WrittenAt(const std::filesystem::path& p, FILETIME& t, uint64_t& size)
 {
     WIN32_FILE_ATTRIBUTE_DATA a{};
@@ -182,40 +199,139 @@ bool WriteWhole(const std::filesystem::path& p, const std::vector<uint8_t>& data
     CloseHandle(h);
     return ok;
 }
+// The regular files of a container from its directory entries (no file opened): name, size, write time.
+// Reparse points are no save file: never listed, never removed on undo.
+bool ListFiles(const std::filesystem::path& dir, std::vector<JournalFile>& out)
+{
+    WIN32_FIND_DATAW d{};
+    HANDLE f = FindFirstFileExW((dir / L"*").c_str(), FindExInfoBasic, &d, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+    if (f == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND;
+    do
+    {
+        if (d.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        JournalFile j;
+        j.name = d.cFileName;
+        j.size = uint64_t(d.nFileSizeHigh) << 32 | d.nFileSizeLow;
+        j.listed = d.ftLastWriteTime;
+        out.push_back(std::move(j));
+    } while (FindNextFileW(f, &d));
+    const bool ok = GetLastError() == ERROR_NO_MORE_FILES;
+    FindClose(f);
+    return ok;
+}
+JournalFile* FindFile(std::vector<JournalFile>& files, const std::wstring& name)
+{
+    for (JournalFile& f : files)
+        if (_wcsicmp(f.name.c_str(), name.c_str()) == 0) return &f;
+    return nullptr;
+}
+// The newest journal entry of a container: the save that changes it now (an older one of the same container
+// is undone only after the newer ones, which put back what they changed).
+JournalEntry* NewestEntry(const std::filesystem::path& dir)
+{
+    for (auto it = g_journal.rbegin(); it != g_journal.rend(); ++it)
+        if (it->dir == dir) return &*it;
+    return nullptr;
+}
+bool CopyBeforeChange(const std::filesystem::path& p, JournalFile& f)
+{
+    uint64_t size = 0;
+    f.copied = !NoReparse(p) && WrittenAt(p, f.written, size) && ReadWhole(p, f.bytes);
+    f.failed = !f.copied;
+    if (f.failed) { f.error = GetLastError(); f.bytes.clear(); }
+    return f.copied;
+}
+// A newer save of a container that is not put back: its older ones are not either (review wf_fd6326af-ace). An older
+// one's undo counts on the newer ones having put back what they changed (it removes what its listing lacks and has no
+// copy of a file only a newer save changed): undone over a newer one left as it is, a record could keep neither slot.
+void PoisonOlder(const std::filesystem::path& dir)
+{
+    for (JournalEntry& o : g_journal)
+        if (o.dir == dir) o.broken = true;
+}
+// DeleteTree (g_saveMutex held): a journaled container deleted as a whole - the files not copied yet first.
+void JournalCopyAllLocked(const std::filesystem::path& dir)
+{
+    if constexpr (!TTT2_LOCAL_SAVES) return;
+    JournalEntry* e = NewestEntry(dir);
+    if (!e || !e->existed || e->broken) return;
+    size_t copied = 0, failed = 0;
+    for (JournalFile& f : e->files)
+        if (!f.copied && !f.failed) (CopyBeforeChange(dir / f.name, f) ? copied : failed)++;
+    e->broken |= failed != 0;
+    std::fprintf(stderr, "[save-journal] the container of the frame %d save is deleted: %zu files copied first%s\n", e->frame, copied,
+                 failed ? " - SOME COULD NOT BE COPIED" : "");
+}
 }
 
 void SaveJournalCapture(const SaveContentRecord& record, int32_t frame)
 {
     if constexpr (!TTT2_LOCAL_SAVES) return;
-    std::lock_guard lock(g_saveMutex);
     std::filesystem::path dir;
-    if (RecordPath(record, dir)) return;
-    for (const JournalEntry& e : g_journal)
-        if (e.dir == dir && e.frame == frame) return;       // this frame's earlier state is kept already
+    {
+        std::lock_guard lock(g_saveMutex);
+        if (RecordPath(record, dir)) return;
+        for (const JournalEntry& e : g_journal)
+            if (e.dir == dir && e.frame == frame) return;   // this frame's earlier state is kept already
+    }
+    // The listing without the lock (the main thread takes it every update); nothing changes the container
+    // here - the save job lists it before opening it.
     JournalEntry e;
     e.frame = frame;
     e.dir = dir;
     std::error_code ec;
     e.existed = std::filesystem::is_directory(dir, ec);
-    size_t bytes = 0;
-    if (e.existed)
-        for (auto it = std::filesystem::directory_iterator(dir, ec); !ec && it != std::filesystem::directory_iterator(); it.increment(ec))
-        {
-            if (!it->is_regular_file(ec) || NoReparse(it->path())) continue;
-            JournalFile f;
-            f.name = it->path().filename().wstring();
-            uint64_t size = 0;
-            if (!WrittenAt(it->path(), f.written, size) || !ReadWhole(it->path(), f.bytes))
-            {
-                std::fprintf(stderr, "[save-journal] could not copy %ls - no copy of this save\n", it->path().filename().c_str());
-                return;
-            }
-            bytes += f.bytes.size();
-            e.files.push_back(std::move(f));
-        }
-    std::fprintf(stderr, "[save-journal] save in frame %d (not confirmed yet): %zu files (%zu bytes) of %ls copied\n", frame,
-                 e.files.size(), bytes, dir.filename().c_str());
+    if (e.existed && !ListFiles(dir, e.files))
+    {
+        const unsigned long error = GetLastError();
+        std::fprintf(stderr, "[save-journal] could not list %s (error %lu) - no copy of this save\n", LogUtf8(dir.filename()).c_str(),
+                     error);
+        return;
+    }
+    std::lock_guard lock(g_saveMutex);
+    for (const JournalEntry& o : g_journal)
+        if (o.dir == dir && o.frame == frame) return;
+    e.id = ++g_journalIds;
+    std::fprintf(stderr, "[save-journal] save in frame %d (not confirmed yet): %zu files of %s listed (a file is copied before the save changes it)\n",
+                 frame, e.files.size(), LogUtf8(dir.filename()).c_str());
     g_journal.push_back(std::move(e));
+}
+
+void SaveJournalBeforeChange(const std::filesystem::path& container, const std::filesystem::path& file)
+{
+    if constexpr (!TTT2_LOCAL_SAVES) return;
+    const std::wstring name = file.filename().wstring();
+    uint64_t id = 0;
+    {
+        std::lock_guard lock(g_saveMutex);
+        JournalEntry* e = NewestEntry(container);
+        if (!e || !e->existed || e->broken) return;        // no save journaled, a new container (removed on undo), or broken
+        const JournalFile* f = FindFile(e->files, name);
+        if (!f || f->copied || f->failed) return;          // new since the listing (removed on undo), or copied already
+        id = e->id;
+    }
+    // The copy without the lock; only this save job changes the container while it is open.
+    JournalFile copy;
+    CopyBeforeChange(file, copy);
+    std::lock_guard lock(g_saveMutex);
+    for (JournalEntry& e : g_journal)
+    {
+        if (e.id != id) continue;
+        JournalFile* f = FindFile(e.files, name);
+        if (!f || f->copied || f->failed) return;
+        f->copied = copy.copied;
+        f->failed = copy.failed;
+        f->bytes = std::move(copy.bytes);
+        f->written = copy.written;
+        e.broken |= f->failed;
+        if (f->failed)
+            std::fprintf(stderr, "[save-journal] frame %d: could not copy %s (error %lu) - this save is NOT put back on a rewind\n", e.frame,
+                         LogUtf8(file.filename()).c_str(), copy.error);
+        else
+            std::fprintf(stderr, "[save-journal] frame %d: %s copied before the save changes it (%zu bytes)\n", e.frame,
+                         LogUtf8(file.filename()).c_str(), f->bytes.size());
+        return;
+    }
 }
 
 int SaveJournalUndo(int32_t fromFrame)
@@ -233,6 +349,16 @@ int SaveJournalUndo(int32_t fromFrame)
             FlushSaveFiles(e.dir, true))
         {
             std::fprintf(stderr, "[save-journal] the save of frame %d is still open - its files are NOT put back\n", e.frame);
+            PoisonOlder(e.dir);
+            continue;
+        }
+        if (e.broken)
+        {
+            PoisonOlder(e.dir);
+            // All or nothing (review wf_f788ef00-b3b): the save's new slot removed while the slot it deleted cannot come
+            // back would leave neither - the files stay as the save left them (as when the journal copied everything first).
+            std::fprintf(stderr, "[save-journal] rewind to frame %d: the save of frame %d is NOT put back (a file could not be copied first, or a newer save of it was not put back) - its files stay as the saves left them\n",
+                         fromFrame, e.frame);
             continue;
         }
         std::error_code ec;
@@ -249,29 +375,40 @@ int SaveJournalUndo(int32_t fromFrame)
         // Files the save added go; the ones it changed or deleted come back byte for byte; the rest (the
         // container holds ~100 files - replays, ghosts - and a save touches a few) stay as they are.
         // MEASURED: rewriting all of them (with flushes) took one rewind ~250 ms.
-        std::vector<std::filesystem::path> present;
-        for (auto it = std::filesystem::directory_iterator(e.dir, ec); !ec && it != std::filesystem::directory_iterator(); it.increment(ec))
-            if (it->is_regular_file(ec)) present.push_back(it->path());
-        size_t removed = 0, put = 0;
-        for (const auto& p : present)
+        std::vector<JournalFile> present;
+        ok &= ListFiles(e.dir, present);
+        size_t removed = 0, put = 0, copied = 0, unexpected = 0, failed = 0;
+        std::string firstUnexpected;
+        for (const JournalFile& p : present)
         {
-            bool keep = false;
-            for (const JournalFile& f : e.files) keep |= p.filename().wstring() == f.name;
-            if (keep) continue;
-            if (DeleteFileW(p.c_str())) ++removed;
+            if (FindFile(e.files, p.name)) continue;
+            if (DeleteFileW((e.dir / p.name).c_str())) ++removed;
             else ok = false;
         }
-        for (const JournalFile& f : e.files)
+        for (JournalFile& f : e.files)
         {
             const auto p = e.dir / f.name;
+            copied += f.copied;
+            if (f.failed) { ++failed; continue; }
+            if (!f.copied)
+            {
+                // Never opened to be changed: as listed (a difference is logged, the file left as it is).
+                const JournalFile* now = FindFile(present, f.name);
+                if (now && now->size == f.size && CompareFileTime(&now->listed, &f.listed) == 0) continue;
+                if (!unexpected++) firstUnexpected = LogUtf8(f.name);
+                continue;
+            }
             FILETIME t{};
             uint64_t size = 0;
             if (WrittenAt(p, t, size) && size == f.bytes.size() && CompareFileTime(&t, &f.written) == 0) continue;
             if (WriteWhole(p, f.bytes)) ++put;
             else ok = false;
         }
-        std::fprintf(stderr, "[save-journal] rewind to frame %d: the save of frame %d undone (%zu files put back, %zu removed)%s\n",
-                     fromFrame, e.frame, put, removed, ok ? "" : " - SOME FILES FAILED");
+        std::fprintf(stderr, "[save-journal] rewind to frame %d: the save of frame %d undone (%zu files put back, %zu removed; %zu of %zu copied before the save changed them)%s\n",
+                     fromFrame, e.frame, put, removed, copied, e.files.size(), ok ? "" : " - SOME FILES FAILED");
+        if (unexpected || failed)
+            std::fprintf(stderr, "[save-journal]   %zu files changed without a copy (first: %s), %zu could not be copied - left as they are\n",
+                         unexpected, firstUnexpected.c_str(), failed);
         ++restored;
     }
     return restored;
@@ -290,12 +427,39 @@ void SaveJournalClear()
     g_journal.clear();
 }
 
+bool SaveJournalHas(int32_t frame)
+{
+    std::lock_guard lock(g_saveMutex);
+    for (const JournalEntry& e : g_journal)
+        if (e.frame == frame) return true;
+    return false;
+}
+
+// TEST 17: no save, once a session - with the unlock backups (unlock_all.cpp, <save root>\..\save_backups\<XUID>) that
+// say whether this profile had saves before. Tester logs 46 / 48 / 50 began with a new save while the shader cache in
+// the same folder was intact: saves deleted outside the game, which the log could not show.
+static void NoteNoSave(const std::filesystem::path& root,size_t containers=0)
+{
+    static bool noted=false;if(noted)return;noted=true;
+    std::error_code ec;size_t n=0;std::string newest;
+    const auto backups=root.parent_path().parent_path()/L"save_backups"/root.filename();
+    for(auto it=std::filesystem::directory_iterator(backups,ec);!ec&&it!=std::filesystem::directory_iterator();it.increment(ec))
+        if(it->is_directory(ec)){++n;newest=(std::max)(newest,LogUtf8(it->path().filename()));}
+    const bool folder=std::filesystem::exists(root,ec);
+    char state[64];
+    if(!folder)std::snprintf(state,sizeof(state),"no folder");
+    else if(!containers)std::snprintf(state,sizeof(state),"the folder is empty");
+    else std::snprintf(state,sizeof(state),"%zu save folder(s), none made by this profile",containers);
+    std::fprintf(stderr,"[content] no save in %s (%s); %zu unlock backup(s)%s%s\n",LogUtf8(root).c_str(),
+                 state,n,n?", the newest ":"",newest.c_str());
+}
+
 uint32_t SaveListContent(std::vector<SaveContentRecord>& records)
 {
     if constexpr (!TTT2_LOCAL_SAVES) { records.clear(); return 0; }
     std::lock_guard lock(g_saveMutex);records.clear();std::filesystem::path root;
     if(uint32_t e=Root(root))return e;
-    std::error_code ec;if(!std::filesystem::exists(root,ec))return ec?uint32_t(ec.value()):0;
+    std::error_code ec;if(!std::filesystem::exists(root,ec)){if(!ec)NoteNoSave(root);return ec?uint32_t(ec.value()):0;}
     std::vector<std::filesystem::path> paths;
     for(auto it=std::filesystem::directory_iterator(root,ec);!ec&&it!=std::filesystem::directory_iterator();it.increment(ec)) {
         if(uint32_t e=NoReparse(it->path()))return e;
@@ -303,6 +467,7 @@ uint32_t SaveListContent(std::vector<SaveContentRecord>& records)
     }
     if(ec)return uint32_t(ec.value());std::sort(paths.begin(),paths.end());
     for(const auto& p:paths){SaveContentRecord r{};uint64_t owner=0;uint32_t e=ReadMetadata(p,r,owner);if(e)return e;if(owner==LocalXuid())records.push_back(r);}
+    if(records.empty())NoteNoSave(root,paths.size());
     return 0;
 }
 uint32_t SaveCreateContent(const std::string& rootName,const SaveContentRecord& record,uint32_t mode,uint32_t& disposition)

@@ -46,6 +46,7 @@ struct Welcome
     bool stats = false;                       // the server keeps the game's statistics (the leaderboards)
     bool matches = false;                     // the server records the matches played on it (ReportMatch)
     bool files = false;                       // the server keeps the players' license files (PutFile / GetFile)
+    bool serverRanks = false;                 // the ranks are the server's own (server/PROTOCOL.md "Ranks")
     std::string name, region, motd;
     std::string fingerprint;                  // the server key, 8 groups of 4 hex digits
     std::string tls;                          // negotiated protocol
@@ -121,6 +122,13 @@ public:
     void PutFile(uint64_t ownXuid, const std::string& item, const std::vector<uint8_t>& data);
     int GetFile(uint64_t ownerXuid, const std::string& item, std::vector<uint8_t>& data, int timeoutMs);
     bool KeepsFiles() const;
+    // A server whose ranks are its own (server/PROTOCOL.md "Ranks", WELCOME bit 5) keeps the license and penalties
+    // this game plays with there: GetFile with owner 0 reads this player's own (licence.dat, penalty.dat), PutFile
+    // writes them, DeleteOwnFile removes one.
+    bool ServerRanks() const;
+    void DeleteOwnFile(uint64_t ownXuid, const std::string& item);
+    // The fingerprint of the server's key (64 hex digits; the same server at any address), "" before a login.
+    std::string ServerKey() const;
 
     // Is `peer` (a Steam ID that reached this game directly) a player of this server? 1 yes, 0 no, -1 no answer
     // (asked too often, or the connection ended): games on a server play only with each other.
@@ -154,6 +162,7 @@ struct ServerInfo
     uint16_t protocolVersion = 0;
     bool password = false;                    // the server asks for a password
     bool verified = false;                    // the server checks Steam IDs with Steam
+    bool ownRanks = false;                    // the ranks there are the server's own (PROTOCOL.md "Ranks")
     std::string name, region, motd;
     uint16_t online = 0, maxPlayers = 0, inMatch = 0, sessions = 0;   // inMatch: players in rooms and their matches
     std::vector<std::string> gameProtocols;   // the game versions it accepts

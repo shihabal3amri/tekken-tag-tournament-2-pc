@@ -13,6 +13,8 @@
 //
 // Tests: TTT2_SERVER=<address> (TTT2_SERVER_PASSWORD) starts with that server as the network, unsaved.
 #include "server_ui.h"
+#include "menu_doc.h"
+#include "online_2v2.h"
 #include "community_net.h"
 #include "menu_host.h"
 #include "net_transport.h"
@@ -51,20 +53,25 @@ const char* const kOnlineMenu = "FrameOnlineMenu";
 // needs server if player selected playing on steam"): on Steam they are not selectable - the game draws a row it
 // cannot open grayed and its cursor passes it, as VS BATTLE with one controller. WORLD ARENA needs Namco's lobby
 // service, which no network offers: never selectable. Rows of "MenuOnlineMenu" by place: 0 RANKED MATCH, 1 PLAYER
-// MATCH, 2 WORLD ARENA, 3 TEAM, 4 TEKKEN CHANNEL, 5 LEADERBOARDS, 6 SERVER.
+// MATCH, 2 PAIR PLAY, 3 WORLD ARENA, 4 TEAM, 5 TEKKEN CHANNEL, 6 LEADERBOARDS, 7 SERVER - without the PAIR PLAY row
+// (menu_doc.cpp MenuPairPlayRow) those after PLAYER MATCH one place up.
+// RANKED MATCH is open on Steam too (the user, 2026-10-28): there each player plays with the rank on their PC and
+// nothing checks it; a community server can keep its own (server/PROTOCOL.md "Ranks").
 // TEKKEN CHANNEL stays open on Steam for its REPLAY THEATER (the replays saved on this PC - the user, 2026-10-23:
 // watching them needs no server); its SEARCH REPLAYS needs a server (kReplay* below).
 const char* const kOnlineMenuItems = "MenuOnlineMenu";
-const char* const kServerOnlyRows[] = { "MenuItemOnline01-ranked-match", "MenuItemOnline04-team", "MenuItemOnline07-leaderboard" };
-const int kServerOnlyPlaces[] = { 0, 3, 5 };
+const char* const kServerOnlyRows[] = { "MenuItemOnline04-team", "MenuItemOnline07-leaderboard" };
+const int kServerOnlyPlaces[] = { 4, 6 };
 // TEKKEN CHANNEL's page: 0 SEARCH REPLAYS (the server's replays), 1 REPLAY THEATER.
 const char* const kReplayFrame = "FrameOnline0501-arcade_replay";
 const char* const kReplayMenu = "MenuOnline0501-arcade_replay";
 const char* const kSearchReplaysRow = "MenuItemOnline0501-search_replay";
 const char* const kWorldArenaRow = "MenuItemOnline03-lobby";
-constexpr int kWorldArenaPlace = 2;
-const char* const kRowValue = "StaticOnlineModeValue007"; // the SERVER row's value column
-const char* const kRowHelp = "StaticOnlineMode007";       // and its help text
+constexpr int kWorldArenaPlace = 3;
+// Places as above, with or without the PAIR PLAY row.
+int Place(int place) { return menu_doc::MenuPairPlayRow() || place < 2 ? place : place - 1; }
+const char* RowValue() { return menu_doc::MenuPairPlayRow() ? "StaticOnlineModeValue008" : "StaticOnlineModeValue007"; }   // SERVER's value column
+const char* RowHelp() { return menu_doc::MenuPairPlayRow() ? "StaticOnlineMode008" : "StaticOnlineMode007"; }              // and its help text
 constexpr uint16_t kUp = 0x0001, kDown = 0x0002, kA = 0x1000, kX = 0x4000, kY = 0x8000;
 
 int64_t NowMs()
@@ -585,6 +592,8 @@ std::string InfoText(const std::string& address, const server_list::Live& live)
             std::to_string(i.inMatch) + " playing";
     if (live.pingMs >= 0) line += "  -  " + std::to_string(live.pingMs) + " ms";
     text += "\n" + line;
+    text += i.ownRanks ? "\nRanks: kept by this server. Everyone starts here as a Beginner."
+                       : "\nRanks: your own, as saved on your PC.";
     std::string notes;
     if (!Compatible(i)) notes += "Another version of the game. ";
     if (i.password) notes += "Asks for a password. ";
@@ -756,9 +765,11 @@ void DrawList(PPCContext& ctx, uint8_t* base, bool force)
         const std::string row = "MenuItemOnlineSrv" + Two(i + 1);
         if (force || want.visible != was.visible)
         {
-            menu_host::SetVisible(ctx, base, row, want.visible);
+            // A row with no entry stays shown, blank, and the cursor skips it: a hidden row keeps its box, with
+            // two cyan text marks in it (MEASURED 2026-10-24: a list of 5 entries showed 3 boxes with the marks).
+            menu_host::SetVisible(ctx, base, row, true);
             menu_host::SetFocusable(ctx, base, row, want.visible);
-            menu_host::SetVisible(ctx, base, "SelectValueOnlineSrv" + Two(i + 1), want.visible);
+            menu_host::SetVisible(ctx, base, "SelectValueOnlineSrv" + Two(i + 1), true);
         }
         if (force || want.label != was.label) menu_host::SetText(ctx, base, row, want.label.empty() ? " " : want.label);
         if (force || want.value != was.value) menu_host::SetText(ctx, base, "SelectValueOnlineSrv" + Two(i + 1), want.value);
@@ -1094,7 +1105,9 @@ void Frame(PPCContext& ctx, uint8_t* base)
     // 2026-10-23: the server's welcome text on the first visit; players learned to press START to "wake" the menu).
     // So ours wait until a named frame has settled and the game's window has been closed for kSettleFrames.
     const bool gameWindow = menu_host::WindowShowing(ctx, base);
-    const bool calm = !gameWindow && g.candidate == g.frame && g.frame.rfind("Frame", 0) == 0;
+    // ... and never over the PAIR PLAY screen (its names frame is a named frame too: a window there takes the controller
+    // from the screen on one PC only)
+    const bool calm = !gameWindow && g.candidate == g.frame && g.frame.rfind("Frame", 0) == 0 && !online2v2::PlacesActive();
     g.calmFrames = calm ? (std::min)(g.calmFrames + 1, kSettleFrames) : 0;
     const bool windowFree = !SysUiBoxBusy() && g.calmFrames >= kSettleFrames;
     Pump(windowFree);
@@ -1126,7 +1139,7 @@ void Frame(PPCContext& ctx, uint8_t* base)
         g.rowsSet = true;
         g.rowsNetwork = g.address;
         g.nextStep = 0;
-        std::fprintf(stderr, "[srv-ui] online modes for %s: ranked, team, leaderboards, tekken channel's search %s\n",
+        std::fprintf(stderr, "[srv-ui] online modes for %s: team, leaderboards, tekken channel's search %s\n",
                      onServer ? g.address.c_str() : "Steam", onServer ? "on" : "grayed");
     }
     // TEKKEN CHANNEL's page: SEARCH REPLAYS on a server only; on Steam the cursor steps down to REPLAY THEATER as on
@@ -1152,8 +1165,8 @@ void Frame(PPCContext& ctx, uint8_t* base)
     if (frame == kOnlineMenu && g.rowsSet && !g.job && NowMs() >= g.nextStep)
     {
         const int at = menu_host::Cursor(ctx, base, kOnlineMenuItems);
-        bool off = at == kWorldArenaPlace;
-        for (int place : kServerOnlyPlaces) off = off || (g.address.empty() && at == place);
+        bool off = at == Place(kWorldArenaPlace);
+        for (int place : kServerOnlyPlaces) off = off || (g.address.empty() && at == Place(place));
         if (off)
         {
             HostPulseDown();
@@ -1172,8 +1185,8 @@ void Frame(PPCContext& ctx, uint8_t* base)
                                                                               : "Steam or a community server.";
         if (changed || value != g.rowValue || help != g.rowHelp)
         {
-            menu_host::SetText(ctx, base, kRowValue, value);
-            menu_host::SetText(ctx, base, kRowHelp, help);
+            menu_host::SetText(ctx, base, RowValue(), value);
+            menu_host::SetText(ctx, base, RowHelp(), help);
             g.rowValue = value;
             g.rowHelp = help;
         }
@@ -1202,6 +1215,12 @@ void Frame(PPCContext& ctx, uint8_t* base)
 }
 
 uint16_t GameButtonMask() { return g.mask.load(); }
+
+bool MenuSettled()
+{
+    return g.online && g.frame == kOnlineMenu && !g.job && g.boxUp == Tag::None && g.boxes.empty() && g.askAddress.empty() &&
+           g.calmFrames >= kSettleFrames;
+}
 
 bool WaitForNetwork(int timeoutMs)
 {

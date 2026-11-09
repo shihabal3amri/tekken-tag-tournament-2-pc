@@ -37,10 +37,15 @@ func (s *Store) PlayerFile(xuid uint64, item string) ([]byte, bool, error) {
 	if !ok {
 		return nil, false, nil
 	}
+	return s.OwnPlayerFile(steamID, item)
+}
+
+// OwnPlayerFile is a player's item by their Steam ID; false when they never uploaded it.
+func (s *Store) OwnPlayerFile(steamID uint64, item string) ([]byte, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
 	defer cancel()
 	var data []byte
-	err = s.db.QueryRowContext(ctx, `SELECT data FROM player_files WHERE steam_id = ? AND item = ?`, int64(steamID), item).Scan(&data)
+	err := s.db.QueryRowContext(ctx, `SELECT data FROM player_files WHERE steam_id = ? AND item = ?`, int64(steamID), item).Scan(&data)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -48,4 +53,12 @@ func (s *Store) PlayerFile(xuid uint64, item string) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	return data, true, nil
+}
+
+// DeletePlayerFile removes a player's item (none: nothing happens).
+func (s *Store) DeletePlayerFile(steamID uint64, item string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), readTimeout)
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, `DELETE FROM player_files WHERE steam_id = ? AND item = ?`, int64(steamID), item)
+	return err
 }

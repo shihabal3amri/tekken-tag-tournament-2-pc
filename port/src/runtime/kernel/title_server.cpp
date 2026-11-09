@@ -26,13 +26,23 @@
 // player's last upload (server/PROTOCOL.md "Player files"), else from that player's game while it
 // is connected to this one (xsocket.cpp) - never this player's own file (MEASURED 2026-10-23, the
 // user: the opponent's license showed "mine instead of the opponent", under their name).
+//
+// Ranks (server/PROTOCOL.md "Ranks"): a community server whose ranks are its own keeps the license and penalties its
+// players play with there. While the game plays on such a server, user 0's licence.dat / penalty.dat are read from
+// it and written back to it - never to this PC (a player's own rank stays theirs on Steam and on other servers, and
+// what they earn there stays there). Anywhere else (Steam, a server whose ranks are each player's own) they are this
+// PC's files. Where the license was last read from is its "home": what the game writes goes to that home even when
+// the network changed meanwhile (dropped when that server is gone), and rank_sync.cpp makes the game read its license
+// again when the network's home is another one - the game keeps the license it read in memory.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include "gin_service.h"
 #include "kernel_shared.h"
 #include "kernel_content.h"
 #include "title_server.h"
+#include "rank_sync.h"
 #include "save_store.h"
+#include "server_ui.h"
 #include "community_net.h"
 #include "net_transport.h"
 #include "xlive.h"
@@ -201,10 +211,138 @@ void WriteResults(uint8_t* base, uint32_t results, uint32_t cbResults, uint32_t 
 }
 }
 
+// ---- Ranks: the home of user 0's license
+namespace {
+std::mutex g_homeMutex;
+bool g_homeKnown = false;                 // the license was read in this game session
+std::string g_home;                       // where from: a server's key (its ranks are its own), "" = this PC
+std::vector<uint8_t> g_homeLicence;       // a server home's license as last read / written (for peers that ask)
+
+// The items a server whose ranks are its own keeps for user 0 (penalty.dat: penalties for a ranked match left early,
+// counted against the license at the next visit).
+bool RankItem(const std::string& item) { return item == "licence.dat" || item == "penalty.dat"; }
+
+// The network's home now: the key of the server played on when its ranks are its own (and the client), else "".
+std::string NetworkHome(std::shared_ptr<community::Client>* client = nullptr)
+{
+    std::shared_ptr<community::Client> server = net::Community();
+    if (!server || !server->ServerRanks()) return {};
+    if (client) *client = server;
+    return server->ServerKey();
+}
+
+std::string KeyText(const std::string& key) { return key.empty() ? std::string("this PC") : "the server " + key.substr(0, 16); }
+
+// A beginner's license, as the game makes a new one (sub_826CF508: version 0x0105 / 1, everything else zero). For a
+// server whose ranks are its own and that has none of the player's yet: "not found" would make the game build one
+// from the player's own save.
+std::vector<uint8_t> BeginnerLicence()
+{
+    std::vector<uint8_t> body(3400, 0);
+    body[0] = 0x01;
+    body[1] = 0x05;
+    body[3] = 1;
+    return rank_sync::PackLicence(body.data());
+}
+
+// user 0's licence.dat / penalty.dat read from the network's home: the server's copy, or this PC's file. 1 found,
+// 0 none, -1 no answer from the server (the game's storage error; this PC's file is never read instead).
+int ReadRankItem(const std::string& path, const std::string& item, std::vector<uint8_t>& data)
+{
+    std::shared_ptr<community::Client> server;
+    const std::string home = NetworkHome(&server);
+    int found = 0;
+    if (!home.empty())
+        found = server->GetFile(0, item, data, 8000);
+    else if (std::filesystem::path file; UserStorageFile(path, file))
+        found = (data = ReadFileBytes(file)).empty() ? 0 : 1;
+    if (found != 1) data.clear();
+    if (found == 0 && !home.empty() && item == "licence.dat")
+    {
+        data = BeginnerLicence();
+        found = 1;
+        std::fprintf(stderr, "[ranks] %s has no license of this player yet: a beginner's\n", KeyText(home).c_str());
+    }
+    else if (found == 0 && home.empty() && item == "licence.dat" && rank_sync::OwnLicence(data))
+    {
+        // none on this PC while the save holds a server's license fields: the game would build this PC's from those
+        found = 1;
+        std::fprintf(stderr, "[ranks] this PC has no license file: the player's own, taken aside from their save\n");
+    }
+    if (item == "licence.dat" && found >= 0)
+    {
+        std::lock_guard l(g_homeMutex);
+        if (!g_homeKnown || g_home != home)
+            std::fprintf(stderr, "[ranks] the license is read from %s%s\n", KeyText(home).c_str(),
+                         home.empty() ? "" : " (its ranks are its own)");
+        g_homeKnown = true;
+        g_home = home;
+        g_homeLicence = home.empty() ? std::vector<uint8_t>() : data;
+    }
+    return found;
+}
+
+// user 0's licence.dat / penalty.dat written (data) or deleted (!data) at the license's home: true when done.
+bool WriteRankItem(const std::string& path, const std::string& item, const std::vector<uint8_t>* data)
+{
+    std::string home;
+    {
+        std::lock_guard l(g_homeMutex);
+        home = g_homeKnown ? g_home : std::string();
+    }
+    if (home.empty())
+    {
+        std::filesystem::path file;
+        if (!UserStorageFile(path, file)) return false;
+        std::error_code ec;
+        if (!data) return std::filesystem::remove(file, ec);
+        std::filesystem::create_directories(file.parent_path(), ec);
+        const std::filesystem::path temp = file.wstring() + L".tmp";
+        {
+            std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+            if (out && !data->empty()) out.write(reinterpret_cast<const char*>(data->data()), std::streamsize(data->size()));
+        }
+        std::filesystem::rename(temp, file, ec);
+        if (ec) return false;
+        // the license other players view: a server whose ranks are each player's own keeps the last one
+        if (item == "licence.dat" && !data->empty() && data->size() <= community::kMaxPlayerFile)
+            if (const std::shared_ptr<community::Client> server = net::Community(); server && server->KeepsFiles() && !server->ServerRanks())
+                server->PutFile(xlive::OnlineXuid(0), item, *data);
+        return true;
+    }
+    std::shared_ptr<community::Client> server;
+    if (NetworkHome(&server) != home)
+    {
+        // read from a server the game no longer plays on: it is that server's, and never this PC's
+        std::fprintf(stderr, "[ranks] %s %s not kept: it belongs to %s, which the game no longer plays on\n",
+                     item.c_str(), data ? "written" : "deleted", KeyText(home).c_str());
+        return true;
+    }
+    if (!data || data->empty()) server->DeleteOwnFile(xlive::OnlineXuid(0), item);   // an empty file reads as none
+    else if (data->size() <= community::kMaxPlayerFile) server->PutFile(xlive::OnlineXuid(0), item, *data);
+    else return false;
+    if (data && item == "licence.dat")
+    {
+        std::lock_guard l(g_homeMutex);
+        g_homeLicence = *data;
+    }
+    return true;
+}
+} // namespace
+
 bool TitleServerOwnItem(uint64_t owner, const std::string& item, std::vector<uint8_t>& data)
 {
     std::filesystem::path file;
     if (!SharedItem(item) || !owner || !XamLocalUserXuid(owner) || !UserStorageFile("/" + item, file)) return false;
+    {
+        // on a server whose ranks are its own: that server's license of this player, never this PC's
+        std::lock_guard l(g_homeMutex);
+        if (g_homeKnown && !g_home.empty())
+        {
+            data = g_homeLicence;
+            return !data.empty() && data.size() <= community::kMaxPlayerFile;
+        }
+    }
     data = ReadFileBytes(file);
     return !data.empty() && data.size() <= community::kMaxPlayerFile;
 }
@@ -213,9 +351,22 @@ void TitleServerShareOwnFiles(const std::shared_ptr<community::Client>& server)
 {
     const uint64_t own = xlive::OnlineXuid(0);
     std::vector<uint8_t> data;
-    if (!server || !server->KeepsFiles() || !own || !TitleServerOwnItem(own, "licence.dat", data)) return;
+    // a server whose ranks are its own has this player's license already (the one it keeps)
+    if (!server || !server->KeepsFiles() || server->ServerRanks() || !own || !TitleServerOwnItem(own, "licence.dat", data)) return;
     server->PutFile(own, "licence.dat", data);
     std::fprintf(stderr, "[title-server] licence.dat (%zu bytes) given to the server\n", data.size());
+}
+
+bool TitleServerLicenceFromServer()
+{
+    std::lock_guard l(g_homeMutex);
+    return g_homeKnown && !g_home.empty();
+}
+
+bool TitleServerLicenceAtHome()
+{
+    std::lock_guard l(g_homeMutex);
+    return !g_homeKnown || g_home == NetworkHome();
 }
 
 bool TitleServerEnabled()
@@ -315,6 +466,44 @@ PPC_FUNC(sub_82853C28)
             bytes = uint32_t(image.size());
         }
     }
+    else if (user == 0 && RankItem(item))
+    {
+        // user 0's license / penalties: from the network's home (Ranks). An overlapped request completes later from
+        // a worker, as the other players' items do: ONLINE MODE connects the saved server as it opens, and the
+        // game reads the license (state_sync_storage) before that is done, so the worker waits for the visit's
+        // network first (as the game's web requests do), then asks the server, or reads this PC's file.
+        auto serve = [=](uint32_t& got, uint32_t& ext) {
+            std::vector<uint8_t> data;
+            const int found = ReadRankItem(name, item, data);
+            if (found < 0)
+            {
+                got = 0;
+                ext = 0x80004005u;
+                return ERROR_FUNCTION_FAILED_;
+            }
+            return Deliver(base, data, buffer, cbBuffer, got, ext);
+        };
+        if (overlapped && !XamValidateOverlapped(base, overlapped))
+        {
+            GWrite32(base, overlapped + 4, 0);
+            GWrite32(base, overlapped + 24, 0);
+            std::atomic_thread_fence(std::memory_order_release);
+            GWrite32(base, overlapped, ERROR_IO_PENDING_);
+            std::thread([=] {
+                server_ui::WaitForNetwork(15000);
+                const bool remote = !NetworkHome().empty();
+                uint32_t got = 0, ext = 0;
+                const uint32_t r = serve(got, ext);
+                WriteResults(base, results, cbResults, got, owner);
+                std::fprintf(stderr, "[title-server] user %u download '%s' -> %s (%u bytes, %s)\n", user, name.c_str(),
+                             r ? "not served" : "served", got, remote ? "the server's" : "this PC's");
+                XamCompleteOverlapped(base, overlapped, r, 0, ext);
+            }).detach();
+            ctx.r3.u32 = ERROR_IO_PENDING_;
+            return;
+        }
+        result = serve(bytes, extended);
+    }
     else
     {
         // One of this PC's players' items: the copy the game uploaded before, else "not found".
@@ -341,7 +530,13 @@ PPC_FUNC(sub_82853F08)
     const uint64_t owner = PathOwner(name);
     uint32_t result = ERROR_FUNCTION_FAILED_, extended = 0x80004005u;
     std::filesystem::path file;
-    if ((!owner || XamLocalUserXuid(owner)) && UserStorageFile(name, file) && (size == 0 || XamGuestRange(buffer, size, 1)) &&
+    if (user == 0 && (!owner || XamLocalUserXuid(owner)) && RankItem(ItemOf(name)) && (size == 0 || XamGuestRange(buffer, size, 1)))
+    {
+        // user 0's license / penalties: to the license's home (Ranks)
+        const std::vector<uint8_t> data(base + buffer, base + buffer + size);
+        if (WriteRankItem(name, ItemOf(name), &data)) { result = ERROR_SUCCESS_; extended = 0; }
+    }
+    else if ((!owner || XamLocalUserXuid(owner)) && UserStorageFile(name, file) && (size == 0 || XamGuestRange(buffer, size, 1)) &&
         size <= (16u << 20))
     {
         std::error_code ec;
@@ -373,7 +568,9 @@ PPC_FUNC(sub_828539C8)
     std::filesystem::path file;
     std::error_code ec;
     const uint64_t owner = PathOwner(name);
-    const bool removed = (!owner || XamLocalUserXuid(owner)) && UserStorageFile(name, file) && std::filesystem::remove(file, ec);
+    const bool removed = (!owner || XamLocalUserXuid(owner)) &&
+                         (user == 0 && RankItem(ItemOf(name)) ? WriteRankItem(name, ItemOf(name), nullptr)    // at the license's home
+                                                              : UserStorageFile(name, file) && std::filesystem::remove(file, ec));
     const uint32_t result = removed ? ERROR_SUCCESS_ : ERROR_FUNCTION_FAILED_;
     std::fprintf(stderr, "[title-server] user %u delete '%s' -> %s\n", user, name.c_str(), removed ? "deleted" : "not found");
     ctx.r3.u32 = overlapped ? XamCompleteOverlapped(base, overlapped, result, 0, removed ? 0 : XONLINE_E_STORAGE_FILE_NOT_FOUND)

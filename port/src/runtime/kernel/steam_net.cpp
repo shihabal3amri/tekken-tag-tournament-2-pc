@@ -34,8 +34,34 @@ namespace steamnet::direct {
 namespace {
 
 // Lobbies of other builds / games are ignored: the protocol string (and its history) lives in
-// net_transport.cpp, net::GameProtocol - community servers use the same one.
-const char* Protocol() { return net::GameProtocol(); }
+// net_transport.cpp, net::GameProtocol - community servers use the same one. PAIR PLAY's lobbies (online_2v2_pair.cpp)
+// carry it with "-pair3": only PAIR PLAY's searches list them (and Player Match's never), builds without PAIR PLAY never
+// see them; a join (an invite) takes either. This code may run in the Steam helper (steam_bridge.cpp), which knows no
+// menus: a lobby is PAIR PLAY's when its record says so (mm::kPairRoom in the record's last word, its netcode), a search
+// when the game's request says so. "-pair2": the 2v2 stream carries whole entries and the fighters tell the partners the
+// round's go (online_2v2.cpp) - the first PAIR PLAY test build ("-pair") drifts with those; the two never meet.
+// "-pair3" (TEST 18, 2026-11-04): the room host's START, the places before character select, the picks' characters
+// and the rematch menu (online_rematch.cpp) - a "-pair2" room starts by its TEAMS row and never sends them.
+// "-pair4" (TEST 19, 2026-11-07): the native PAIR PLAY flow - the room's READY / 16 s rotation for the marked four, the
+// PAIR PLAY screen straight from the room's start, the end menu's straight paths (online_straight.cpp).
+const std::string& PairProtocol()
+{
+    static const std::string pair = std::string(net::GameProtocol()) + "-pair4";
+    return pair;
+}
+constexpr uint32_t kPairRoomBit = 0x40000000u;  // matchmaking.h mm::kPairRoom
+bool PairRecord(const std::vector<uint8_t>& rec)
+{
+    if (rec.size() < 16) return false;
+    const size_t at = rec.size() - 4;
+    const uint32_t netcode = uint32_t(rec[at]) | uint32_t(rec[at + 1]) << 8 | uint32_t(rec[at + 2]) << 16 | uint32_t(rec[at + 3]) << 24;
+    return (netcode & kPairRoomBit) != 0;
+}
+const char* Protocol(bool pair) { return pair ? PairProtocol().c_str() : net::GameProtocol(); }
+bool OurProtocol(const char* proto)
+{
+    return proto && (std::strcmp(proto, net::GameProtocol()) == 0 || PairProtocol() == proto);
+}
 constexpr int kChannel = 0;
 
 std::atomic<bool> g_running{ false };
@@ -182,8 +208,8 @@ void ReportPeers()
 
 void WriteLobbyData(uint64_t lobby, const std::vector<uint8_t>& record)
 {
-    CSteamID id(lobby);
-    SteamMatchmaking()->SetLobbyData(id, "proto", Protocol());
+    CSteamID id(static_cast<uint64>(lobby));
+    SteamMatchmaking()->SetLobbyData(id, "proto", Protocol(PairRecord(record)));
     SteamMatchmaking()->SetLobbyData(id, "rec", Hex(record).c_str());
 }
 
@@ -284,7 +310,7 @@ void Service()
                 {
                     const CSteamID lobby(g_joinLobby);
                     const char* proto = SteamMatchmaking()->GetLobbyData(lobby, "proto");
-                    if (proto && std::strcmp(proto, Protocol()) == 0)
+                    if (OurProtocol(proto))
                     {
                         g_joinRecord = Unhex(SteamMatchmaking()->GetLobbyData(lobby, "rec"));
                         g_joinReady = !g_joinRecord.empty();
@@ -415,11 +441,11 @@ void RemoveLobby(uint64_t sessionId)
     else it->second.removed = true;                       // leave once the creation completes
 }
 
-std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs)
+std::vector<std::vector<uint8_t>> ListLobbies(int max, int timeoutMs, bool pair)
 {
     std::vector<std::vector<uint8_t>> out;
     if (!g_running) return out;
-    SteamMatchmaking()->AddRequestLobbyListStringFilter("proto", Protocol(), k_ELobbyComparisonEqual);
+    SteamMatchmaking()->AddRequestLobbyListStringFilter("proto", Protocol(pair), k_ELobbyComparisonEqual);
     SteamMatchmaking()->AddRequestLobbyListDistanceFilter(k_ELobbyDistanceFilterWorldwide);
     SteamMatchmaking()->AddRequestLobbyListResultCountFilter(max);
     const SteamAPICall_t call = SteamMatchmaking()->RequestLobbyList();
@@ -535,7 +561,7 @@ uint64_t LocalId() { return 0; }
 bool Send(uint64_t, bool, const void*, size_t) { return false; }
 void PublishLobby(uint64_t, const std::vector<uint8_t>&) {}
 void RemoveLobby(uint64_t) {}
-std::vector<std::vector<uint8_t>> ListLobbies(int, int) { return {}; }
+std::vector<std::vector<uint8_t>> ListLobbies(int, int, bool) { return {}; }
 bool TakeJoinRequest(std::vector<uint8_t>&) { return false; }
 bool WebApiTicket(const std::string&, std::string&, uint32_t&, int) { return false; }
 void CancelTicket(uint32_t) {}

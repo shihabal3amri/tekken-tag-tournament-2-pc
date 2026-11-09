@@ -6,7 +6,9 @@
 //   - the disc's files (dataNNN.bin archives, nrfo.bin, ...), 26 archives LZX-expanded on the way;
 //   - TU3's data100.bin (expanded) + data100.ofs into game\update (the game's "update:" device);
 //   - game\tekken.img: the disc's Default.xex with TU3's Default.xexp applied, decrypted - checked
-//     against the SHA-1 of the image the port's executable was recompiled from.
+//     against the SHA-1 of the image the port's executable was recompiled from;
+//   - optionally the player's downloadable content packages into game\dlc (dlc_install.cpp); with
+//     no disc image and title update given, only that, into an installed game of this build.
 // The only files carried inside this executable are ours (the port's exe, the Steamworks client
 // library, the VC++ runtime, a readme) and an original icon.
 //
@@ -16,6 +18,7 @@
 // Uninstalling leaves %LOCALAPPDATA%\TTT2Recomp alone unless the player ticks the box.
 #include "setup/payload_ids.h"
 #include "setup/payload.h"
+#include "setup/dlc_install.h"
 #include "setup/game_data.h"
 #include "setup/stfs.h"
 #include "setup/xdvdfs.h"
@@ -29,6 +32,7 @@
 #include <cwctype>
 
 #include <algorithm>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -56,8 +60,11 @@ static const wchar_t kImageName[]    = L"game\\tekken.img";
 
 struct InstallJob {
     HWND         dlg = nullptr;
-    std::wstring iso, tu, dest;
+    std::wstring iso, tu, dest, dlc;            // dlc: optional (a folder or one package)
+    bool         dlcOnly = false;               // no disc image and title update: add the DLC to an install
     bool         scDesktop = true, scStartMenu = true;
+    int          dlcInstalled = 0;
+    std::vector<std::wstring> dlcSkipped;      // damaged packages left out: "<display name>: <why>"
     volatile LONG cancel = 0;
 
     CRITICAL_SECTION lock;
@@ -242,7 +249,10 @@ struct Planned { const IsoEntry* entry; uint64_t outBytes; bool expand; };
 // few minutes on all cores. Its "[shaders] <done>/<total>" lines move the bar from `from` to `to` %.
 // Not fatal when it cannot run or fails: the game runs it again in the background at its next start.
 // False: cancelled.
-static bool PrepareShaders(InstallJob* job, int from, int to) {
+// warm: then `--warm-driver all` - every prepared shader drawn once, so the graphics driver compiles them
+// for the GPU now (and keeps them in its own cache) instead of at their first draw in a fight; its "[warm] N / M drawn"
+// lines move the bar. Measured: first-use stalls in fights 12 -> 0 over three stages (RX 9070 XT, 13,462 shaders in 67 s).
+static bool PrepareShaders(InstallJob* job, int from, int to, bool warm = false) {
     const std::wstring exe = job->dest + L"\\" + kGameExeName;
     SECURITY_ATTRIBUTES sa = { sizeof sa, nullptr, TRUE };
     HANDLE rd = nullptr, wr = nullptr;
@@ -253,7 +263,7 @@ static bool PrepareShaders(InstallJob* job, int from, int to) {
     si.hStdOutput = wr;
     si.hStdError = wr;
     PROCESS_INFORMATION pi = {};
-    std::wstring line = L"\"" + exe + L"\" --build-shaders";
+    std::wstring line = L"\"" + exe + (warm ? L"\" --warm-driver all" : L"\" --build-shaders");
     std::vector<wchar_t> cmd(line.begin(), line.end());
     cmd.push_back(0);
     const BOOL started = CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS,
@@ -261,7 +271,8 @@ static bool PrepareShaders(InstallJob* job, int from, int to) {
     CloseHandle(wr);
     if (!started) { CloseHandle(rd); return true; }
     CloseHandle(pi.hThread);
-    job->Set(from, L"Preparing the game's shaders (one time, for smooth play)\x2026");
+    job->Set(from, warm ? L"Preparing the graphics driver (one time, for smooth play)\x2026"
+                        : L"Preparing the game's shaders (one time, for smooth play)\x2026");
     std::string pending;
     char buf[4096];
     DWORD n = 0;
@@ -271,12 +282,14 @@ static bool PrepareShaders(InstallJob* job, int from, int to) {
         pending.append(buf, n);
         for (size_t eol; (eol = pending.find('\n')) != std::string::npos; pending.erase(0, eol + 1)) {
             unsigned done = 0, total = 0;
-            if (sscanf_s(pending.substr(0, eol).c_str(), "[shaders] %u/%u", &done, &total) != 2 || !total) continue;
+            if (sscanf_s(pending.substr(0, eol).c_str(), warm ? "[warm] %u / %u" : "[shaders] %u/%u", &done, &total) != 2 || !total)
+                continue;
             const int pct = from + (int)((uint64_t)done * (to - from) / total);
             if (pct == shown && done != total) continue;
             shown = pct;
             wchar_t s[160];
-            swprintf_s(s, L"Preparing the game's shaders (one time, for smooth play): %u of %u\x2026", done, total);
+            swprintf_s(s, warm ? L"Preparing the graphics driver (one time, for smooth play): %u of %u\x2026"
+                               : L"Preparing the game's shaders (one time, for smooth play): %u of %u\x2026", done, total);
             job->Set(pct, s);
         }
         if (InterlockedCompareExchange(&job->cancel, 0, 0)) {
@@ -291,9 +304,84 @@ static bool PrepareShaders(InstallJob* job, int from, int to) {
     return !cancelled;
 }
 
+static bool EnoughSpace(InstallJob* job, uint64_t need) {
+    ULARGE_INTEGER freeAvail = {};
+    if (!GetDiskFreeSpaceExW(job->dest.substr(0, 3).c_str(), &freeAvail, nullptr, nullptr) || freeAvail.QuadPart >= need)
+        return true;
+    wchar_t msg[256];
+    swprintf_s(msg, L"There is not enough free space on that drive. About %.1f GB is needed.", need / 1e9);
+    return Fail(job, msg);
+}
+
+// The packages in the chosen folder; nothing found is an error (the player asked for it).
+static bool FindDlcPackages(InstallJob* job, std::vector<DlcPackage>& dlcs) {
+    int damaged = 0;
+    dlcs = FindDlc(job->dlc, &damaged);
+    if (!dlcs.empty()) return true;
+    if (damaged)
+        return Fail(job, L"The downloadable content in that folder could not be read: the packages are damaged or incomplete.");
+    return Fail(job, L"No Tekken Tag Tournament 2 downloadable content was found there. Choose the folder holding the "
+                     L"packages (files named with 40 or more letters and digits, often in a folder named 4E4D0859 or "
+                     L"00000002), or leave the field empty.");
+}
+
+// The player's downloadable content into game\dlc. A damaged package is left out and named in the final message;
+// false: cancelled.
+static bool InstallDlcs(InstallJob* job, const std::vector<DlcPackage>& dlcs, const std::wstring& gameDir, uint64_t& done,
+                        const std::function<bool(const std::wstring&, uint64_t)>& report) {
+    for (const DlcPackage& p : dlcs) {
+        const std::wstring what = L"Installing downloadable content: " + p.display + L"\x2026";
+        std::string err;
+        if (InstallDlc(p, gameDir, [&](uint64_t w) { return report(what, w); }, job->written, err)) ++job->dlcInstalled;
+        else if (InterlockedCompareExchange(&job->cancel, 0, 0)) return false;
+        else job->dlcSkipped.push_back(p.display + L": " + Widen(err));
+        done += p.bytes;
+    }
+    if (!job->dlcSkipped.empty()) {
+        std::wstring s = L"Downloadable content left out (damaged or incomplete):";
+        for (const std::wstring& x : job->dlcSkipped) s += L"\n  " + x;
+        job->Set(job->pct, s);
+    }
+    return true;
+}
+
+// Downloadable content only, into a game this installer installed (the same build: an older game would not list it).
+static bool RunDlcOnly(InstallJob* job) {
+    job->Set(1, L"Checking the installed game\x2026");
+    if (!LooksLikeInstall(job->dest))
+        return Fail(job, L"To add downloadable content only, choose the folder the game is installed in. To install the "
+                         L"game, choose your disc image and Title Update 3 as well.");
+    if (!InstalledExeMatches(job->dest.c_str()))
+        return Fail(job, L"The game in that folder is not this version of the port. Install it with this installer first "
+                         L"(choose your disc image and Title Update 3 too; the downloadable content can come along).");
+    job->Set(2, L"Looking for downloadable content\x2026");
+    std::vector<DlcPackage> dlcs;
+    if (!FindDlcPackages(job, dlcs)) return false;
+    uint64_t total = 0;
+    for (const DlcPackage& p : dlcs) total += p.bytes;
+    if (!EnoughSpace(job, total + (64ull << 20))) return false;
+    uint64_t done = 0, shown = 0;
+    auto report = [&](const std::wstring& what, uint64_t extra) {
+        if (InterlockedCompareExchange(&job->cancel, 0, 0)) return false;
+        if (done + extra - shown > (16u << 20) || extra == 0) {
+            shown = done + extra;
+            job->Set(5 + (int)((done + extra) * 90 / (total ? total : 1)), what);
+        }
+        return true;
+    };
+    if (!InstallDlcs(job, dlcs, job->dest + L"\\game", done, report)) return Fail(job, L"Installation cancelled.");
+    if (!job->dlcInstalled) return Fail(job, L"None of the downloadable content could be installed: every package is damaged or incomplete.");
+    job->ok = true;
+    job->Set(100, L"Done.");
+    return true;
+}
+
 static bool RunInstall(InstallJob* job) {
     std::string err;
     std::wstring why;
+    job->dlcInstalled = 0;
+    job->dlcSkipped.clear();
+    if (job->dlcOnly) return RunDlcOnly(job);
 
     job->Set(1, L"Reading the disc image\x2026");
     XdvdfsImage img;
@@ -318,6 +406,12 @@ static bool RunInstall(InstallJob* job) {
     const uint64_t tuExpanded = RecordExpandedSize(tuIndex);
     if (tuArchive.size() < 16 || !IsLzxContainer(tuArchive.data()) || !tuExpanded)
         return Fail(job, L"The title update file is incomplete or damaged.");
+
+    std::vector<DlcPackage> dlcs;
+    if (!job->dlc.empty()) {
+        job->Set(2, L"Looking for downloadable content\x2026");
+        if (!FindDlcPackages(job, dlcs)) return false;
+    }
 
     job->Set(3, L"Applying Title Update 3 to the game\x2026");
     std::vector<uint8_t> image;
@@ -353,16 +447,8 @@ static bool RunInstall(InstallJob* job) {
         plan.push_back(p);
         total += p.outBytes;
     }
-
-    ULARGE_INTEGER freeAvail = {};
-    if (GetDiskFreeSpaceExW(job->dest.substr(0, 3).c_str(), &freeAvail, nullptr, nullptr)) {
-        const uint64_t need = total + PayloadBytes() + (256ull << 20);
-        if (freeAvail.QuadPart < need) {
-            wchar_t msg[256];
-            swprintf_s(msg, L"There is not enough free space on that drive. About %.1f GB is needed.", need / 1e9);
-            return Fail(job, msg);
-        }
-    }
+    for (const DlcPackage& p : dlcs) total += p.bytes;
+    if (!EnoughSpace(job, total + PayloadBytes() + (256ull << 20))) return false;
 
     job->Set(4, L"Creating the install folder\x2026");
     const std::wstring gameDir = job->dest + L"\\game";
@@ -410,6 +496,7 @@ static bool RunInstall(InstallJob* job) {
         }
         done += p.outBytes;
     }
+    if (!InstallDlcs(job, dlcs, gameDir, done, report)) return Fail(job, L"Installation cancelled.");
 
     job->Set(80, L"Installing Title Update 3 data\x2026");
     for (const wchar_t* f : { L"\\update\\data100.bin", L"\\update\\data100.ofs" }) job->written.push_back(gameDir + f);
@@ -424,7 +511,8 @@ static bool RunInstall(InstallJob* job) {
         !WriteBytes(job->dest + L"\\" + kImageName, image.data(), image.size()))
         return Fail(job, L"Could not write to the install folder (the disk may be full).");
 
-    if (!PrepareShaders(job, 82, 97)) return Fail(job, L"Installation cancelled.");
+    if (!PrepareShaders(job, 82, 92)) return Fail(job, L"Installation cancelled.");
+    if (!PrepareShaders(job, 92, 97, true)) return Fail(job, L"Installation cancelled.");
 
     job->Set(98, L"Creating shortcuts\x2026");
     wchar_t self[MAX_PATH];
@@ -471,10 +559,13 @@ static bool RunInstall(InstallJob* job) {
 // tree delete, since the folder may have held something else. Folders go only if left empty.
 static bool Install(InstallJob* job) {
     if (RunInstall(job)) return true;
-    for (const std::wstring& f : job->written) {
-        SetFileAttributesW(f.c_str(), FILE_ATTRIBUTE_NORMAL);
-        DeleteFileW(f.c_str());
+    // Newest first: a package's files before its folder (the downloadable content lists its folders too).
+    for (auto it = job->written.rbegin(); it != job->written.rend(); ++it) {
+        SetFileAttributesW(it->c_str(), FILE_ATTRIBUTE_NORMAL);
+        if (!DeleteFileW(it->c_str())) RemoveDirectoryW(it->c_str());
     }
+    job->written.clear();
+    RemoveDirectoryW((job->dest + L"\\game\\dlc").c_str());
     RemoveDirectoryW((job->dest + L"\\game\\update").c_str());
     RemoveDirectoryW((job->dest + L"\\game").c_str());
     RemoveDirectoryW(job->dest.c_str());
@@ -511,7 +602,7 @@ static std::wstring PickFile(HWND owner, const wchar_t* title, const COMDLG_FILT
     return out;
 }
 
-static std::wstring PickFolder(HWND owner) {
+static std::wstring PickFolder(HWND owner, const wchar_t* title) {
     IFileOpenDialog* dlg = nullptr;
     std::wstring out;
     if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_IFileOpenDialog, (void**)&dlg)))
@@ -519,7 +610,7 @@ static std::wstring PickFolder(HWND owner) {
     DWORD opts = 0;
     dlg->GetOptions(&opts);
     dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_PATHMUSTEXIST);
-    dlg->SetTitle(L"Choose where to install the game");
+    dlg->SetTitle(title);
     if (SUCCEEDED(dlg->Show(owner))) {
         IShellItem* item = nullptr;
         if (SUCCEEDED(dlg->GetResult(&item)) && item) {
@@ -539,8 +630,8 @@ static HANDLE     g_thread = nullptr;
 static bool       g_running = false;
 
 static void SetControlsEnabled(HWND dlg, bool on) {
-    for (int id : { IDC_ISO_PATH, IDC_ISO_BROWSE, IDC_TU_PATH, IDC_TU_BROWSE, IDC_DEST_PATH, IDC_DEST_BROWSE,
-                    IDC_SC_DESKTOP, IDC_SC_STARTMENU, IDC_INSTALL })
+    for (int id : { IDC_ISO_PATH, IDC_ISO_BROWSE, IDC_TU_PATH, IDC_TU_BROWSE, IDC_DLC_PATH, IDC_DLC_BROWSE,
+                    IDC_DEST_PATH, IDC_DEST_BROWSE, IDC_SC_DESKTOP, IDC_SC_STARTMENU, IDC_INSTALL })
         EnableWindow(GetDlgItem(dlg, id), on);
 }
 
@@ -571,22 +662,35 @@ static INT_PTR CALLBACK MainProc(HWND dlg, UINT msg, WPARAM wp, LPARAM) {
             if (!p.empty()) SetDlgItemTextW(dlg, IDC_TU_PATH, p.c_str());
             return TRUE;
         }
+        case IDC_DLC_BROWSE: {
+            std::wstring p = PickFolder(dlg, L"Choose the folder holding your Tekken Tag Tournament 2 downloadable content");
+            if (!p.empty()) SetDlgItemTextW(dlg, IDC_DLC_PATH, p.c_str());
+            return TRUE;
+        }
         case IDC_DEST_BROWSE: {
-            std::wstring p = PickFolder(dlg);
+            std::wstring p = PickFolder(dlg, L"Choose where to install the game");
             if (!p.empty()) SetDlgItemTextW(dlg, IDC_DEST_PATH, (p + L"\\" + kFolderName).c_str());
             return TRUE;
         }
         case IDC_INSTALL: {
-            wchar_t iso[MAX_PATH] = {}, tu[MAX_PATH] = {}, dest[MAX_PATH] = {};
+            wchar_t iso[MAX_PATH] = {}, tu[MAX_PATH] = {}, dlc[MAX_PATH] = {}, dest[MAX_PATH] = {};
             GetDlgItemTextW(dlg, IDC_ISO_PATH, iso, MAX_PATH);
             GetDlgItemTextW(dlg, IDC_TU_PATH, tu, MAX_PATH);
+            GetDlgItemTextW(dlg, IDC_DLC_PATH, dlc, MAX_PATH);
             GetDlgItemTextW(dlg, IDC_DEST_PATH, dest, MAX_PATH);
-            if (!iso[0] || GetFileAttributesW(iso) == INVALID_FILE_ATTRIBUTES) {
+            // Downloadable content alone: both game fields left empty.
+            const bool dlcOnly = !iso[0] && !tu[0] && dlc[0];
+            if (!dlcOnly && (!iso[0] || GetFileAttributesW(iso) == INVALID_FILE_ATTRIBUTES)) {
                 MessageBoxW(dlg, L"Choose your disc image first.", kAppName, MB_ICONINFORMATION);
                 return TRUE;
             }
-            if (!tu[0] || GetFileAttributesW(tu) == INVALID_FILE_ATTRIBUTES) {
+            if (!dlcOnly && (!tu[0] || GetFileAttributesW(tu) == INVALID_FILE_ATTRIBUTES)) {
                 MessageBoxW(dlg, L"Choose Title Update 3 (the file, or the folder holding it).", kAppName, MB_ICONINFORMATION);
+                return TRUE;
+            }
+            if (dlc[0] && GetFileAttributesW(dlc) == INVALID_FILE_ATTRIBUTES) {
+                MessageBoxW(dlg, L"The downloadable content folder was not found. Choose it again, or leave the field empty.",
+                            kAppName, MB_ICONINFORMATION);
                 return TRUE;
             }
             if (!dest[0] || wcslen(dest) < 3 || dest[1] != L':') {
@@ -598,6 +702,8 @@ static INT_PTR CALLBACK MainProc(HWND dlg, UINT msg, WPARAM wp, LPARAM) {
             g_job.dlg = dlg;
             g_job.iso = iso;
             g_job.tu = tu;
+            g_job.dlc = dlc;
+            g_job.dlcOnly = dlcOnly;
             g_job.dest = dest;
             g_job.scDesktop = IsDlgButtonChecked(dlg, IDC_SC_DESKTOP) == BST_CHECKED;
             g_job.scStartMenu = IsDlgButtonChecked(dlg, IDC_SC_STARTMENU) == BST_CHECKED;
@@ -633,14 +739,26 @@ static INT_PTR CALLBACK MainProc(HWND dlg, UINT msg, WPARAM wp, LPARAM) {
         if (g_thread) { WaitForSingleObject(g_thread, 5000); CloseHandle(g_thread); g_thread = nullptr; }
         if (g_job.ok) {
             SetDlgItemTextW(dlg, IDC_STATUS, L"Installed.");
-            std::wstring msg = std::wstring(kAppName) +
-                L" is installed.\n\nSaved games, profiles and settings are kept in your user profile, so they "
-                L"survive an uninstall.\n\nPlay now?";
+            std::wstring msg = g_job.dlcOnly
+                ? L"The downloadable content is installed (" + std::to_wstring(g_job.dlcInstalled) + L" packages)."
+                : std::wstring(kAppName) + L" is installed.\n\nSaved games, profiles and settings are kept in your user "
+                  L"profile, so they survive an uninstall.";
+            if (!g_job.dlcOnly && g_job.dlcInstalled)
+                msg += L"\n\nDownloadable content installed: " + std::to_wstring(g_job.dlcInstalled) + L" packages.";
+            if (!g_job.dlcSkipped.empty()) {
+                msg += L"\n\nLeft out, damaged or incomplete (copy them from your console again):";
+                for (const std::wstring& x : g_job.dlcSkipped) msg += L"\n  " + x;
+            }
+            msg += L"\n\nPlay now?";
             if (MessageBoxW(dlg, msg.c_str(), kAppName, MB_YESNO | MB_ICONINFORMATION) == IDYES) {
                 // Through Explorer, so the game runs as the user does from its shortcut - started from here
                 // directly it inherited the installer's administrator rights (MEASURED 2026-10-21: an elevated
                 // game whose log and state the unelevated user's tools could not read).
+                // Explorer is not the window in front, so the game it starts may not come to the front by itself,
+                // and exclusive fullscreen waits for that (the likely reason log 43, 2026-10-31, never entered it).
+                // This installer is in front (the player just answered): it lets the next program take the front.
                 std::wstring game = L"\"" + g_job.dest + L"\\" + kGameExeName + L"\"";
+                AllowSetForegroundWindow(ASFW_ANY);
                 ShellExecuteW(nullptr, L"open", L"explorer.exe", game.c_str(), g_job.dest.c_str(), SW_SHOWNORMAL);
             }
             EndDialog(dlg, 1);
@@ -788,20 +906,25 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
     const bool amUninstaller = _wcsicmp(selfName, kUninstallExe) == 0 || HasArg(cmdline, L"/uninstall");
 
     int rc = 0;
-    // /silent <disc.iso> <title update> <install folder>: the same install with no UI and a log
-    // next to the exe (scripted tests; unattended installs).
+    // /silent <disc.iso> <title update> <install folder> [dlc folder]: the same install with no UI and
+    // a log next to the exe (scripted tests; unattended installs). "-" for both game files: the DLC only.
     if (HasArg(cmdline, L"/silent")) {
         int argc = 0;
         LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-        std::wstring iso, tu, dest;
+        std::wstring iso, tu, dest, dlc;
         for (int i = 1; i < argc; ++i)
             if (_wcsicmp(argv[i], L"/silent") == 0) {
                 if (i + 3 < argc) { iso = argv[i + 1]; tu = argv[i + 2]; dest = argv[i + 3]; }
+                if (i + 4 < argc) dlc = argv[i + 4];
                 break;
             }
         if (argv) LocalFree(argv);
-        if (iso.empty() || tu.empty() || dest.empty()) {
-            MessageBoxW(nullptr, L"usage: ttt2_setup.exe /silent <disc.iso> <title update file or folder> <install folder>",
+        if (iso == L"-") iso.clear();
+        if (tu == L"-") tu.clear();
+        const bool dlcOnly = iso.empty() && tu.empty() && !dlc.empty();
+        if ((!dlcOnly && (iso.empty() || tu.empty())) || dest.empty()) {
+            MessageBoxW(nullptr, L"usage: ttt2_setup.exe /silent <disc.iso> <title update file or folder> <install folder> [DLC folder]\n"
+                                 L"(\"-\" for the disc image and title update: add the DLC to an installed game)",
                         kAppName, MB_ICONINFORMATION);
             CoUninitialize();
             return 2;
@@ -811,6 +934,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
         g_job.dlg = nullptr;
         g_job.iso = iso;
         g_job.tu = tu;
+        g_job.dlc = dlc;
+        g_job.dlcOnly = dlcOnly;
         g_job.dest = dest;
         g_job.scDesktop = g_job.scStartMenu = false;
         g_job.log = CreateFileW(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -821,6 +946,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR cmdline, int) {
         g_job.Set(0, L"[args] <" + std::wstring(cmdline ? cmdline : L"") + L">");
         const DWORD start = GetTickCount();
         const bool ok = Install(&g_job);
+        if (!g_job.dlc.empty()) {
+            wchar_t d[96];
+            swprintf_s(d, L"[dlc] %d installed, %zu left out", g_job.dlcInstalled, g_job.dlcSkipped.size());
+            g_job.Set(g_job.pct, d);
+        }
         wchar_t took[64];
         swprintf_s(took, L"[time] %.1f s", (GetTickCount() - start) / 1000.0);
         g_job.Set(g_job.pct, took);

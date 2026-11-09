@@ -15,3 +15,9 @@ std::vector<uint8_t> TitleStorageImage(uint32_t level, uint32_t bufferBytes);
 bool TitleServerOwnItem(uint64_t owner, const std::string& item, std::vector<uint8_t>& data);
 // After a login to a community server that keeps player files: this player's license, so others can view it.
 void TitleServerShareOwnFiles(const std::shared_ptr<community::Client>& server);
+// Ranks (server/PROTOCOL.md): false while the license the game read last came from another home than the network's
+// now (a server whose ranks are its own, or this PC) - the game must read it again (rank_sync.cpp); true before the
+// first read.
+bool TitleServerLicenceAtHome();
+// The license the game read last came from a server whose ranks are its own.
+bool TitleServerLicenceFromServer();

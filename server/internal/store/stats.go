@@ -326,7 +326,8 @@ func (s *Store) byXUID(xuids []uint64, column string, found func(xuid uint64, n 
 	return q.Err()
 }
 
-// Wipe forgets a player's statistics, uploads, ghosts, replays and profile (a cheater's rows); the player stays known (bans, seen).
+// Wipe forgets a player's statistics, uploads, ghosts, replays, profile and license files - on a server whose ranks
+// are its own, their rank there (a cheater's rows); the player stays known (bans, seen).
 func (s *Store) Wipe(steamID uint64) (int64, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -337,7 +338,7 @@ func (s *Store) Wipe(steamID uint64) (int64, error) {
 	defer tx.Rollback()
 	var n int64
 	for _, q := range []string{`DELETE FROM stats WHERE steam_id = ?`, `DELETE FROM uploads WHERE steam_id = ?`, `DELETE FROM profiles WHERE steam_id = ?`,
-		`DELETE FROM ghosts WHERE steam_id = ?`, `DELETE FROM replays WHERE steam_id = ?`} {
+		`DELETE FROM ghosts WHERE steam_id = ?`, `DELETE FROM replays WHERE steam_id = ?`, `DELETE FROM player_files WHERE steam_id = ?`} {
 		r, err := tx.ExecContext(ctx, q, int64(steamID))
 		if err != nil {
 			return 0, err

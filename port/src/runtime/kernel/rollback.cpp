@@ -27,9 +27,13 @@
 // left (fighter words and pages that differ are logged). The fight then goes on from the
 // re-simulated state, as it will in a real rollback. TTT2_RB_FROM (600): fight updates before the
 // hot set is learned (the round intro still streams assets). "[rb]" log lines.
+#include "online_2v2.h"
 #include "kernel_shared.h"
+#include "award_journal.h"
 #include "guest_heap.h"
 #include "save_store.h"
+#include "timeline.h"
+#include "unlock_all.h"
 #include <windows.h>
 #include <intrin.h>
 #include <algorithm>
@@ -46,6 +50,8 @@
 #include <unordered_set>
 #include <thread>
 #include <vector>
+
+extern std::atomic<uint32_t> g_stageLoads;   // kernel_video.cpp: read by the renderer (gpu_hw_d3d11.h FollowStageLoad)
 
 extern "C" PPC_FUNC(__imp__sub_825EF0B8);
 extern "C" PPC_FUNC(__imp__sub_822745B0);
@@ -92,7 +98,10 @@ void ResimScratchStats(uint64_t& allocs, uint64_t& bytes, uint64_t& refused);
 double GpuCpFrameMs();               // kernel_video.cpp: the command processor's work per frame (average)
 
 void GuestThreadBlocks(std::vector<std::pair<uint32_t, uint32_t>>& out);   // kernel_thread.cpp
+void GuestThreadBlocksForFight(std::vector<std::pair<uint32_t, uint32_t>>& out);   // kernel_thread.cpp: + spares, a new epoch
+void GuestThreadBlocksFightOver(uint32_t& madeThisFight, std::vector<std::pair<uint32_t, uint32_t>>* blocks);   // kernel_thread.cpp
 void GameHeapOps(uint64_t& thread, uint64_t& all);                          // diag_hooks.cpp
+void DiagHeapRewound();                                                      // diag_hooks.cpp (TTT2_DIAG_HEAPCHECK)
 namespace hitch { uint32_t GuestEntryOfThread(DWORD tid); void DumpGuestThreads(); int GuestContexts(DWORD* tids, uint32_t* entries, PPCContext** ctxs, int max); }
 // rollback_session.cpp: online rollback sessions over NACE (TTT2_ROLLBACK=1).
 bool SessionEnabled();
@@ -104,7 +113,12 @@ void SessionOwnPump(bool own);
 int SessionPrePump(PPCContext& ctx, uint8_t* base, int32_t& real, bool& ready);
 bool SessionNext(PPCContext& ctx, uint8_t* base);
 int32_t SessionRealFrame();
+bool SessionSpectator();
 int32_t SessionConfirmedFrame();   // rollback_session.cpp: NACE node 0's confirmed frame (-9 none)
+int32_t SessionEndBattleFrame();   // rollback_session.cpp: the end-of-battle request's session frame (-1 none)
+int KernelGuestThreadsWithEntry(uint32_t entry);   // kernel_thread.cpp: live guest threads started there
+unsigned long KernelGuestThreadTidWithEntry(uint32_t entry);   // kernel_thread.cpp: one's host thread id, 0 none
+bool XamSaveJobAsksPlayer();       // kernel_ui.cpp: the save / load job waits for the player's answer to a system box
 bool SaveInProgress();             // below: a save container is open (RollbackSaveOpen)
 bool SessionYield();               // rollback_session.cpp: time sync - this update yields a frame
 double SessionTimeSyncGiven();     // rollback_session.cpp: frames the time sync gave up this session
@@ -144,6 +158,10 @@ int Every() { static const int v = Env("TTT2_RB_EVERY", 30, 1, 1 << 30); return 
 int CalibrateFrom() { static const int v = Env("TTT2_RB_FROM", SessionEnabled() ? 30 : 600, 1, 1 << 30); return v; }
 // The machinery runs for the sync test or for online rollback sessions.
 bool MachineryOn() { return Depth() > 0 || SessionEnabled(); }
+// The audio timeline's memory kept out of rewinds: XAudio2's heap blocks in the never-rewound arena
+// (RollbackAudioArenaOn, diag_hooks.cpp's XMemAlloc hook) and the audio libraries' statics masked (kAudioStatics).
+// TTT2_RB_AUDIOARENA=0: neither (as before; A/B tests only).
+bool AudioArenaEnv() { static const bool on = [] { const char* e = std::getenv("TTT2_RB_AUDIOARENA"); return !(e && *e == '0'); }(); return on; }
 // TTT2_RB_SET=update: the hot set is only the pages written while an update runs; pages only the
 // draw writes (render lists, the D3D runtime's dynamic-buffer bookkeeping - rewinding that while
 // frames were in flight drew the fighters with garbage vertices) are never rewound.
@@ -377,9 +395,16 @@ std::vector<Island> g_islands;
 void AdoptPendingIslands();   // below: routers noted since (main thread)
 void HavokCalibrationStart();                     // below ("Havok")
 bool CheckHavokFreeLists(const char* where);
-struct Image { uint64_t frame = ~0ull; size_t pages = 0; std::vector<uint8_t> data; size_t islands = 0; std::vector<uint8_t> islandData; };
+struct Image
+{
+    uint64_t frame = ~0ull; size_t pages = 0; std::vector<uint8_t> data; size_t islands = 0; std::vector<uint8_t> islandData;
+    int8_t saveJob = 0;                // a session snapshot taken while the save / load job ran: 1 no container open, 2 open (log only)
+    float saveJobMs = 0;               // ms after the job's request
+};
+void NoteSnapshotSaveJob(Image& img, uint64_t frame);   // below (SaveJobRunning's neighbour)
 void Save(Image& img, uint64_t frame)
 {
+    NoteSnapshotSaveJob(img, frame);
     img.frame = frame;
     img.pages = g_hot.size();
     if (img.data.size() < img.pages * kPage) img.data.resize(img.pages * kPage + 512 * kPage);
@@ -402,11 +427,14 @@ void RestoreIslands(const Image& img)
         bytes += s.size;
     }
 }
+std::atomic<uint64_t> g_restores{ 0 };   // kernel_thread.cpp's "restores while it ran" (RollbackRestoreCount)
 uint32_t Restore(const Image& img)
 {
+    g_restores.fetch_add(1, std::memory_order_relaxed);
     // Blocks and job objects noted since the update started (e.g. NACE's pump allocating from the
     // network's arena right before a session's rewind) are masked before anything is copied back.
     ApplyJobMasks(false);
+    DiagHeapRewound();
     RestoreIslands(img);
     uint32_t copied = 0;
     for (size_t i = 0; i < img.pages; ++i)
@@ -496,6 +524,12 @@ uint64_t g_foreignToHot = 0, g_foreignFaults = 0;
 struct ForeignOpen { uint32_t page; DWORD tid; uint32_t entry, lr; };
 std::vector<ForeignOpen> g_foreignOpens;
 uint32_t g_foreignOpensTotal = 0;
+// Diagnostics: watched pages a frame thread then wrote (they turn hot: their other timeline's words are rewound from
+// then on, unless masked) - the page, the frame thread, its guest lr and the page's first foreign writer. MEASURED
+// 2026-11-09: "foreign pages turned the frame's" rose by one in the player's window where the sound stopped.
+struct ForeignHot { uint32_t page; DWORD tid; uint32_t entry, lr, foreignEntry; };
+std::vector<ForeignHot> g_foreignHots;
+uint32_t g_foreignHotsTotal = 0;
 }   // namespace
 PPCContext* WatchGuestContextOf(DWORD tid);   // diag_hooks.cpp
 namespace {
@@ -526,6 +560,7 @@ void OpenPageLocked(uint32_t page)
         ++g_foreignFaults;
         if (g_foreign[page >> 12]) return;
         g_foreign[page >> 12] = 1;
+        if (!g_foreignTid[page >> 12]) g_foreignTid[page >> 12] = GetCurrentThreadId();   // diagnostics (ForeignHot)
         if (g_foreignOpensTotal++ < 200)
         {
             const DWORD tid = GetCurrentThreadId();
@@ -534,7 +569,19 @@ void OpenPageLocked(uint32_t page)
         }
         return;
     }
-    if (g_foreign[page >> 12]) { g_foreign[page >> 12] = 0; ++g_foreignToHot; }   // the frame writes it too: rewound from now on
+    if (g_foreign[page >> 12])                       // the frame writes it too: rewound from now on
+    {
+        g_foreign[page >> 12] = 0;
+        ++g_foreignToHot;
+        if (g_foreignHotsTotal++ < 200)
+        {
+            const DWORD tid = GetCurrentThreadId();
+            const PPCContext* c = WatchGuestContextOf(tid);
+            const DWORD first = g_foreignTid[page >> 12];
+            g_foreignHots.push_back({ page, tid, hitch::GuestEntryOfThread(tid), c ? uint32_t(c->lr) : 0,
+                                      first ? hitch::GuestEntryOfThread(first) : 0 });
+        }
+    }
     auto before = std::make_unique<uint8_t[]>(kPage);
     std::memcpy(before.get(), g_base + page, kPage);
     DWORD old = 0;
@@ -868,10 +915,161 @@ std::mutex g_neverMutex;
 std::vector<std::pair<uint32_t, uint32_t>> g_neverRewind;
 constexpr uint32_t kNeverOwners[] = { 0x8255DAB0 };
 
+// The audio libraries' statics (.bss) are the audio timeline's as well, but their pages hold other code's words
+// (MEASURED 2026-11-09, TTT2_RB_PAGEMAP: 830B8000 written by the frame and NUSound in every fight - hot, rewound
+// whole; 830BF000 / 830D4000 by XAudio2's engine 82C3A4E0, 830D3000 by NUSound, 830C1000 by the audio pump): so
+// word masks, permanent like the arena's chunks (g_neverBlocks), not page exclusions. The ranges are the code that
+// addresses them (lis/addi pairs in the recompiled code, re/ppc): only that library's functions and its static
+// initialisers between the bounds. The neighbours stay rewound: game code at 830B8E2C-830B8E68, NACE from 830B9358
+// (rollback_session.cpp), Havok's (82C7B160.., 82C82E98..) and code not identified (82CC00D0-82CFDBF0) at
+// 830D3720-830D37D8, Havok's 830D4F78 (82C83240..).
+struct AudioStatic { uint32_t lo, hi; const char* what; };
+constexpr AudioStatic kAudioStatics[] = {
+    { 0x830B8E6C, 0x830B9358, "the sound library's (code 82B1B000-82B344A0)" },
+    { 0x830BEE40, 0x830C1700, "XAudio2's (pool manager 830BF408, render-client globals 830BF9A0/9C0, the render callback's "
+                              "bounce buffer 830BF9D0+1800, 82C55EE0's tables)" },
+    { 0x830D37DC, 0x830D4F78, "NUSound's (its streaming thread 82CFF418, mixer 82CFFB20-82D00FB0, output state 830D4DE8)" },
+};
+void NoteAudioStatics()
+{
+    static bool done = false;                      // main thread (calibration)
+    if (done || !AudioArenaEnv()) return;
+    done = true;
+    std::lock_guard b(g_blockMutex);
+    for (const AudioStatic& s : kAudioStatics)
+    {
+        g_neverBlocks[s.lo] = s.hi - s.lo;
+        g_newNeverBlocks.push_back({ s.lo, s.hi - s.lo });
+        std::fprintf(stderr, "[rb] %08X-%08X, %s statics: never rewound (word masks)\n", s.lo, s.hi, s.what);
+    }
+}
+
+// XAPI's file-handle table (its XCTD transparent-decompression layer at 0x830BE600, top of XAPI's NT file dispatch chain
+// 0x82E4EA34 since the game's init; header obj+80: +4 the rows, +8 the capacity 64, +12 the count, +16 a sequence, +20
+// its lock, +48 ready, +56 allocation owned; rows 88 bytes, +0 the key - an event handle, -1 free). Every CreateFileA /
+// NtOpenFile / attribute query through XAPI inserts a row and removes it within the call (the port answers the class-27
+// query with "not compressed", kernel_io.cpp, so no file stays wrapped and the opener gets a direct handle the table
+// never holds) - from any thread: NUSound's file thread 82D02D00 (its stream opens, data027.bin) and the save worker
+// 8258B2C0 (a fight's saves after the end of battle) - MEASURED 2026-11-09: header page 830BE000 + the rows' heap page
+// turned hot in every online fight (t4a-t4d). A restore while another thread's open is in flight brings back a row
+// and/or a count nobody removes (handles are never reused) or reverts a row its opener still removes - leaked events and
+// a probe handle; 64 left-behind counts and every XAPI open fails (0xC000011F: music streams, saves), rows in use at the
+// capacity and the insert's probe loop spins. Nothing a frame sees reads these words (the lookups miss for direct
+// handles), so like the audio statics they are never rewound: word masks on the header (64 bytes: MaskRange's 8-byte
+// units) and the whole rows array, wherever it sits (02DC1000 on three copies, 02D81000 on one). Research + 3 reviews:
+// the 2026-11-09 handle-table workflow. TTT2_RB_FILETABLE=0: rewound as before (diagnostics).
+constexpr uint32_t kXctdHolder = 0x830BE5F8, kXctd = 0x830BE600, kXctdTable = kXctd + 80;
+constexpr uint32_t kXctdTableBytes = 64, kXctdRowBytes = 88;
+bool FileTableEnv() { static const bool on = [] { const char* e = std::getenv("TTT2_RB_FILETABLE"); return !(e && *e == '0'); }(); return on; }
+bool XctdTable(uint32_t& rows, uint32_t& cap)
+{
+    if (!g_base || GRead32(g_base, kXctdHolder) != kXctd || GRead32(g_base, kXctdTable + 48) != 1) return false;
+    rows = GRead32(g_base, kXctdTable + 4);
+    cap = GRead32(g_base, kXctdTable + 8);
+    return rows && !(rows & 7) && cap && cap <= 1024 && rows < 0x80000000u;
+}
+uint32_t g_xctdRows = 0, g_xctdRowBytes = 0;   // the rows' mask (main thread)
+bool g_xctdHeader = false;
+uint32_t g_xctdLastCount = 0;
+void NoteFileTable()
+{
+    uint32_t rows = 0, cap = 0;
+    const bool table = FileTableEnv() && XctdTable(rows, cap);
+    std::lock_guard b(g_blockMutex);
+    if (!table)                                // gone (title exit) or off: no stale masks over reused memory
+    {
+        if (g_xctdHeader) g_neverBlocks.erase(kXctdTable);
+        if (g_xctdRows) g_neverBlocks.erase(g_xctdRows);
+        g_xctdHeader = false;
+        g_xctdRows = g_xctdRowBytes = 0;
+        return;
+    }
+    if (!g_xctdHeader)
+    {
+        g_xctdHeader = true;
+        g_neverBlocks[kXctdTable] = kXctdTableBytes;
+        g_newNeverBlocks.push_back({ kXctdTable, kXctdTableBytes });
+    }
+    if (rows == g_xctdRows && cap * kXctdRowBytes == g_xctdRowBytes) return;
+    if (g_xctdRows) g_neverBlocks.erase(g_xctdRows);
+    g_xctdRows = rows;
+    g_xctdRowBytes = cap * kXctdRowBytes;
+    g_neverBlocks[rows] = g_xctdRowBytes;
+    g_newNeverBlocks.push_back({ rows, g_xctdRowBytes });
+    std::fprintf(stderr, "[rb] %08X-%08X + rows %08X-%08X (%u), XAPI's file-handle table: never rewound (word masks)\n", kXctdTable,
+                 kXctdTable + kXctdTableBytes, rows, rows + g_xctdRowBytes, cap);
+}
+// At a fight's calibration the table is empty unless an open is in flight: a count still there at the next calibration
+// is one a rewind left behind (diagnostics).
+void CheckFileTable()
+{
+    uint32_t rows = 0, cap = 0;
+    if (!XctdTable(rows, cap)) return;
+    const uint32_t count = GRead32(g_base, kXctdTable + 12);
+    if (count && g_xctdLastCount)
+    {
+        uint32_t used = 0;
+        for (uint32_t i = 0; i < cap; ++i) used += GRead32(g_base, rows + i * kXctdRowBytes) != 0xFFFFFFFFu;
+        std::fprintf(stderr, "[rb] XAPI's file-handle table at a fight's calibration: count %u (the last calibration %u), rows in use %u of %u - left behind\n",
+                     count, g_xctdLastCount, used, cap);
+    }
+    g_xctdLastCount = count;
+}
+
+// The save manager's job handshake (2026-11-09, t20u: 4 copies, 40 ms delay + 30 jitter). The save manager is the static
+// object 82E6AC94 (sub_822547D0; its init flag bit 0 of 82E6ACA0); its worker [+8] (one 3264-byte block per process, never
+// moved) holds the job state +1656: 0 idle, 1 a load running, 2 a save running (sub_82588C88 / sub_82588CA8 test 1 / 2).
+// The request sets it on the requesting (frame) thread - the load request sub_8258B2F0 writes 1 and the user +3192, the
+// save request sub_8258B598 writes 2, the user and its flag byte +3252, then starts the job thread (8258B2D8 sub_8258AFD0 /
+// 8258B2C0 sub_8258ADF8) - and the job writes the result +3248 and 0 when it ends, all under the +1684 section. Those words
+// sit on a page the frame's threads write (hot). MEASURED: the end-of-battle save finished during the session's last
+// predicted frames, then a rewind restored a snapshot from the middle of the save: +1656 back to 2 with no job left to
+// clear it, and the file loader's job that waits while a job runs (sub_8255C510: loop on 82587FA0 || 82588238, no sleep)
+// spun - every snapshot then waited its 100 ms for that loader (QuiesceJobs): ~10 fps for 16 s after the KO, on the room
+// host only. A rewind must stay possible (the barrier refusing one desynced the players - RollbackNoteIo), so the state,
+// the user and the result are never rewound: they follow the real job, not the timeline. The 8-byte units also hold the
+// "saving off" byte +1660 and the request's flag byte +3252. A re-simulated request then sees the real state: a save still
+// running is joined (its user compared with the real +3192), a finished one is started again (save_store.cpp's journal
+// has put the files back). Nothing the fight reads lives there. The request's unit queue (+1720..+2271) stays rewound
+// (stale bits only mean a unit saved twice). TTT2_RB_SAVESTATUS=0: rewound as before (A/B).
+constexpr uint32_t kSaveManager = 0x82E6AC94, kSaveManagerInit = 0x82E6ACA0;
+uint32_t g_saveWorkerMasked = 0;
+void NoteSaveStatus()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_RB_SAVESTATUS"); return !(e && *e == '0'); }();
+    uint32_t worker = 0;
+    if (on && g_base && (GRead32(g_base, kSaveManagerInit) & 1))
+    {
+        worker = GRead32(g_base, kSaveManager + 8);
+        if (!worker || (worker & 7) || worker >= 0x80000000u) worker = 0;
+    }
+    if (worker == g_saveWorkerMasked) return;
+    {
+        std::lock_guard b(g_blockMutex);
+        constexpr uint32_t kWords[] = { 1656, 3192, 3248 };   // job state + saving off, user, result + save flag
+        if (g_saveWorkerMasked)
+            for (uint32_t off : kWords) g_neverBlocks.erase(g_saveWorkerMasked + off);
+        g_saveWorkerMasked = worker;
+        if (worker)
+            for (uint32_t off : kWords)
+            {
+                g_neverBlocks[worker + off] = 8;
+                g_newNeverBlocks.push_back({ worker + off, 8 });
+            }
+    }
+    if (worker)
+        std::fprintf(stderr, "[rb] the save manager's job state %08X (+1656: 0 idle, 1 load, 2 save; +1660 saving off), user %08X and result %08X: never rewound (word masks)\n",
+                     worker + 1656, worker + 3192, worker + 3248);
+}
+
 void StartCalibration()
 {
     UnprotectAll();
     PruneJobObjects();
+    NoteAudioStatics();
+    CheckFileTable();
+    NoteFileTable();
+    NoteSaveStatus();
     std::fill(g_isHot.begin(), g_isHot.end(), 0);
     std::fill(g_excluded.begin(), g_excluded.end(), 0);
     g_hot.clear();
@@ -881,7 +1079,7 @@ void StartCalibration()
     for (auto& s : g_snap) s.frame = ~0ull;
     for (auto& s : g_post) s.frame = ~0ull;
     std::vector<std::pair<uint32_t, uint32_t>> blocks;
-    GuestThreadBlocks(blocks);
+    GuestThreadBlocksForFight(blocks);   // + spare blocks made now (no image yet), then a new epoch
     const uint32_t device = VdDeviceGuest();
     // The D3D device: its ring / fence / flip-queue state belongs to the GPU side and the vblank DPC
     // (fields out to +24460: the vblank event; MEASURED: rewinding its tail broke the swap token).
@@ -1282,6 +1480,20 @@ void QuiesceJobs(uint8_t*, const PPCContext&)
                 if (g_loaderLent++ < 5)
                     std::fprintf(stderr, "[rb-ld] loader thread %lu waits for section %08X, which this thread holds (taken at lr %08X): lent until its job is done (fight update %d)\n",
                                  tid, section, lentLr, g_fightRun);
+            }
+            // A save job showing a system box ("Save Error": Retry / Continue) waits for the player's answer, and the
+            // loader's job that waits while a save runs (sub_8255C510, "the save job's state" above) cannot end before
+            // it: not waited for beyond 2 ms. MEASURED 2026-11-09 (TTT2_TEST_SAVE_FAIL, m177): 100 ms per update -
+            // ~10 fps for the rest of the session, then the game's catch-up updates presented a frame every few
+            // seconds and the box (answered at the frame's swap) never saw the player's press.
+            const bool boxUp = XamSaveJobAsksPlayer();
+            if (boxUp && Ms(l0, std::chrono::steady_clock::now()) > 2)
+            {
+                static int boxSkips = 0;
+                if (boxSkips++ < 5)
+                    std::fprintf(stderr, "[rb-ld] the file loaders still busy (%d running) while the save job waits for the player's answer to a system box - going on (fight update %d%s)\n",
+                                 g_loaderBusy.load(), g_fightRun, g_resimulating ? ", re-simulating" : "");
+                break;
             }
             if (Ms(l0, std::chrono::steady_clock::now()) > 100)
             {
@@ -1716,17 +1928,148 @@ void SetPrevious(int32_t frame)
 // re-simulated frames save into exactly the files the restored memory expects. MEASURED 2026-10-21: the
 // save stayed open behind the game's "Save Error" box, the 1 s wait ran out, the restore went ahead in the
 // middle of it and the heap's free list closed into a cycle (the next match froze). The wait is 3 s now.
+// The end-of-battle award's changes to the never-rewound side records are undone with its save
+// (award_journal.cpp): the re-simulated KO awards them once, not twice. Only restores reach this (the
+// refusals return before it); both run on the main thread, as the award does.
+// A save job, not only an open container: the save manager's job state (+1656, never rewound - NoteSaveStatus) is set
+// by the request on the frame thread before the job thread starts, while SaveInProgress() sees the save only once the
+// job has opened its container. MEASURED 2026-11-09 (t21a, two restores over one KO a frame apart): the second restore
+// fell between the re-simulated save's request and its container open - no wait; the restore went back under the
+// running job (its request queue +1720.. is rewound), the save journal could not put the files back (open by then), the
+// file loader spun every update afterwards (~17 s late) and the win screen never ended. The job does no I/O that waits
+// for confirmation before its container is open (XamContentCreateEx marks it open first), so it runs to its end while
+// the main thread waits here (MEASURED: 12 ms). The stuck job of t21a was looping in the system library's heap code
+// (sub_82BFA928 under sub_8258ADF8 -> sub_8258A0D8 -> sub_82BD47C8): the job allocates from the rewound game heap for
+// its whole life, so the wait also lasts until its thread has ended (save job 8258B2C0, load job 8258B2D8). A wait that
+// ran out once (a job really stuck) is not repeated at every later restore until the jobs are seen idle again.
+bool SaveJobRunning()
+{
+    if (g_saveWorkerMasked && g_base && GRead32(g_base, g_saveWorkerMasked + 1656) != 0) return true;
+    return KernelGuestThreadsWithEntry(0x8258B2C0u) + KernelGuestThreadsWithEntry(0x8258B2D8u) > 0;
+}
+// Diagnostics (log only, 2026-11-09, review wf_4d8bc5bf-eaf): a session snapshot taken while the save / load job runs holds
+// the rewound game heap in the middle of the job (an unlocked copy while the job allocates and frees); the restore waits
+// for the job (above) but then puts that heap back. Measured here: the job's timeline (RollbackSaveJobMark: request, live
+// or re-simulated; thread running; container create; the save journal's copy; container closed; thread ended), every
+// snapshot taken while it runs, and every restore of one.
+std::atomic<int64_t> g_jobT0Us{ 0 };     // the newest request
+std::atomic<bool> g_jobTimeline{ false };
+std::atomic<int> g_jobsTimed{ 0 };         // requested in a session, thread not ended yet
+int64_t JobNowUs()
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+double JobMs() { return double(JobNowUs() - g_jobT0Us.load()) / 1000.0; }
+void NoteSnapshotSaveJob(Image& img, uint64_t frame)
+{
+    img.saveJob = 0;
+    img.saveJobMs = 0;
+    if (!g_sess.on) return;
+    const bool open = SaveInProgress();
+    if (!open && !SaveJobRunning()) return;
+    img.saveJob = open ? 2 : 1;
+    img.saveJobMs = g_jobTimeline.load() ? float(JobMs()) : -1.f;
+    static int logged = 0;
+    if (logged++ < 200)
+        std::fprintf(stderr, "[save-job] snapshot of frame %llu taken while the job runs (%s, +%.1f ms; %s)\n", (unsigned long long)frame,
+                     open ? "container open" : "no container open", img.saveJobMs, g_resimulating ? "re-simulating" : "live");
+}
+void NoteRestoreSaveJob(const Image& img, int32_t p, const char* what)
+{
+    static int logged = 0;
+    if (!img.saveJob || logged++ >= 100) return;
+    std::fprintf(stderr, "[save-job] %s to frame %d restored a snapshot taken while a save job ran (%s, +%.1f ms after its request)\n", what, p,
+                 img.saveJob == 2 ? "container open" : "no container open", img.saveJobMs);
+}
+bool g_saveWaitGaveUp = false;
 void SessionSaveBeforeRestore(int32_t p, const char* what)
 {
-    if (SaveInProgress())
+    if (!SaveInProgress() && !SaveJobRunning())
+        g_saveWaitGaveUp = false;
+    else if (g_saveWaitGaveUp)
     {
+        static int logged = 0;
+        if (logged++ < 10)
+            std::fprintf(stderr, "[rb-session] %s to frame %d: a save is still running, not waited for (an earlier wait ran out)\n", what, p);
+    }
+    else
+    {
+        const bool open = SaveInProgress(), job = SaveJobRunning();
         const auto w0 = std::chrono::steady_clock::now();
-        while (SaveInProgress() && std::chrono::steady_clock::now() - w0 < std::chrono::milliseconds(3000)) Sleep(1);
-        std::fprintf(stderr, "[rb-session] %s to frame %d waited %.1f ms for a save to finish%s\n", what, p,
-                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count(),
-                     SaveInProgress() ? " - still open, going on anyway" : "");
+        // A job that asks the player something (a failed save's "Save Error" box) waits for the main thread: not waited for.
+        bool asks = false;
+        while ((SaveInProgress() || SaveJobRunning()) && !(asks = XamSaveJobAsksPlayer()) &&
+               std::chrono::steady_clock::now() - w0 < std::chrono::milliseconds(3000))
+            Sleep(1);
+        g_saveWaitGaveUp = !asks && (SaveInProgress() || SaveJobRunning());
+        static int asksLogged = 0;   // a rewind each update while the box is up: the first few (review wf_fd6326af-ace)
+        if (!asks || asksLogged++ < 5)
+            std::fprintf(stderr, "[rb-session] %s to frame %d waited %.1f ms for a save to finish (%s)%s\n", what, p,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count(),
+                         open ? "its container open" : job ? "its job running, no container open" : "?",
+                         asks ? " - it waits for the player's answer to a system box, not waited for"
+                              : g_saveWaitGaveUp ? " - still running, going on anyway" : "");
     }
     SaveJournalUndo(p);
+    AwardJournalUndo(p);
+}
+// No session snapshot while the save / load job runs (called before each one's QuiesceJobs). Review wf_4d8bc5bf-eaf
+// (confirmed): a snapshot is an unlocked copy of the game heap, and the job allocates and frees from it on its own
+// thread for its whole life - a snapshot in the middle of the job holds a heap the job left half done, and a restore
+// of it (after the restore's wait above: the job has ended for good by then) put back blocks nobody frees or a torn
+// free list. The job runs from the request in frame K's update to its thread's end, so the snapshot of K+1 waits for
+// it: every snapshot then holds the heap either before the job or after it, live and re-simulated alike, and the game
+// sees the job done in the same frame on both sides. MEASURED 2026-11-09 (m174): the job takes ~15 ms of its own
+// (container create to close) once the save journal no longer copies every file. A job waiting for a section this
+// thread holds, or for the player's answer to a system box (a failed save's "Save Error" box, shown and answered by
+// this thread - review wf_f788ef00-b3b), is not waited for (it would only run into the timeout, with the box not on
+// screen yet); a wait that ran out once (3 s, a job really stuck) is not repeated until the jobs are seen idle again
+// (shared with the restore's wait). Besides each snapshot it runs before NACE's pump (SessionStep): a job still running
+// there would have its heap writes learned as the pump's and masked for good (review wf_f788ef00-b3b).
+void SessionWaitSaveJob(int32_t frame, const char* what)
+{
+    static int boxStops = 0;
+    if (!g_sess.on) return;
+    if (!SaveInProgress() && !SaveJobRunning()) { g_saveWaitGaveUp = false; boxStops = 0; return; }
+    if (g_saveWaitGaveUp) return;
+    const unsigned long self = GetCurrentThreadId();
+    const bool open = SaveInProgress();
+    const auto w0 = std::chrono::steady_clock::now();
+    const char* stopped = "";
+    uint32_t section = 0, ownerLr = 0;
+    while (SaveInProgress() || SaveJobRunning())
+    {
+        if (XamSaveJobAsksPlayer())
+        {
+            // Every update while the box is up: logged the first few times.
+            if (boxStops++ >= 3) return;
+            stopped = " - it waits for the player's answer to a system box, not waited for";
+            break;
+        }
+        if (std::chrono::steady_clock::now() - w0 >= std::chrono::milliseconds(3000))
+        {
+            g_saveWaitGaveUp = true;
+            stopped = " - still running after 3 s, going on anyway";
+            break;
+        }
+        unsigned long tid = KernelGuestThreadTidWithEntry(0x8258B2C0u);
+        if (!tid) tid = KernelGuestThreadTidWithEntry(0x8258B2D8u);
+        if (tid && CsThreadBlockedBy(tid, self, &section, &ownerLr))
+        {
+            stopped = " - it waits for a section this thread holds, not waited for";
+            break;
+        }
+        Sleep(1);
+    }
+    static int logged = 0;
+    if (logged++ < 200 || *stopped)
+    {
+        char extra[64] = "";
+        if (section) std::snprintf(extra, sizeof(extra), " (section %08X taken at lr %08X)", section, ownerLr);
+        std::fprintf(stderr, "[rb-session] snapshot of frame %d (%s) waited %.1f ms for the save job to end (%s)%s%s\n", frame, what,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count(),
+                     open ? "its container open" : "no container open", stopped, extra);
+    }
 }
 
 void SessionRewind(PPCContext& ctx, uint8_t* base, const PPCContext& entry, int32_t p, int32_t& frame)
@@ -1774,6 +2117,7 @@ void SessionRewind(PPCContext& ctx, uint8_t* base, const PPCContext& entry, int3
     // effect library after rewinds).
     IncorporateLate();
     Restore(g_snap[p % kRing]);
+    NoteRestoreSaveJob(g_snap[p % kRing], p, "rewind");
     CheckLargeBlockHeaps("after a session rewind's restore");
     CheckHavokFreeLists("after a session rewind's restore");
     GpuDiscardNextFrames(uint32_t(depth));
@@ -1798,6 +2142,7 @@ void SessionRewind(PPCContext& ctx, uint8_t* base, const PPCContext& entry, int3
                 break;
             }
             CheckRealFrame(k);
+            SessionWaitSaveJob(k, "re-simulated");
             QuiesceJobs(base, entry);
             ph[3] += lap(tp);
             IncorporateLate();
@@ -1886,12 +2231,14 @@ void SessionReplay(PPCContext& ctx, uint8_t* base, const PPCContext& entry, int3
     std::memcpy(liveRec, g_base + kNaceRecord, 24);
     const uint8_t liveReady = GRead8(g_base, kNaceReady);
     Restore(g_snap[p % kRing]);
+    NoteRestoreSaveJob(g_snap[p % kRing], p, "replay");
     GpuDiscardNextFrames(uint32_t(depth));
     g_resimulating = true;
     for (int32_t k = p; k <= last; ++k)
     {
         if (k != p)
         {
+            SessionWaitSaveJob(k, "replayed");
             QuiesceJobs(base, entry);
             IncorporateLate();
             Save(g_snap[k % kRing], uint64_t(k));
@@ -1923,6 +2270,74 @@ void SessionReplay(PPCContext& ctx, uint8_t* base, const PPCContext& entry, int3
     std::fprintf(stderr, "[rb-session] frames %d..%d again (%s) in %.2f ms\n", p, last, why, Ms(t0, std::chrono::steady_clock::now()));
 }
 
+// TTT2_RB_KOREPLAY=<n> (1..7; developers only, never in a tester's settings): the award journal's test. In the first
+// session update after the KO frame F ran (SessionEndBattleFrame), frames P..last are simulated again from their
+// snapshot with the records they ran with - SessionReplay, the go-frame path: it restores through
+// SessionSaveBeforeRestore, so the award journal takes back frame F's award first (and the save journal its save) and
+// the re-simulated KO must award once. P = F-n+1 (n = 1: a restore to F itself), but never a frame a real restore could
+// not reach: P stays after NACE's confirmed frame C as this update's pump left it (a misprediction rewinds only to a frame
+// NACE has not confirmed; SoundRollbackFinal has already let go of the frames before C, and a save of a frame after C was
+// journaled and not pruned), and at or after the barrier and the applied go frame. A KO frame NACE has confirmed already
+// gets no forced rewind (logged): on a fast local link it usually is by the next update (t4b.log, the KO at 5902), so the
+// test needs added lag or a slow side (a larger network delay, TTT2_RB_SLOW) to cross the KO at all. The forced-rewind
+// line says whether the save journal holds frame F's save - expect a save-journal undo only then. Fighters only: a
+// spectator node (PAIR PLAY partner, watcher) never rewinds, so it is never forced. Once per match;
+// TTT2_RB_KOREPLAY_TWICE=1: once more in the next update (two restores over one KO, the same checks - by then F is often
+// confirmed and the second one is skipped). No early-stop variant: a re-simulation stopped before F (t20u) needs NACE
+// itself to lack the next record - a replay that stopped on its own would leave the session counting frames behind the
+// record NACE already handed out for this update.
+int KoReplayDepth()
+{
+    static const int n = [] {
+        const char* e = std::getenv("TTT2_RB_KOREPLAY");
+        const int v = e ? std::atoi(e) : 0;
+        return v >= 1 && v <= 7 ? v : 0;
+    }();
+    return n;
+}
+int KoReplaysWanted()
+{
+    static const int twice = [] { const char* e = std::getenv("TTT2_RB_KOREPLAY_TWICE"); return e && *e == '1' ? 2 : 1; }();
+    return KoReplayDepth() ? twice : 0;
+}
+int g_koReplays = 0;          // forced (or skipped) this session
+bool g_koSpectator = false;   // this session's node is a spectator's: never forced, no 'ended before' line
+void KoReplay(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
+{
+    if (g_koReplays >= KoReplaysWanted()) return;    // nothing without TTT2_RB_KOREPLAY
+    const int32_t ko = SessionEndBattleFrame();
+    if (SessionSpectator())                           // partners / watchers never rewind: not forced there
+    {
+        g_koSpectator = true;
+        if (ko >= 0)
+        {
+            g_koReplays = KoReplaysWanted();          // done for this session
+            std::fprintf(stderr, "[award-journal] TTT2_RB_KOREPLAY: spectator node - not forced\n");
+        }
+        return;
+    }
+    if (ko < 0 || ko > g_sess.last) return;
+    ++g_koReplays;                                    // once per match, whether or not a rewind can go there
+    const int32_t c = SessionConfirmedFrame();        // after this update's pump, as SoundRollbackFinal saw it
+    if (ko <= c)
+    {
+        std::fprintf(stderr, "[award-journal] TTT2_RB_KOREPLAY: the KO frame %d is already confirmed (%d) - no rewind can cross it, skipped\n",
+                     ko, c);
+        return;
+    }
+    const int32_t p = (std::max)({ ko - KoReplayDepth() + 1, c + 1, g_sessBarrier, g_goSeen, 0 });
+    if (p > ko)
+    {
+        std::fprintf(stderr, "[award-journal] TTT2_RB_KOREPLAY: the KO frame %d is before the barrier %d / go frame %d - no rewind can cross it, skipped\n",
+                     ko, g_sessBarrier, g_goSeen);
+        return;
+    }
+    const char* saved = SaveJournalHas(ko) ? "yes" : SaveInProgress() ? "not yet (a save is open)" : "no";
+    std::fprintf(stderr, "[award-journal] TTT2_RB_KOREPLAY: forced rewind to frame %d over the KO frame %d (depth %d of %d, confirmed %d, save of %d journaled: %s)\n",
+                 p, ko, ko - p + 1, KoReplayDepth(), c, ko, saved);
+    SessionReplay(ctx, base, entry, p, "TTT2_RB_KOREPLAY");
+}
+
 // TTT2_RB_SESSTEST=<every> (diagnostics): the session's own sync test. Every <every> consumed frames
 // (with no misprediction this update), the last kSelfTestDepth frames are re-simulated from their
 // snapshot with the records they ran with, the result compared word by word with the live state they
@@ -1931,7 +2346,7 @@ void SessionReplay(PPCContext& ctx, uint8_t* base, const PPCContext& entry, int3
 // rewind does not restore - in the online setting (NACE's live state, the online tasks, ...).
 constexpr int kSelfTestDepth = 3;
 Image g_testNow;
-struct SelfTestStats { uint64_t tests = 0, failed = 0; } g_selfTest;
+struct SelfTestStats { uint64_t tests = 0, failed = 0, skippedGo = 0, skippedKo = 0; } g_selfTest;
 int SelfTestEvery()
 {
     static const int every = [] { const char* e = std::getenv("TTT2_RB_SESSTEST"); return e ? std::atoi(e) : 0; }();
@@ -1941,6 +2356,21 @@ void SessionSelfTest(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
 {
     const int32_t last = g_sess.last, p = last - kSelfTestDepth + 1;
     if (p < g_sessBarrier) return;
+    // Frames before the go frame NACE has applied (g_goSeen, taken earlier in this update) cannot be
+    // simulated again faithfully: NACE answers "everyone ready" from its live state, so the round would
+    // start early in the re-simulation. A real rewind never goes there - NACE applies a go only once the
+    // frames before it are confirmed (a go-frame replay starts at the go frame itself). MEASURED
+    // 2026-11-09 (1v1, 40 ms lag, a test every 5 frames): the only failures were windows 2102..2104 and
+    // 3422..3424, tested in the update that applied go frames 2103 / 3425 - both copies in sync throughout.
+    if (p < g_goSeen) { ++g_selfTest.skippedGo; return; }
+    // Nor a window over the end of battle (the KO frame's award into the never-rewound side records and its
+    // save): the test's put-back leaves the arena as the re-simulation left it and runs neither journal - the
+    // award would count twice and the save run again.
+    if (const int32_t ko = (std::max)(SessionEndBattleFrame(), AwardJournalNewestFrame()); ko >= 0 && p <= ko)
+    {
+        ++g_selfTest.skippedKo;
+        return;
+    }
     for (int32_t k = p; k <= last; ++k)
         if (g_snap[k % kRing].frame != uint64_t(k) || g_rec[k % kRing].frame != k) return;
     const auto t0 = std::chrono::steady_clock::now();
@@ -2017,6 +2447,12 @@ void SessionSelfTest(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
     }
     // Put the live state back: pages the test opened first (their content from before), then the
     // hot pages, then NACE's record.
+    // LIMIT (diagnostics only): the test throws its re-simulation away for the rewound words but not for
+    // the never-rewound ones (masked words, the arena's blocks and its host bookkeeping, sends dropped),
+    // so a structure spanning both can be torn - a real rewind keeps the re-simulation for both. MEASURED
+    // 2026-11-09 (1v1, 40 ms lag, a test every 5 frames), in sessions with no real rewind: the ping task
+    // 826C5FE0's std::set (arena) looped forever in sub_826C6150 (m166), and with the opened pages put back
+    // without their masked words (tried in m169) a node list looped in sub_82384B70 instead. Short runs only.
     {
         std::vector<LatePage> opened;
         AcquireSRWLockExclusive(&g_cowLock);
@@ -2035,9 +2471,10 @@ void SessionSelfTest(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
     ++g_selfTest.tests;
     g_selfTest.failed += fighterWords != 0;
     if (fighterWords || g_selfTest.tests % 100 == 1)
-        std::fprintf(stderr, "[rb-selftest] frames %d..%d again: %u words on %u pages differ (%u fighter words), %.2f ms; %llu tests, %llu failed\n",
+        std::fprintf(stderr, "[rb-selftest] frames %d..%d again: %u words on %u pages differ (%u fighter words), %.2f ms; %llu tests, %llu failed (%llu skipped: before an applied go frame, %llu: over the end of battle)\n",
                      p, last, words, pages, fighterWords, Ms(t0, std::chrono::steady_clock::now()),
-                     (unsigned long long)g_selfTest.tests, (unsigned long long)g_selfTest.failed);
+                     (unsigned long long)g_selfTest.tests, (unsigned long long)g_selfTest.failed, (unsigned long long)g_selfTest.skippedGo,
+                     (unsigned long long)g_selfTest.skippedKo);
 }
 
 // rollback.cpp's update hook, once calibrated: true when an online session runs this update (its
@@ -2071,9 +2508,12 @@ bool SessionStep(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
     {
         if (g_sess.on)
         {
+            if (const int32_t ko = SessionEndBattleFrame(); KoReplayDepth() && g_koReplays == 0 && !g_koSpectator && ko >= 0)
+                std::fprintf(stderr, "[award-journal] TTT2_RB_KOREPLAY: the session ended before a forced rewind over the KO frame %d\n", ko);
             SessionOwnPump(false);
             g_sess.on = false;
             SaveJournalClear();                       // no rewind any more: every save stands
+            AwardJournalSessionOver();                // and every award
             SessionReport("session over");
             XSessionReportMatch(false);
             SlowFramesReport();
@@ -2106,6 +2546,9 @@ bool SessionStep(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
         g_intervalMax = 0;
         g_sess.last = startReal;                     // the next frame is startReal + 1
         SaveJournalClear();
+        AwardJournalSessionOn();
+        g_koReplays = 0;
+        g_koSpectator = false;
         g_goSeen = int32_t(GRead32(g_base, kSyncGoApplied));
         g_sessBarrier = 0;
         g_pumpPages.clear();
@@ -2127,6 +2570,46 @@ bool SessionStep(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
         ++g_sess.yields;
         g_stepFlags |= 1;
     }
+    // Online 2v2 (online_2v2.cpp): a spectator - a partner - that started behind the fighters (MEASURED 2026-10-24:
+    // 12-135 frames, from the start) simulates up to two more frames per update while its sync engine holds their
+    // records, without showing them (as re-simulated frames), until it plays along with them.
+    if (const int extra = online2v2::CatchUpFrames(base, g_sess.last); extra > 0)
+    {
+        GpuDiscardNextFrames(uint32_t(extra));
+        int ran = 0;
+        for (int i = 0; i < extra; ++i)
+        {
+            g_inPump = true;
+            const bool got = SessionNext(ctx, base);
+            g_inPump = false;
+            if (!got) break;
+            const int32_t realK = SessionRealFrame();
+            const int32_t k = realK >= 0 && SessionSpectator() ? realK : g_sess.last + 1;   // see the step below
+            SessionWaitSaveJob(k, "caught up");
+            QuiesceJobs(base, entry);
+            IncorporateLate();
+            KeepRecord(k);
+            SetPrevious(k);
+            Save(g_snap[k % kRing], uint64_t(k));
+            SaveStack(k % kRing, entry.r1.u32);
+            g_sessFrame = k;
+            SoundRollbackFrame(uint64_t(k), false);
+            Update(ctx, base, entry, uint64_t(k), true, false);
+            RngOut();
+            ctx = entry;
+            g_resimDraw = true;
+            sub_825EBCC8(ctx, base);
+            g_resimDraw = false;
+            RngIn();
+            g_sess.last = k;
+            ++g_sess.consumed;
+            ++ran;
+        }
+        GpuDiscardEndNow();
+        static uint64_t caught = 0;
+        if ((caught += uint64_t(ran)) % 60 < uint64_t(ran))
+            std::fprintf(stderr, "[rb-session] spectator catch-up: %llu frames so far (now at %d)\n", (unsigned long long)caught, g_sess.last);
+    }
     int32_t real = -1, frame = -1;
     bool ready = false;
     // NACE's pump writes network state into the game's memory too - the online manager's words
@@ -2134,6 +2617,9 @@ bool SessionStep(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
     // masked there). Rewinding those under the network corrupts it. The pages the pump writes are
     // learned (write watch around it) and copied before each pump; every word it changes is masked
     // (never rewound) for the rest of the fight.
+    // A save job requested in the last update (the KO's end-of-battle save) ends before the pump's write watch: its heap
+    // writes would be learned as the pump's and masked for good (review wf_f788ef00-b3b).
+    SessionWaitSaveJob(g_sess.last + 1, "before the pump");
     std::vector<uint32_t> pumpPages;
     ReadWritten(pumpPages);                              // drain: from here on, the pump's
     // The pages the previous frame opened join now: a page that opens from here on is the pump's
@@ -2209,6 +2695,7 @@ bool SessionStep(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
         g_goSeen = go;
         if (go >= 0 && go <= g_sess.last) SessionReplay(ctx, base, entry, go, "the go frame of the players' ready");
     }
+    KoReplay(ctx, base, entry);                       // TTT2_RB_KOREPLAY (developers): nothing without it
     if (n > 0 && real >= 0)
     {
         if (n != g_sess.last - real + 1)
@@ -2224,12 +2711,18 @@ bool SessionStep(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
     else if (ready)
     {
         frame = g_sess.last >= 0 ? g_sess.last + 1 : real;
+        // A spectator (an online 2v2 partner) makes no predictions: its records are real ones and say their frame. While
+        // the round flow waits for a go the sync engine loads the same one again, and at the go it goes on from the go
+        // frame - counted updates put the session 6 frames behind its records for the rest of the match (MEASURED
+        // 2026-10-25, four copies: the partners caught up two frames every update and stalled the next, at 30 a second).
+        if (real >= 0 && SessionSpectator()) frame = real;
         if (frame < 0) frame = 0;
         CheckRealFrame(frame);
     }
     g_sessFrame = frame;
     if (frame >= 0)
     {
+        SessionWaitSaveJob(frame, "live");
         if (SelfTestEvery() > 0 && n == 0 && g_sess.consumed % uint64_t(SelfTestEvery()) == 0) SessionSelfTest(ctx, base, entry);
         QuiesceJobs(base, entry);
         IncorporateLate();
@@ -2248,6 +2741,9 @@ bool SessionStep(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
     {
         ++g_sess.stalls;
         g_stepFlags |= 4;
+        if (g_sess.stalls <= 40 || g_sess.stalls % 120 == 0)
+            std::fprintf(stderr, "[rb-session] stall #%llu at last %d (nodes %s)\n", (unsigned long long)g_sess.stalls, g_sess.last,
+                         online2v2::NodesBrief(base).c_str());
     }
     return true;
 }
@@ -2343,11 +2839,18 @@ std::mutex g_arenaMutex;
 std::unordered_map<uint32_t, uint32_t> g_arena;     // live block -> requested size
 std::unordered_map<uint32_t, uint32_t> g_arenaSlot; // block -> its slot size (live and free)
 std::map<uint32_t, std::vector<uint32_t>> g_arenaFree;   // slot size -> free blocks
+// Live block -> its allocation serial (award_journal.cpp: a side record still the block it was - the arena hands a
+// freed block's address out again, so the address alone does not say). Stamped at every allocation, gone at the free.
+std::unordered_map<uint32_t, uint64_t> g_arenaSerial;
+uint64_t g_arenaSerialNext = 1;
 struct ArenaChunk { uint32_t base, size, top; };
 std::vector<ArenaChunk> g_arenaChunks;
 uint64_t g_arenaAllocs = 0, g_arenaBytes = 0;
 constexpr uint32_t kArenaChunk = 4u << 20;
 bool RollbackArenaOn() { return SessionEnabled(); }
+// XAudio2's heap blocks (diag_hooks.cpp's XMemAlloc hook, allocator id 0x97) come from the arena whenever rewinds can
+// happen (a sync test or sessions); AudioArenaEnv above.
+bool RollbackAudioArenaOn() { return AudioArenaEnv() && MachineryOn(); }
 // Slot sizes: powers of two from 16 up to 64 KB, then whole 4 KB pages.
 uint32_t ArenaSlot(uint32_t size)
 {
@@ -2402,13 +2905,15 @@ uint32_t RollbackArenaAlloc(uint32_t size, bool zero, uint32_t align)
             g_arenaSlot[a] = slot;
         }
         g_arena[a] = size;
+        g_arenaSerial[a] = g_arenaSerialNext++;
         ++g_arenaAllocs;
         g_arenaBytes += slot;
     }
     if (newChunk)
     {
         RollbackNoteHeapBlock(chunkBase, chunkSize);
-        std::fprintf(stderr, "[rb] the network's arena: chunk %08X+%X (%zu chunks)\n", chunkBase, chunkSize, g_arenaChunks.size());
+        std::fprintf(stderr, "[rb] the never-rewound arena (the network's and XAudio2's blocks): chunk %08X+%X (%zu chunks)\n",
+                     chunkBase, chunkSize, g_arenaChunks.size());
     }
     if (zero) std::memset(g_base + a, 0, size);
     return a;
@@ -2425,10 +2930,64 @@ bool RollbackArenaFree(uint32_t a)
     const auto it = g_arena.find(a);
     if (it == g_arena.end()) return false;
     g_arena.erase(it);
+    g_arenaSerial.erase(a);
     const uint32_t slot = g_arenaSlot[a];
     g_arenaFree[slot].push_back(a);
     g_arenaBytes -= slot;
     return true;
+}
+// kernel_thread.cpp: a guest thread block needed while a fight is tracked and no pooled one is free - carved from the
+// never-rewound arena when it is in use and its spare has room. Its bookkeeping is host-side (no g_virtualHeap header a
+// rewind could put back - the heap would then hand the block's memory out again under a live stack) and its chunks are
+// masked whole. 0: not possible - no chunk is made here (that would write g_virtualHeap headers mid-fight).
+uint32_t RollbackArenaCarveNoGrow(uint32_t size, uint32_t align)
+{
+    if (!RollbackArenaOn() && !RollbackAudioArenaOn()) return 0;
+    if (align < 16) align = 16;
+    const uint32_t slot = ArenaSlot(size ? size : 1);
+    std::lock_guard l(g_arenaMutex);
+    if (g_arenaChunks.empty()) return 0;
+    uint32_t a = 0;
+    auto& list = g_arenaFree[slot];
+    for (size_t i = list.size(); i-- > 0;)
+        if (list[i] % align == 0)
+        {
+            a = list[i];
+            list[i] = list.back();
+            list.pop_back();
+            break;
+        }
+    if (!a)
+    {
+        ArenaChunk& c = g_arenaChunks.back();
+        const uint32_t at = (c.top + align - 1) & ~(align - 1);
+        if (at + slot > c.base + c.size) return 0;
+        c.top = at + slot;
+        a = at;
+        g_arenaSlot[a] = slot;
+    }
+    g_arena[a] = size;
+    g_arenaSerial[a] = g_arenaSerialNext++;
+    ++g_arenaAllocs;
+    g_arenaBytes += slot;
+    return a;
+}
+// award_journal.cpp: the allocation serial of the live arena block holding `addr` (0: not in a live arena block). A block
+// freed and handed out again gets a new serial.
+uint64_t RollbackArenaSerial(uint32_t addr)
+{
+    std::lock_guard l(g_arenaMutex);
+    if (const auto it = g_arenaSerial.find(addr); it != g_arenaSerial.end()) return it->second;
+    bool inChunk = false;                           // the game heap's blocks (a partner's lent record): no walk
+    for (const ArenaChunk& c : g_arenaChunks) inChunk |= addr >= c.base && addr - c.base < c.size;
+    if (!inChunk) return 0;
+    for (const auto& [a, size] : g_arena)           // inside a block (rare: a record is a block of its own)
+        if (addr > a && addr - a < (size ? size : 1))
+        {
+            const auto it = g_arenaSerial.find(a);
+            return it == g_arenaSerial.end() ? 0 : it->second;
+        }
+    return 0;
 }
 void RollbackNoteHeapBlock(uint32_t ptr, uint32_t size)
 {
@@ -2442,6 +3001,34 @@ void RollbackNoteHeapFree(uint32_t ptr)
     if (!ptr) return;
     std::lock_guard l(g_blockMutex);
     if (!g_neverBlocks.empty()) g_neverBlocks.erase(ptr);
+}
+// The arena keeps 2 MB of its last chunk free, topped up at a fight's calibration start on the main thread: a new chunk
+// made there is masked at once (ApplyJobMasks right after), and no rewind can reach back past it (StartCalibration has
+// just cleared the images; the barrier follows calibration). XAudio2's threads allocate from the arena whenever they like
+// - a rewind does not stop them - and a chunk one of them made in the middle of a restore would be masked only at the
+// next frame's start, its pages (g_virtualHeap memory a frame thread may have written before) copied over by that restore
+// meanwhile. Nor may a chunk be made in a calibrated frame on a frame thread: g_virtualHeap keeps its block headers in
+// guest memory, and a rewind past that frame would put them back - the heap would forget the chunk and hand its memory out
+// again under the arena's live blocks (reviews 2026-11-09). MEASURED (t20b, 4 copies, 5 matches): the boot chunk was over
+// 3 MB used at the first calibration; one spare chunk then lasted all five matches.
+constexpr uint32_t kArenaSpare = 2u << 20;
+void ArenaReserve()
+{
+    uint32_t chunkBase = 0;
+    size_t chunks = 0;
+    {
+        std::lock_guard l(g_arenaMutex);
+        if (g_arenaChunks.empty()) return;              // the arena unused so far
+        const ArenaChunk& last = g_arenaChunks.back();
+        if (last.base + last.size - last.top >= kArenaSpare) return;
+        void* p = g_virtualHeap.Alloc(kArenaChunk, 65536);
+        if (!p) return;
+        chunkBase = uint32_t(static_cast<uint8_t*>(p) - g_base);
+        g_arenaChunks.push_back({ chunkBase, kArenaChunk, chunkBase });
+        chunks = g_arenaChunks.size();
+    }
+    RollbackNoteHeapBlock(chunkBase, kArenaChunk);
+    std::fprintf(stderr, "[rb] the never-rewound arena: spare chunk %08X+%X made at the calibration start (%zu chunks)\n", chunkBase, kArenaChunk, chunks);
 }
 
 // rollback_session.cpp: a range NACE's state lives in (the session's prediction ring), registered
@@ -2693,6 +3280,7 @@ bool RollbackPageRewound(uint32_t page)
 // rollback_session.cpp's trace: the record frame the current session update simulates (-1: none).
 int32_t RollbackSessionFrame() { return g_sess.on ? g_sessFrame : -1; }
 bool RollbackSessionOn() { return g_sess.on; }
+bool RollbackFightOnline() { return g_fightOnline; }      // frame_overlap.cpp
 int32_t RollbackSessionLast() { return g_sess.on ? g_sess.last : -1; }   // the newest record frame consumed
 bool RollbackResimulating() { return g_resimulating; }
 bool RollbackResimDraw() { return g_resimDraw; }   // diag_hooks.cpp (TTT2_HITCH_PROFILE=5)
@@ -2701,6 +3289,7 @@ bool RollbackResimDraw() { return g_resimDraw; }   // diag_hooks.cpp (TTT2_HITCH
 // last 3 s (a container left open does not hold rewinds back for good).
 std::atomic<int> g_savesOpen{ 0 };
 std::atomic<int64_t> g_saveOpenedMs{ 0 };
+std::atomic<uint64_t> g_savesClosed{ 0 };
 int64_t NowMs()
 {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -2712,10 +3301,39 @@ void RollbackSaveOpen(bool open)
         g_savesOpen.fetch_add(1);
         g_saveOpenedMs.store(NowMs());
     }
-    else if (g_savesOpen.fetch_sub(1) <= 0)
-        g_savesOpen.store(0);
+    else
+    {
+        g_savesClosed.fetch_add(1);
+        if (g_savesOpen.fetch_sub(1) <= 0) g_savesOpen.store(0);
+    }
 }
 bool SaveInProgress() { return g_savesOpen.load() > 0 && NowMs() - g_saveOpenedMs.load() < 3000; }
+
+// kernel_thread.cpp (the save / load job's request in ExCreateThread on the requesting thread, its thread running and ended)
+// and kernel_content.cpp (container create / created / closed, the save journal's copy): the job's timeline while a
+// session runs, ms after its request (log only; NoteSnapshotSaveJob's diagnostics). `ms` >= 0: that step's own time.
+void RollbackSaveJobMark(const char* what, bool request, double ms)
+{
+    if (request)
+    {
+        if (!g_sess.on) return;
+        g_jobT0Us.store(JobNowUs());
+        g_jobsTimed.fetch_add(1);
+        g_jobTimeline.store(true);
+        std::fprintf(stderr, "[save-job] %s (session frame %d, last %d, confirmed %d, %s, thread %lu)\n", what, g_sessFrame, g_sess.last,
+                     SessionConfirmedFrame(), g_resimulating ? "re-simulating" : "live", GetCurrentThreadId());
+        return;
+    }
+    if (!g_jobTimeline.load()) return;
+    if (ms >= 0) std::fprintf(stderr, "[save-job] %s at +%.1f ms (took %.1f ms; thread %lu)\n", what, JobMs(), ms, GetCurrentThreadId());
+    else std::fprintf(stderr, "[save-job] %s at +%.1f ms (thread %lu)\n", what, JobMs(), GetCurrentThreadId());
+    if (std::strcmp(what, "job thread ended") == 0 && g_jobsTimed.fetch_sub(1) <= 1)
+    {
+        g_jobsTimed.store(0);
+        g_jobTimeline.store(false);
+    }
+}
+uint64_t SaveContainersClosed() { return g_savesClosed.load(); }   // unlock_all.cpp: a save it started has ended
 
 // kernel_content.cpp (XamContentCreateEx, on the saving thread): the session frame a save belongs to if a
 // rewind may still re-simulate it, else -1 (save_store.cpp's journal then copies the container first).
@@ -3099,6 +3717,20 @@ void RollbackNoteForeignThread()
 {
     if (hitch::GuestEntryOfThread(GetCurrentThreadId()) == 0) NoteForeignThread("a host thread running a guest callback");
 }
+// kernel_thread.cpp's ExCreateThread: a new guest thread starts on this host thread. A foreign entry under its id is a dead
+// thread's (Windows reuses thread ids; IsFrameThread checks the foreign list first), not this thread's.
+void RollbackGuestThreadStarted()
+{
+    const DWORD t = GetCurrentThreadId();
+    const int n = (std::min)(g_foreignThreadCount.load(), 64);
+    for (int i = 0; i < n; ++i)
+    {
+        DWORD cur = t;
+        if (g_foreignThreads[i].compare_exchange_strong(cur, 0))
+            std::fprintf(stderr, "[rb] thread %lu: the id of a dead thread on its own timeline, now a new guest thread's - no longer foreign\n", t);
+    }
+}
+uint64_t RollbackRestoreCount() { return g_restores.load(std::memory_order_relaxed); }
 
 void SessionTraceTick(bool start);   // rollback_session.cpp (TTT2_RB_NACETRACE)
 void SessionTraceUpdate();
@@ -3145,11 +3777,14 @@ void RollbackJobTrace(const char* what, uint32_t obj, bool after)
 // stream" after ~400 rewinds of 7 frames). It once cost 15.4 ms per re-simulated frame because the
 // previous frame's fence waited for its vblank; discarded frames no longer wait for one
 // (kernel_video.cpp), so the wait is the command processor's few packets. Timed for the report.
+bool DiagInKick();                                              // diag_hooks.cpp (p_diag47)
+void DiagKickFenceWait(PPCContext& ctx, uint8_t* base);
 PPC_FUNC(sub_82738E70)
 {
     if (!RollbackInResimDraw())
     {
-        __imp__sub_82738E70(ctx, base);
+        if (DiagInKick()) DiagKickFenceWait(ctx, base);
+        else __imp__sub_82738E70(ctx, base);
         return;
     }
     const auto start = std::chrono::steady_clock::now();
@@ -3160,7 +3795,8 @@ PPC_FUNC(sub_82738E70)
 }
 
 // Threads on their own timelines (entry routines and loops that never return): registered as they start.
-PPC_FUNC(sub_82D032D0) { NoteForeignThread(); __imp__sub_82D032D0(ctx, base); }
+void HitchRegisterGuestThread(const char* name, PPCContext* ctx);   // diag_hooks.cpp (TTT2_HITCH_PROFILE=4)
+PPC_FUNC(sub_82D032D0) { NoteForeignThread(); HitchRegisterGuestThread("sound", &ctx); __imp__sub_82D032D0(ctx, base); }
 PPC_FUNC(sub_82C3A4E0) { NoteForeignThread(); __imp__sub_82C3A4E0(ctx, base); }
 PPC_FUNC(sub_82C3A540) { NoteForeignThread(); __imp__sub_82C3A540(ctx, base); }
 
@@ -3299,6 +3935,31 @@ void HavokCalibrationStart()
 }
 }   // namespace
 
+// kernel_thread.cpp: a guest thread ended and its block [lo, lo+size) goes back to the pool. Havok memory routers on that
+// stack are forgotten (the next calibration would make them islands again: 40 stale bytes restored into the next owner's
+// stack). True: one was an island in this fight - the block must wait for the next calibration.
+bool RollbackThreadBlockReleased(uint32_t lo, uint32_t size)
+{
+    std::vector<HkRouter> gone;
+    {
+        std::lock_guard l(g_hkMutex);
+        for (auto it = g_hkRouters.begin(); it != g_hkRouters.end();)
+        {
+            if (it->addr < lo || it->addr - lo >= size) { ++it; continue; }
+            gone.push_back(*it);
+            it = g_hkRouters.erase(it);
+        }
+    }
+    bool adopted = false;
+    for (const HkRouter& r : gone)
+    {
+        adopted |= r.adopted;
+        std::fprintf(stderr, "[rb-hk] Havok memory router %08X of thread %lu (entry %08X): its thread ended - forgotten%s\n",
+                     r.addr, r.tid, r.entry, r.adopted ? " (an island until the next calibration)" : "");
+    }
+    return adopted;
+}
+
 PPC_FUNC(sub_82C7B7E8)
 {
     if (HavokMode() == 1) NoteForeignThread();
@@ -3397,7 +4058,51 @@ PPC_FUNC(sub_82CFF418) { NoteForeignThread(); __imp__sub_82CFF418(ctx, base); }
 // effects). Some stages stream resources through the file loaders all fight long (the loader waits above).
 PPC_FUNC(sub_8250F070)
 {
-    if (ctx.r4.u32) std::fprintf(stderr, "[stage] loading stage %u's resources\n", GRead32(base, ctx.r4.u32));
+    if (ctx.r4.u32)
+    {
+        // TEST ONLY (p_diag21): the descriptor's second word, and a stage swap for finding the online-only stages.
+        // "<from>:<to>[:<word>]", or "@<file>" holding that text, read again at every stage load (one session tries many);
+        // <from> "*": any fight stage (not the menus' 32-35, nor 30, the VS screen's backdrop, caller lr 8250AB94).
+        // Only the files change: the rest of the game keeps the stage it picked (start positions, sky set-up), so a
+        // swapped stage is a hybrid - fine for timing and sync tests, not for looks (MEASURED 2026-11-01: Fallen Garden
+        // swapped in drew magenta sky rectangles that its own pick on the stage select never does; a swapped backdrop 30
+        // put red/green/blue cube-map faces in the intro's eyes). Pick stages on the select for pictures.
+        static const char* const spec = std::getenv("TTT2_DIAG_STAGE_AS");
+        std::array<int64_t, 3> as = { -1, -1, -1 };
+        if (spec && *spec)
+        {
+            char text[64] = {};
+            if (*spec == '@')
+            {
+                if (FILE* f = std::fopen(spec + 1, "rb")) { std::fread(text, 1, sizeof(text) - 1, f); std::fclose(f); }
+            }
+            else std::snprintf(text, sizeof(text), "%s", spec);
+            char* p = text;
+            const bool any = *p == '*';
+            if (any) { as[0] = 0x7FFFFFFF; p += *(p + 1) == ':' ? 2 : 1; }
+            for (int i = any ? 1 : 0; i < 3 && *p >= '0' && *p <= '9'; ++i)
+            {
+                as[size_t(i)] = int64_t(std::strtoul(p, &p, 0));
+                if (*p == ':') ++p;
+            }
+        }
+        const uint32_t id = GRead32(base, ctx.r4.u32), word = GRead32(base, ctx.r4.u32 + 4);
+        if (as[0] >= 0 && as[1] >= 0 && (id == uint32_t(as[0]) || (as[0] == 0x7FFFFFFF && id != 30 && (id < 32 || id > 35))))
+        {
+            GWrite32(base, ctx.r4.u32, uint32_t(as[1]));
+            if (as[2] >= 0) GWrite32(base, ctx.r4.u32 + 4, uint32_t(as[2]));
+            std::fprintf(stderr, "[stage] TEST swap: stage %u (word %08X) -> %u (word %08X)\n", id, word,
+                         GRead32(base, ctx.r4.u32), GRead32(base, ctx.r4.u32 + 4));
+        }
+        g_stageLoads.fetch_add(1, std::memory_order_relaxed);
+        std::fprintf(stderr, "[stage] loading stage %u's resources (descriptor %08X: %u, %08X; caller lr %08X)\n",
+                     GRead32(base, ctx.r4.u32), ctx.r4.u32, GRead32(base, ctx.r4.u32), GRead32(base, ctx.r4.u32 + 4),
+                     uint32_t(ctx.lr));
+    }
+    {
+        void DiagHeapReport(const char* why);    // diag_hooks.cpp (DIAGNOSTIC BUILD diag3)
+        DiagHeapReport("stage load");
+    }
     __imp__sub_8250F070(ctx, base);
 }
 
@@ -3417,6 +4122,9 @@ PPC_FUNC(sub_82AD1AD0)
     __imp__sub_82AD1AD0(ctx, base);
     if (GetCurrentThreadId() == g_mainTid) g_fp.vblankMs += Ms(t, std::chrono::steady_clock::now());
 }
+
+// low_latency.cpp: this frame's vblank waits in the frame kick so far (main thread; the next update starts them anew).
+double RollbackKickVblankMs() { return g_fp.vblankMs; }
 
 // The fight's inputs from outside the state: a pad slot's buttons (sub_822745B0: the local pad, or
 // online NACE's current record) and, online, whether the next frame's record is ready
@@ -3457,6 +4165,7 @@ void SoundRollbackFrame(uint64_t frame, bool resim);   // sound_rollback.cpp
 extern "C" PPC_FUNC(__imp__sub_825EBCC8);
 PPC_FUNC(sub_825EBCC8)
 {
+    const timeline::Scope tlDraw{ timeline::GameDraw };   // TEST ONLY (timeline.h: input latency work)
     if (!g_resimDraw) g_fp.draw0 = Clock::now();
     __imp__sub_825EBCC8(ctx, base);
     if (!g_resimDraw) { g_fp.draw1 = Clock::now(); g_inFrameWork = false; g_frameSince = 0; }
@@ -3551,10 +4260,12 @@ PPC_FUNC(sub_8266D8C0)
 
 PPC_FUNC(sub_825EF0B8)
 {
+    const timeline::Scope tlUpdate{ timeline::GameUpdate };   // TEST ONLY (timeline.h: input latency work)
     SoundRollbackFrame(~0ull, false);                 // the previous frame's sound calls end here
     FrameProfNext(Clock::now());                      // the previous frame's parts (slow frames)
     g_inFrameWork = true;
     SessionTraceUpdate();
+    unlock_all::Update(ctx, base);                    // UNLOCK ALL confirmed on the main menu: applied and saved here
     if (!g_foreignOpens.empty())
     {
         std::vector<ForeignOpen> opens;
@@ -3564,6 +4275,17 @@ PPC_FUNC(sub_825EF0B8)
         for (const ForeignOpen& o : opens)
             std::fprintf(stderr, "[rb] page %08X first written after calibration by a foreign thread %lu (entry %08X, lr %08X): never rewound\n",
                          o.page, o.tid, o.entry, o.lr);
+    }
+    if (!g_foreignHots.empty())
+    {
+        std::vector<ForeignHot> hots;
+        AcquireSRWLockExclusive(&g_cowLock);
+        hots.swap(g_foreignHots);
+        ReleaseSRWLockExclusive(&g_cowLock);
+        for (const ForeignHot& h : hots)
+            std::fprintf(stderr, "[rb] page %08X (only other timelines wrote it - first entry %08X) written by frame thread %lu "
+                                 "(entry %08X, lr %08X): rewound from now on, except masked words\n",
+                         h.page, h.foreignEntry, h.tid, h.entry, h.lr);
     }
     if (MachineryOn())
     {
@@ -3647,8 +4369,12 @@ PPC_FUNC(sub_825EF0B8)
     // Full-frame state (the default): the draw is re-simulated too, so its words are restored like
     // the update's; only the update-only sets learn words to leave alone.
     const uint32_t outsideAdded = g_lastPostPages && UpdateSetOnly() ? LearnOutside() : 0;
-    if (g_fightRun >= CalibrateFrom()) ApplyJobMasks(g_hot.size() != g_lastPostPages);
-    RngIn();                                        // before the snapshot: it holds the fight's state
+    if (g_fightRun >= CalibrateFrom())
+    {
+        if (g_fightRun == CalibrateFrom()) ArenaReserve();   // no image yet: a new chunk is masked right below, never rewound past
+        ApplyJobMasks(g_hot.size() != g_lastPostPages);
+    }
+    RngIn();                                       // before the snapshot: it holds the fight's state
     // A page first written after calibration: older snapshots lack it, so a rewind leaves it as it
     // is (MEASURED: the fight's replay recording grows into a new page every ~7 frames; re-simulated
     // frames rewrite what they append).
@@ -3711,6 +4437,33 @@ PPC_FUNC(sub_825EF0B8)
         if (g_fightRun) std::fprintf(stderr, "[rb] fight over after %d updates; %u tests, %u with fighter differences\n",
                                      g_fightRun, g_st.tests, g_st.failed);
         if (g_cowActive.load()) UnprotectAll();
+        if (g_fightRun >= CalibrateFrom())
+        {
+            // Guest thread blocks against this fight's set (g_isHot / g_foreign stay as they are until the next
+            // calibration): a block handed out from the pool was excluded - none of its pages hot or watched; only a
+            // block a thread had to make during the fight can show any (kernel_thread.cpp's "no free thread block").
+            uint32_t madeThisFight = 0;
+            std::vector<std::pair<uint32_t, uint32_t>> blocks;
+            GuestThreadBlocksFightOver(madeThisFight, &blocks);
+            uint32_t hot = 0, watched = 0, withPages = 0;
+            for (auto [lo, size] : blocks)
+            {
+                bool any = false;
+                for (uint32_t p = lo >> 12; p < (lo + size + kPage - 1) >> 12 && p < g_isHot.size(); ++p)
+                {
+                    if (g_isHot[p]) { ++hot; any = true; }
+                    if (g_foreign[p]) { ++watched; any = true; }
+                }
+                withPages += any;
+            }
+            std::fprintf(stderr, "[rb] fight over: %u hot and %u watched pages inside guest thread blocks (%u of %zu blocks; %u made during this fight)\n",
+                         hot, watched, withPages, blocks.size(), madeThisFight);
+        }
+        else
+        {
+            uint32_t ignored = 0;
+            GuestThreadBlocksFightOver(ignored, nullptr);
+        }
         if (g_fightRun) NoteEvent("fight over");
         g_fightRun = 0;
         g_fightOnline = false;

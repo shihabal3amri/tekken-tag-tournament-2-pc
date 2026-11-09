@@ -22,4 +22,14 @@ struct PcLists
 std::string ApplyPcEdits(const uint8_t* doc, size_t size, const PcLists& lists, std::string* why,
                          std::string* note = nullptr);
 
+// The ONLINE MODE menu has the PAIR PLAY row (after PLAYER MATCH: the rows after it one place down).
+bool MenuPairPlayRow();
+// The online document has the rematch menu (FrameRematch5 / FrameRematch6, online_rematch.cpp) and the room's REMATCH
+// MENU row.
+bool MenuRematchFrames();
+// A rematch menu row's help text, by choice (0 REMATCH .. 4 RETURN TO ROOM, 5 LEAVE - the room host's closes the session).
+const char* RematchHelp(int choice, bool host = false);
+// The online document has the PAIR PLAY screen's names frame (FrameOnlinePairNames: TextPairPlace1-4 at the stones).
+bool MenuPairNamesFrame();
+
 } // namespace menu_doc

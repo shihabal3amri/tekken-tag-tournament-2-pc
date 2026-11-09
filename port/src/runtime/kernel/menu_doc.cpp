@@ -10,10 +10,13 @@
 // 0x07 int) that the bytecode indexes - renaming an entry retargets the script.
 #include "menu_doc.h"
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <initializer_list>
+#include <functional>
 #include <map>
 #include <stdexcept>
+#include <utility>
 
 namespace menu_doc {
 namespace {
@@ -243,6 +246,74 @@ void XtalExtendArrays(std::string& blob, std::initializer_list<uint8_t> consts, 
     blob = head + code + tail;
 }
 
+// One more element at `index` (>= 1) in every array literal of a script - a copy of the element before it - with the
+// script's jumps moved past the insertions: 1b = jump (+2-byte offset), 1d = conditional jump (+3 operand bytes, 2-byte
+// offset), both relative to the opcode (MEASURED 2026-10-25 on the ONLINE MODE menu's OnLoad: its three build variants
+// each make the two icon arrays, the jumps land on the next variant / the end). Throws when a jump does not land inside
+// the code; the debug tail's last pc follows the new code size.
+void XtalInsertArrayElements(std::string& blob, size_t index)
+{
+    const auto* b = reinterpret_cast<const uint8_t*>(blob.data());
+    const uint32_t codeSize = Be32(b, blob.size(), 8);
+    if (12 + size_t(codeSize) > blob.size() || index < 1) throw Fail("bad script");
+    const std::string code = blob.substr(12, codeSize), tail = blob.substr(12 + codeSize);
+    const std::string make{ '\x42', '\x01', '\x02' };
+    std::vector<std::pair<size_t, std::string>> inserts;           // (offset in the old code, bytes)
+    for (size_t at = code.find(make); at != std::string::npos; at = code.find(make, at + 1))
+    {
+        size_t p = at + make.size();
+        // the first element: 02 00 k 43 01 02; each later one: 02 02 00 k 43 01 02
+        if (p + 6 > code.size() || code[p] != '\x02' || code[p + 1] != '\x00' || code.compare(p + 3, 3, "\x43\x01\x02", 3) != 0)
+            continue;
+        uint8_t k = uint8_t(code[p + 2]);
+        p += 6;
+        size_t n = 1;
+        while (n < index && p + 7 <= code.size() && code.compare(p, 3, "\x02\x02\x00", 3) == 0 && code.compare(p + 4, 3, "\x43\x01\x02", 3) == 0)
+        {
+            k = uint8_t(code[p + 3]);
+            p += 7;
+            ++n;
+        }
+        if (n < index) throw Fail("an array shorter than the new element's place");
+        inserts.push_back({ p, std::string{ '\x02', '\x02', '\x00', char(k), '\x43', '\x01', '\x02' } });
+    }
+    if (inserts.empty()) throw Fail("no array");
+    auto moved = [&](size_t from, size_t to) {                     // bytes inserted in (from, to]
+        size_t add = 0;
+        for (const auto& [at, bytes] : inserts)
+            if (at > from && at <= to) add += bytes.size();
+        return add;
+    };
+    std::string out = code;
+    // jumps first (old offsets), then the insertions from the end
+    for (size_t i = 0; i < code.size(); ++i)
+    {
+        const uint8_t op = uint8_t(code[i]);
+        size_t field = 0;
+        if (op == 0x1b && i + 3 <= code.size()) field = i + 1;
+        else if (op == 0x1d && i + 6 <= code.size()) field = i + 4;
+        else continue;
+        const size_t off = (uint8_t(code[field]) << 8) | uint8_t(code[field + 1]);
+        const size_t target = i + off;
+        if (target >= code.size()) throw Fail("a jump outside the script");
+        const size_t add = moved(i, target);
+        if (!add) continue;
+        const size_t now = off + add;
+        out[field] = char(now >> 8);
+        out[field + 1] = char(now & 0xFF);
+    }
+    for (auto it = inserts.rbegin(); it != inserts.rend(); ++it) out.insert(it->first, it->second);
+    std::string oldLast, newLast, t = tail;
+    PutBe32(oldLast, codeSize - 1);
+    PutBe32(newLast, uint32_t(out.size()) - 1);
+    const size_t at = t.find(oldLast);
+    if (at == std::string::npos || t.find(oldLast, at + 1) != std::string::npos) throw Fail("script tail pc not unique");
+    t.replace(at, 4, newLast);
+    std::string head = blob.substr(0, 8);
+    PutBe32(head, uint32_t(out.size()));
+    blob = head + out + t;
+}
+
 // The same, to any size >= 1: elements beyond `size` are removed from the end (each later element
 // is one 7-byte unit 02 02 00 k 43 01 02).
 void XtalResizeArrays(std::string& blob, std::initializer_list<uint8_t> consts, size_t size)
@@ -322,6 +393,7 @@ void AddKeyboardMode(Doc& d);
 void AddInputDelay(Doc& d);
 void AddOnlineNetcode(Doc& d);
 void AddDisplayImage(Doc& d);
+void AddGraphicsPage(Doc& d);
 
 void Edit(Doc& d, const PcLists& lists, std::string* note)
 {
@@ -376,7 +448,9 @@ void Edit(Doc& d, const PcLists& lists, std::string* note)
             Node item;
             item.index = itemIndex;
             item.text = (*values[i])[k] + '\0';
-            if (k == 0) d.Set(item, "default", "true");
+            // the list's default (the game draws it green, any other value yellow): WINDOWED; 1280x720, display_settings.cpp's
+            // default (third since 640x360 and 960x540 came first)
+            if (i == 0 ? k == 0 : (*values[i])[k] == "1280x720") d.Set(item, "default", "true");
             sv.children.push_back(std::move(item));
         }
         size_t at = 0;
@@ -438,6 +512,10 @@ void Edit(Doc& d, const PcLists& lists, std::string* note)
     catch (const Fail& e) { if (note) *note = std::string("Display Settings image rows left out: ") + e.what(); }
 
     AddSwitchProfile(d);
+    // GRAPHICS SETTINGS (the picture options' page): an edit of a copy too.
+    Doc graphics = d;
+    try { AddGraphicsPage(graphics); d = std::move(graphics); }
+    catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "Graphics Settings left out: " + e.what(); }
     AddSystemFrames(d);
     // KEYBOARD edits a copy: if the screen is not as measured, only that part is left out.
     Doc keyboard = d;
@@ -562,62 +640,74 @@ void AddOnlineNetcode(Doc& d)
     list.insert(list.begin() + std::ptrdiff_t(at), helps.begin(), helps.end());
 }
 
-// ---- Options -> Display Settings: VSYNC, SHARPNESS, ANTI-ALIASING, TEXTURE FILTERING, SHADOWS after RESOLUTION
-// (display_settings.h; the presenter, the texture samplers and the renderer apply them as the cursor moves).
-// Clones of 3D DEPTH like DISPLAY MODE / RESOLUTION, natives renamed to PC ones of the same lengths
-// (menu_ext.cpp registers them); the page's icon arrays grow to 12 rows; help texts go by position
-// (rows 7..11, DEFAULT's becomes "StaticMode007-04-012").
+// A PC row: a clone of 3D DEPTH (its OnTrigger passes the value cursor as an int) with the natives renamed to PC ones
+// (menu_ext.cpp registers them) and a value list of its own - the row (`item`, value `sv`) and the list (a clone of
+// `svTemplate`, value `defaultValue` its default).
+struct PcRow
+{
+    const char* label; const char* preview; const char* store; const char* help; std::vector<std::string> values;
+    size_t defaultValue = 0;
+};
+void MakePcRow(Doc& d, const Node& depth, const Node& svTemplate, const PcRow& r, const std::string& item,
+               const std::string& sv, std::vector<Node>& items, std::vector<Node>& lists)
+{
+    Node row = depth;
+    d.Set(row, "name", item.c_str());
+    d.Set(row, "text", r.label);
+    d.Set(row, "textid", nullptr);
+    d.Set(row, "value", sv.c_str());
+    // 3D DEPTH may already be off the page (AddDisplayImage): the copy is laid out automatically
+    d.Set(row, "postype", "auto");
+    d.Set(row, "posx", nullptr);
+    d.Set(row, "posy", nullptr);
+    d.Set(row, "visible", nullptr);
+    std::string& trig = d.Event(row, "OnTrigger").text;
+    XtalRename(trig, "DisplaySettingIsMonitor3DCapable", "DisplaySettingIsPCDisplayCapable");
+    XtalRename(trig, "MenuOptionDisplay3DPallarax", r.preview);
+    XtalRename(trig, "DisplaySettingSet3DDepth", r.store);
+    XtalRename(trig, "SelectValueMenuItemMode007-04-04", sv);
+    items.push_back(std::move(row));
+    Node list = svTemplate;
+    d.Set(list, "name", sv.c_str());
+    list.children.clear();
+    const uint32_t itemIndex = d.E("selectvalueitem");
+    for (size_t k = 0; k < r.values.size(); ++k)
+    {
+        Node value;
+        value.index = itemIndex;
+        value.text = r.values[k] + '\0';
+        if (k == r.defaultValue) d.Set(value, "default", "true");
+        list.children.push_back(std::move(value));
+    }
+    lists.push_back(std::move(list));
+}
+
+// ---- Options -> Display Settings: VSYNC, BRIGHTNESS, LOW LATENCY and QUICK START after RESOLUTION (display_settings.h;
+// the presenter and the frame kick apply them as the cursor moves, QUICK START at the next start). PC rows like DISPLAY
+// MODE / RESOLUTION; the page's icon arrays grow to 11 rows (the hidden 3D rows among them); help texts go by position
+// (rows 7 to 10, DEFAULT's becomes "StaticMode007-04-011"). The page stops here: with 12 entries in those arrays the
+// main menu came up without its rows (MEASURED 2026-11-04; 11 entries with 12 rows left DEFAULT's help text on screen).
+// The picture options have a page of their own (AddGraphicsPage).
 void AddDisplayImage(Doc& d)
 {
-    const struct { const char* n; const char* label; const char* preview; const char* store; const char* help;
-                   std::vector<std::string> values; } rows[] = {
-        { "11", "VSYNC", "MenuOptionDisplayVSyncOnOff", "DisplaySettingSetVSyncOn",
-          "OFF: less input lag, the picture may tear. Still 60 fps.",
-          { "ON", "OFF" } },
-        { "08", "SHARPNESS", "MenuOptionDisplaySharpening", "DisplaySettingSetSharpen",
-          "Sharpen the picture (contrast adaptive sharpening).",
-          { "OFF", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10" } },
-        { "09", "ANTI-ALIASING", "MenuOptionDisplayEdgeSmooth", "DisplaySettingSetEdgesAA",
-          "Smooth jagged edges (FXAA).",
-          { "OFF", "FXAA" } },
-        { "10", "TEXTURE FILTERING", "MenuOptionDisplayTexFilters", "DisplaySettingSetTexFilt",
-          "Anisotropic filtering keeps textures sharp at an angle.",
-          { "STANDARD", "ANISOTROPIC 2X", "ANISOTROPIC 4X", "ANISOTROPIC 8X", "ANISOTROPIC 16X" } },
-        { "12", "SHADOWS", "MenuOptionDisplayShadowsOff", "DisplaySettingSetShadows",
-          "OFF: fighters and stage objects cast no shadows. Lighter on the GPU.",
-          { "ON", "OFF" } },
+    const PcRow rows[] = {
+        { "VSYNC", "MenuOptionDisplayVSyncOnOff", "DisplaySettingSetVSyncOn",
+          "OFF: less input lag, the picture may tear. Still 60 fps.", { "ON", "OFF" } },
+        { "BRIGHTNESS", "MenuOptionDisplayBrightness", "DisplaySettingSetBrightn",
+          "Brighter or darker picture. 0: as the game draws it.",
+          { "-5", "-4", "-3", "-2", "-1", "0", "+1", "+2", "+3", "+4", "+5" }, 5 },
+        { "LOW LATENCY", "MenuOptionDisplayLowLatency", "DisplaySettingSetLowLatn",
+          "ON: a frame less input lag in fights, can cost fps. AUTO: if it fits.", { "AUTO", "ON", "OFF" }, 2 },   // OFF since TEST 17
+        { "QUICK START", "MenuOptionDisplayQuickStart", "DisplaySettingSetQuickGo",
+          "ON: skip the logos and the intro movie when the game starts.", { "OFF", "ON" } },
     };
+    const char* const numbers[] = { "11", "12", "13", "14" };
     const Node depth = d.Find("MenuItemMode007-04-04");
     const Node svTemplate = d.Find("SelectValueMenuItemMode007-04-02");
-    const uint32_t itemIndex = d.E("selectvalueitem");
     std::vector<Node> items, lists;
-    for (const auto& r : rows)
-    {
-        const std::string sv = std::string("SelectValueMenuItemMode007-04-") + r.n;
-        Node row = depth;
-        d.Set(row, "name", (std::string("MenuItemMode007-04-") + r.n).c_str());
-        d.Set(row, "text", r.label);
-        d.Set(row, "textid", nullptr);
-        d.Set(row, "value", sv.c_str());
-        std::string& trig = d.Event(row, "OnTrigger").text;
-        XtalRename(trig, "DisplaySettingIsMonitor3DCapable", "DisplaySettingIsPCDisplayCapable");
-        XtalRename(trig, "MenuOptionDisplay3DPallarax", r.preview);
-        XtalRename(trig, "DisplaySettingSet3DDepth", r.store);
-        XtalRename(trig, "SelectValueMenuItemMode007-04-04", sv);
-        items.push_back(std::move(row));
-        Node list = svTemplate;
-        d.Set(list, "name", sv.c_str());
-        list.children.clear();
-        for (size_t k = 0; k < r.values.size(); ++k)
-        {
-            Node item;
-            item.index = itemIndex;
-            item.text = r.values[k] + '\0';
-            if (k == 0) d.Set(item, "default", "true");
-            list.children.push_back(std::move(item));
-        }
-        lists.push_back(std::move(list));
-    }
+    for (size_t i = 0; i < std::size(rows); ++i)
+        MakePcRow(d, depth, svTemplate, rows[i], std::string("MenuItemMode007-04-") + numbers[i],
+                  std::string("SelectValueMenuItemMode007-04-") + numbers[i], items, lists);
     // Rows before DEFAULT (after RESOLUTION), value lists after RESOLUTION's (document order).
     {
         size_t at = 0;
@@ -629,11 +719,10 @@ void AddDisplayImage(Doc& d)
         std::vector<Node>& list = d.ListOf("SelectValueMenuItemMode007-04-07", at);
         list.insert(list.begin() + std::ptrdiff_t(at) + 1, lists.begin(), lists.end());
     }
-    XtalExtendArrays(d.Event(d.Find("MenuMode007-04-01"), "OnLoad").text, { 1, 2 }, 12);
-    // 3D MODE / 3D DEPTH (stereoscopic 3D: never on a PC, the rows stayed greyed out) leave the page so 10 rows fit
-    // above the info bar (12 overlapped it). The page's scripts look them up by name, so they stay in the document,
-    // out of the automatic layout and hidden (row, value, help text); the cursor already skipped them. MEASURED: only
-    // hiding them left their help texts and frames in place.
+    XtalExtendArrays(d.Event(d.Find("MenuMode007-04-01"), "OnLoad").text, { 1, 2 }, 7 + std::size(rows));
+    // 3D MODE / 3D DEPTH (stereoscopic 3D: never on a PC, the rows stayed greyed out) leave the page. The page's
+    // scripts look them up by name, so they stay in the document, out of the automatic layout and hidden (row, value,
+    // help text); the cursor already skipped them. MEASURED: only hiding them left their help texts and frames in place.
     for (const char* name : { "MenuItemMode007-04-03", "MenuItemMode007-04-04", "SelectValueMenuItemMode007-04-03",
                               "SelectValueMenuItemMode007-04-04", "StaticMode007-04-03", "StaticMode007-04-04" })
     {
@@ -654,7 +743,7 @@ void AddDisplayImage(Doc& d)
         d.Set(help, "textid", nullptr);
         helps.push_back(std::move(help));
     }
-    d.Set(list[at], "name", "StaticMode007-04-012");
+    d.Set(list[at], "name", ("StaticMode007-04-0" + std::to_string(7 + std::size(rows))).c_str());
     list.insert(list.begin() + std::ptrdiff_t(at), helps.begin(), helps.end());
 }
 
@@ -709,6 +798,187 @@ void AddSwitchProfile(Doc& d)
     XtalRename(tick, "WindowGetValue", "SwitchProfileWindow");
     XtalRename(tick, "FrameMainMenu", "FrameMode007-01");
     top.insert(top.begin() + std::ptrdiff_t(at) + 1, std::move(dialog));
+}
+
+bool XtalHas(const std::string& blob, const std::string& name)
+{
+    for (const char tag : { '\x0e', '\x0b' })
+    {
+        std::string pat(1, tag);
+        PutBe32(pat, uint32_t(name.size()));
+        if (blob.find(pat + name) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// ---- Options -> GRAPHICS SETTINGS (5th row, after DISPLAY SETTINGS): SHARPNESS, ANTI-ALIASING, TEXTURE FILTERING,
+// SHADOWS, DEPTH OF FIELD, BLOOM, LIGHT SHAFTS, WEATHER EFFECTS and DEFAULT (display_settings.h; the presenter, the
+// texture samplers, the renderer, the game's post filters and particle jobs apply them as the cursor moves; TEST 17
+// removed DYNAMIC RESOLUTION, post_dof.cpp: WEATHER EFFECTS moved up to row 8, DEFAULT to 9). Display Settings fits 10 rows
+// above the info bar (MEASURED 2026-10-29: an 11th put DEFAULT half behind it, and the automatic layout ignores
+// positions), so the picture options have a page of their own: FrameMode007-07-01, built from Display Settings' parts
+// with names of its own -
+//   the frame's OnFocus, OnLostFocus, OnCancel and OnTick are Display Settings'. OnFocus initialises Display
+//     Settings' own lists (lib::MenuSelectValueSetCursor, which menu_ext.cpp follows with this page's values) and
+//     its hidden 3D rows, as Display Settings does; OnCancel returns to Options. There is no frame OnEnter (Display
+//     Settings' stores MOTION BLUR and 3D from its lists; these rows store as they change);
+//   the menu's scripts are Display Settings' (the icon arrays are globals, renamed: Display Settings' would be
+//     overwritten), the arrays sized to the rows; help texts go by position ("StaticMode007-07-0" + row);
+//   the rows are PC rows (MakePcRow); DEFAULT is Display Settings' with lib::GraphicsSettingResetToDefaults for
+//     lib::DisplaySettingResetToDefaults (it then re-initialises the lists like OnFocus).
+// The Options row is DISPLAY SETTINGS' with OnEnter retargeted; its icons and help / value texts are inserted at
+// position 5 (COPYRIGHT's and SWITCH PROFILE's help texts move to 6 and 7).
+void AddGraphicsPage(Doc& d)
+{
+    const PcRow rows[] = {
+        { "SHARPNESS", "MenuOptionDisplaySharpening", "DisplaySettingSetSharpen",
+          "Sharpen the picture (contrast adaptive sharpening).",
+          { "OFF", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10" } },
+        { "ANTI-ALIASING", "MenuOptionDisplayEdgeSmooth", "DisplaySettingSetEdgesAA",
+          "Smooth jagged edges. SMAA: light. SSAA: above RESOLUTION, heavier.",
+          { "OFF", "SMAA", "SSAA 1.5X", "SSAA 2X" } },
+        { "TEXTURE FILTERING", "MenuOptionDisplayTexFilters", "DisplaySettingSetTexFilt",
+          "TRILINEAR: smoother distant textures. ANISOTROPIC: sharp at an angle.",
+          { "STANDARD", "TRILINEAR", "ANISOTROPIC 2X", "ANISOTROPIC 4X", "ANISOTROPIC 8X", "ANISOTROPIC 16X" } },
+        { "SHADOWS", "MenuOptionDisplayShadowsOff", "DisplaySettingSetShadows",
+          "OFF: fighters and stage objects cast no shadows. Lighter on the GPU.", { "ON", "OFF" } },
+        { "DEPTH OF FIELD", "MenuOptionDisplayDepthField", "DisplaySettingSetDofBlur",
+          "OFF: no depth of field blur, the stage stays sharp. Lighter on the GPU.", { "ON", "OFF" } },
+        { "BLOOM", "MenuOptionDisplayBloomGlare", "DisplaySettingSetBloomFx",
+          "OFF: no glow around bright light. A little lighter on the GPU.", { "ON", "OFF" } },
+        { "LIGHT SHAFTS", "MenuOptionDisplayLightShaft", "DisplaySettingSetShaftFx",
+          "OFF: no rays of light on the stages that have them.", { "ON", "OFF" } },
+        { "WEATHER EFFECTS", "MenuOptionDisplayRainSnowFx", "DisplaySettingSetWeather",
+          "OFF: no falling rain or other stage particles. Lighter on the CPU.", { "ON", "OFF" } },
+        { "FPS COUNTER", "MenuOptionDisplayFpsCounter", "DisplaySettingSetFpsShow",
+          "Show the frames per second in a corner of the screen.", { "OFF", "TOP LEFT", "TOP RIGHT", "BOTTOM LEFT", "BOTTOM RIGHT" } },
+    };
+    const size_t count = std::size(rows) + 1;                   // + DEFAULT
+    const std::string frameName = "FrameMode007-07-01", menuName = "MenuMode007-07-01", helpPrefix = "StaticMode007-07-0";
+
+    size_t at = 0;
+    std::vector<Node>& top = d.ListOf("FrameMode007-04-01", at);
+    const Node source = top[at];
+    auto child = [&](const Node& parent, const char* name) -> const Node& {
+        for (const Node& c : parent.children)
+            if (d.Get(c, "name") == name) return c;
+        throw Fail(std::string("no ") + name + " in Display Settings");
+    };
+    auto event = [&](const Node& parent, const char* name) -> Node {
+        return d.Event(const_cast<Node&>(parent), name);
+    };
+    const Node& menuSource = child(source, "MenuMode007-04-01");
+    // the menu's scripts with this page's names
+    auto rename = [&](std::string& blob) {
+        const std::pair<const char*, std::string> names[] = {
+            { "MenuMode007-04-01", menuName },
+            { "StaticIcon007-04", "StaticIcon007-07" },
+            { "StaticMode007-04-0", helpPrefix },
+            { "MenuMode007_04_icon_S_array", "MenuMode007_07_icon_S_array" },
+            { "MenuMode007_04_icon_L_array", "MenuMode007_07_icon_L_array" } };
+        for (const auto& [from, to] : names)
+            if (XtalHas(blob, from)) XtalRename(blob, from, to);
+    };
+
+    Node frame;
+    frame.index = source.index;
+    frame.text = source.text;
+    frame.attrs = source.attrs;
+    d.Set(frame, "name", frameName.c_str());
+    for (const char* name : { "OnFocus", "OnLostFocus", "OnCancel", "OnTick" })
+    {
+        Node e = event(source, name);
+        if (std::string(name) == "OnFocus") XtalRename(e.text, "StaticTelopMode007-04", "StaticTelopMode007-07");
+        if (std::string(name) == "OnTick") XtalRename(e.text, "MenuMode007-04-01", menuName);
+        frame.children.push_back(std::move(e));
+    }
+
+    Node menu;
+    menu.index = menuSource.index;
+    menu.text = menuSource.text;
+    menu.attrs = menuSource.attrs;
+    d.Set(menu, "name", menuName.c_str());
+    const Node depth = d.Find("MenuItemMode007-04-04");
+    const Node svTemplate = d.Find("SelectValueMenuItemMode007-04-02");
+    std::vector<Node> items, lists;
+    for (size_t i = 0; i < std::size(rows); ++i)
+        MakePcRow(d, depth, svTemplate, rows[i], "MenuItemMode007-07-0" + std::to_string(i + 1),
+                  "SelectValueMenuItemMode007-07-0" + std::to_string(i + 1), items, lists);
+    Node reset = child(menuSource, "MenuItemMode007-04-05");
+    d.Set(reset, "name", ("MenuItemMode007-07-0" + std::to_string(count)).c_str());
+    XtalRename(d.Event(reset, "OnEnter").text, "DisplaySettingResetToDefaults", "GraphicsSettingResetToDefaults");
+    items.push_back(std::move(reset));
+    for (Node& item : items) menu.children.push_back(std::move(item));
+    for (const Node& c : menuSource.children)
+    {
+        if (c.index == d.E("menuitemtext")) continue;
+        Node e = c;                                              // the menu's events
+        rename(e.text);
+        if (c.index == d.E("OnLoad")) XtalResizeArrays(e.text, { 1, 2 }, count);
+        menu.children.push_back(std::move(e));
+    }
+    frame.children.push_back(std::move(menu));
+
+    // value column (document order): the lists, then DEFAULT's empty value; then the help texts, the icon, the info
+    // bar text and the hidden "from" text the Options row writes
+    for (Node& list : lists) frame.children.push_back(std::move(list));
+    Node resetValue = child(source, "StaticTextMenuItemMode007-04-05");
+    d.Set(resetValue, "name", ("StaticTextMenuItemMode007-07-0" + std::to_string(count)).c_str());
+    frame.children.push_back(std::move(resetValue));
+    const Node& helpTemplate = child(source, "StaticMode007-04-01");
+    for (size_t i = 0; i < std::size(rows); ++i)
+    {
+        Node h = helpTemplate;
+        d.Set(h, "name", (helpPrefix + std::to_string(i + 1)).c_str());
+        d.Set(h, "text", rows[i].help);
+        d.Set(h, "textid", nullptr);
+        frame.children.push_back(std::move(h));
+    }
+    const Node* resetHelp = nullptr;                             // DEFAULT's: the game's text 4,643
+    for (const Node& c : source.children)
+        if (d.Get(c, "textid") == "4,643") resetHelp = &c;
+    if (!resetHelp) throw Fail("no DEFAULT help text");
+    Node h = *resetHelp;
+    d.Set(h, "name", (helpPrefix + std::to_string(count)).c_str());
+    frame.children.push_back(std::move(h));
+    for (const char* name : { "StaticIconMode007-04", "StaticTelopMode007-04", "StaticMode007-04From" })
+    {
+        Node s = child(source, name);
+        std::string renamed = name;
+        renamed.replace(renamed.find("007-04"), 6, "007-07");
+        d.Set(s, "name", renamed.c_str());
+        frame.children.push_back(std::move(s));
+    }
+    top.insert(top.begin() + std::ptrdiff_t(at) + 1, std::move(frame));
+
+    // The Options row, after DISPLAY SETTINGS.
+    Node row = d.Find("MenuItemMode007-04");
+    d.Set(row, "name", "MenuItemMode007-07");
+    d.Set(row, "text", "GRAPHICS SETTINGS");
+    d.Set(row, "textid", nullptr);
+    d.Set(row, "textid360", nullptr);
+    std::string& enter = d.Event(row, "OnEnter").text;
+    XtalRename(enter, "FrameMode007-04-01", frameName);
+    XtalRename(enter, "StaticMode007-04From", "StaticMode007-07From");
+    {
+        std::vector<Node>& list = d.ListOf("MenuItemMode007-04", at);
+        list.insert(list.begin() + std::ptrdiff_t(at) + 1, std::move(row));
+    }
+    XtalInsertArrayElements(d.Event(d.Find("MenuMode007-01"), "OnLoad").text, 4);  // a copy of DISPLAY SETTINGS' icons
+    for (const char* prefix : { "StaticMode007-0", "StaticValueMode007-0" })
+    {
+        const std::string p = prefix;
+        d.Set(d.Find((p + "6").c_str()), "name", (p + "7").c_str());
+        d.Set(d.Find((p + "5").c_str()), "name", (p + "6").c_str());
+        std::vector<Node>& list = d.ListOf((p + "4").c_str(), at);
+        Node copy = list[at];
+        d.Set(copy, "name", (p + "5").c_str());
+        // as short as the game's own (a longer text scrolls - MEASURED 2026-10-29)
+        d.Set(copy, "text", p == "StaticMode007-0" ? "Adjust picture quality, such as sharpness and shadows." : "");
+        d.Set(copy, "textid", nullptr);
+        d.Set(copy, "textid360", nullptr);
+        list.insert(list.begin() + std::ptrdiff_t(at) + 1, std::move(copy));
+    }
 }
 
 // ---- System UI frames (menu_ext.cpp, PROFILE_PLAN.md): the console-side screens - Select Profile
@@ -843,6 +1113,264 @@ void AddFriendInvite(Doc& d)
 {
     XtalRename(d.Event(d.Find("MenuItemPlayerMatch04-Friend"), "OnEnter").text, "OnlinePlayerMatchOperationMenuSetValue",
                "OnlinePlayerMatchSteamFriendInviteOpen");
+}
+
+// ---- the room's REMATCH MENU row (port/ONLINE_2V2_PLAN.md "Start and rematch"): after KICK, a copy of LICENSE (a row
+// whose OnEnter calls one native) with a native of its own that turns the rematch menu on or off (online_rematch.cpp; the
+// value column says ON / OFF). The room host's alone, as KICK - online_2v2_team.cpp shows it only there - so for everyone
+// else both are hidden at the end of the list and no help line moves (help texts go by place: "StaticPlayerMatchRoom0" +
+// row, value texts by document order). The page's icon array grows to the 6 rows.
+void AddRematchRow(Doc& d)
+{
+    // copies, not references: the inserts below move the document's nodes
+    Node row = d.Find("MenuItemPlayerMatch03-License");
+    Node value = d.Find("StaticPlayerMatchRoomValue05");
+    Node help = d.Find("StaticPlayerMatchRoom05");
+    d.Set(row, "name", "MenuItemPlayerMatch06-Rematch");
+    d.Set(row, "text", "REMATCH MENU");
+    d.Set(row, "textid", nullptr);
+    d.Set(row, "textid360", nullptr);
+    XtalRename(d.Event(row, "OnEnter").text, "OnlinePlayerMatchOperationMenuSetValue", "OnlineRoomRematchToggle");
+    {
+        size_t at = 0;
+        std::vector<Node>& items = d.ListOf("MenuItemPlayerMatch05-KickOut", at);
+        items.insert(items.begin() + std::ptrdiff_t(at) + 1, std::move(row));
+    }
+    d.Set(value, "name", "StaticPlayerMatchRoomValue06");
+    d.Set(value, "fontalign", "right");                 // in the value column, as the rows' value lists
+    {
+        size_t at = 0;
+        std::vector<Node>& list = d.ListOf("StaticPlayerMatchRoomValue05", at);
+        list.insert(list.begin() + std::ptrdiff_t(at) + 1, std::move(value));
+    }
+    d.Set(help, "name", "StaticPlayerMatchRoom06");
+    d.Set(help, "text", "After each match the players choose: rematch, stage select, character select or the room.");
+    d.Set(help, "textid", nullptr);
+    d.Set(help, "textid360", nullptr);
+    {
+        size_t at = 0;
+        std::vector<Node>& list = d.ListOf("StaticPlayerMatchRoom05", at);
+        list.insert(list.begin() + std::ptrdiff_t(at) + 1, std::move(help));
+    }
+    Node& frame = d.Find("FrameOnlinePlayerMatchRoom");
+    XtalResizeArrays(d.Event(frame, "OnLoad").text, { 1 }, 6);
+}
+
+// ---- the rematch menu (online_rematch.cpp, port/ONLINE_2V2_PLAN.md "Start and rematch"): after a Player Match or PAIR
+// PLAY match, the ranked match's end menu (FrameRankMatchResult, IFPauseMenuS) with the room's choices - one frame per row
+// count, as the interface draws a bar per icon-array entry: FrameRematch5 (REMATCH, STAGE SELECT, CHARACTER SELECT,
+// RETURN TO ROOM, LEAVE) and FrameRematch6 (PAIR PLAY: CHANGE TEAMS before RETURN TO ROOM). The menu's scripts are the ranked
+// menu's with names of their own (the icon arrays are globals: the ranked menu's would be overwritten), the arrays sized
+// to the rows; help texts go by place ("StaticRematch<N>_0" + row), the value texts StaticRematch<N>Value<row> show who
+// chose what. Its OnEnter (a decide sound and a delayed frame switch) is the room's LICENSE row's, the native renamed:
+// lib::OnlineRematchChoose (menu_ext.cpp) takes the focused row and the menu stays up.
+struct RematchRow { const char* text; const char* help; };
+const RematchRow kRematchRows[6] = {                   // by choice (online_rematch.cpp's order)
+    { "REMATCH", "Same characters, same stage." },
+    { "STAGE SELECT", "Same characters, a new stage." },
+    { "CHARACTER SELECT", "New characters and stage." },
+    { "CHANGE TEAMS", "New teams, then characters." },
+    { "RETURN TO ROOM", "Back to the room." },
+    { "LEAVE", "Return to Online Mode menu." } };     // the game's own words (online texts 347 / 315)
+// LEAVE's help for the room host: its leave closes the session (the game has no host migration - texts 348 / 350)
+const char* const kRematchHostLeaveHelp = "Close the session. Everyone returns to the Online Mode menu.";
+void AddRematchFrames(Doc& d)
+{
+    size_t at = 0;
+    std::vector<Node>& top = d.ListOf("FrameRankMatchResult", at);
+    const Node source = top[at];
+    Node enter = d.Event(d.Find("MenuItemPlayerMatch03-License"), "OnEnter");
+    XtalRename(enter.text, "OnlinePlayerMatchOperationMenuSetValue", "OnlineRematchChoose");
+    const RematchRow* const kRows = kRematchRows;
+    std::vector<Node> frames;
+    for (const int rows : { 5, 6 })
+    {
+        const std::string n = std::to_string(rows), menuName = "MenuRematch" + n;
+        std::vector<int> shown = { 0, 1, 2, 4, 5 };
+        if (rows == 6) shown.insert(shown.begin() + 3, 3);
+        auto rename = [&](std::string& blob) {
+            const std::pair<std::string, std::string> names[] = {
+                { "MenuRankMatchResult", menuName },
+                { "MenuRankMatchResult-03", menuName + "-03" },
+                { "StaticIconRankMatchResult", "StaticIconRematch" + n },
+                { "StaticRankMatchResult00", "StaticRematch" + n + "_0" },
+                { " ResultMenuRankMatch_icon_S_array", " Rematch" + n + "_icon_S_array" },
+                { " ResultMenuRankMatch_icon_L_array", " Rematch" + n + "_icon_L_array" } };
+            for (const auto& [from, to] : names)
+                if (XtalHas(blob, from)) XtalRename(blob, from, to);
+        };
+        Node frame;
+        frame.index = source.index;
+        frame.text = source.text;
+        frame.attrs = source.attrs;
+        d.Set(frame, "name", ("FrameRematch" + n).c_str());
+        bool helps = false, values = false;
+        for (const Node& c : source.children)
+        {
+            const std::string name = d.Get(c, "name");
+            if (name == "MenuRankMatchResult")
+            {
+                Node menu;
+                menu.index = c.index;
+                menu.text = c.text;
+                menu.attrs = c.attrs;
+                d.Set(menu, "name", menuName.c_str());
+                bool items = false;
+                for (const Node& e : c.children)
+                {
+                    const std::string item = d.Get(e, "name");
+                    if (item.rfind("MenuRankMatchResult-", 0) == 0)
+                    {
+                        if (std::exchange(items, true)) continue;
+                        for (int i = 1; i <= rows; ++i)
+                        {
+                            Node it = e;
+                            const RematchRow& r = kRows[shown[size_t(i - 1)]];
+                            d.Set(it, "name", (menuName + "-0" + std::to_string(i)).c_str());
+                            d.Set(it, "text", r.text);
+                            d.Set(it, "textid", nullptr);
+                            d.Set(it, "textid360", nullptr);
+                            menu.children.push_back(std::move(it));
+                        }
+                        continue;
+                    }
+                    Node ev = e.index == d.E("OnEnter") ? enter : e;
+                    rename(ev.text);
+                    if (e.index == d.E("OnLoad")) XtalResizeArrays(ev.text, { 1, 2 }, size_t(rows));
+                    menu.children.push_back(std::move(ev));
+                }
+                if (!items) throw Fail("no rows in the ranked end menu");
+                frame.children.push_back(std::move(menu));
+            }
+            else if (name.rfind("StaticRankMatchResult00", 0) == 0)
+            {
+                if (std::exchange(helps, true)) continue;
+                for (int i = 1; i <= rows; ++i)
+                {
+                    Node h = c;
+                    d.Set(h, "name", ("StaticRematch" + n + "_0" + std::to_string(i)).c_str());
+                    d.Set(h, "text", kRows[shown[size_t(i - 1)]].help);
+                    d.Set(h, "textid", nullptr);
+                    d.Set(h, "textid360", nullptr);
+                    frame.children.push_back(std::move(h));
+                }
+            }
+            else if (name.rfind("StaticRankMatchValue", 0) == 0)
+            {
+                if (std::exchange(values, true)) continue;
+                for (int i = 1; i <= rows; ++i)
+                {
+                    Node v = c;
+                    d.Set(v, "name", ("StaticRematch" + n + "Value" + std::to_string(i)).c_str());
+                    d.Set(v, "text", "");
+                    d.Set(v, "font", "1");
+                    d.Set(v, "fontalign", "right");
+                    frame.children.push_back(std::move(v));
+                }
+            }
+            else
+            {
+                Node other = c;
+                if (name == "StaticIconRankMatchResult") d.Set(other, "name", ("StaticIconRematch" + n).c_str());
+                else if (!name.empty()) throw Fail("unexpected " + name + " in the ranked end menu");
+                rename(other.text);
+                frame.children.push_back(std::move(other));
+            }
+        }
+        if (!helps || !values) throw Fail("no help or value texts in the ranked end menu");
+        frames.push_back(std::move(frame));
+    }
+    top.insert(top.begin() + std::ptrdiff_t(at) + 1, frames.begin(), frames.end());
+}
+
+// ---- PAIR PLAY's place screen: the players' names on its stones (the user, 2026-10-25: "instead of showing the controller
+// you can show the player name"; 2026-11-09: "we didn't know who's player 1 or 2 or 3 or 4"). The screen is a Lumen movie
+// with no texts of its own (online_2v2_places.cpp) and the room's frame is closed by then (the room's battle start puts it
+// away; CHANGE TEAMS closes the end menu's) - so a frame of their own, FrameOnlinePairNames (no interface, no scripts or
+// menu: as FrameSysEmpty), with four texts at the stones' faces (absolute places on the 1280x720 screen, the game's font),
+// empty until online_2v2_places.cpp writes a name; it is shown only while the screen takes presses. Place 1 / 2 = the red
+// side's lower / upper stone, 3 / 4 the blue side's.
+void AddPairNames(Doc& d)
+{
+    const Node model = d.Find("StaticIconPlayerMatchRoom");      // a statictext of the room's frame
+    static const struct { int x, y; } kAt[4] = { { 422, 440 }, { 225, 275 }, { 852, 440 }, { 1057, 275 } };
+    size_t at = 0;
+    std::vector<Node>& top = d.ListOf("FrameOnlinePlayerMatchRoom", at);
+    Node frame;
+    frame.index = top[at].index;
+    frame.text = top[at].text;
+    d.Set(frame, "name", "FrameOnlinePairNames");
+    for (int i = 0; i < 4; ++i)
+    {
+        Node n = model;
+        n.children.clear();
+        const std::string name = "TextPairPlace" + std::to_string(i + 1), x = std::to_string(kAt[i].x), y = std::to_string(kAt[i].y);
+        d.Set(n, "name", name.c_str());
+        d.Set(n, "text", "");
+        d.Set(n, "font", "1");
+        d.Set(n, "fontalign", "center");
+        d.Set(n, "postype", "abs");
+        d.Set(n, "posx", x.c_str());
+        d.Set(n, "posy", y.c_str());
+        d.Set(n, "poslabel", nullptr);
+        d.Set(n, "visible", nullptr);
+        frame.children.push_back(std::move(n));
+    }
+    top.insert(top.begin() + std::ptrdiff_t(at) + 1, std::move(frame));
+}
+
+// Every script of the document that names `from` names `to` instead.
+void RenameInScripts(Doc& d, const std::string& from, const std::string& to)
+{
+    std::function<void(std::vector<Node>&)> walk = [&](std::vector<Node>& list) {
+        for (Node& n : list)
+        {
+            if (n.text.size() > 12 && n.text.compare(0, 4, "xtal") == 0)
+                try { XtalRename(n.text, from, to); } catch (const Fail&) {}
+            walk(n.children);
+        }
+    };
+    walk(d.roots);
+}
+
+// ---- PAIR PLAY in the ONLINE MODE menu (the user, 2026-10-25: "Pair play should be a separate option and not part of
+// player match"): a copy of PLAYER MATCH right after it, opening the same pages - online_2v2.cpp tells which row opened them
+// (pair mode: PAIR PLAY rooms, apart from Player Match's). Help and value texts go by place ("StaticOnlineMode00" + place
+// + 1): those after it move down one (in the scripts that name them too), as do the menu's icon arrays (its OnLoad).
+// After AddServerRow (SERVER's texts are 007).
+void AddPairPlayRow(Doc& d)
+{
+    Node row = d.Find("MenuItemOnline02-player-match");
+    d.Set(row, "name", "MenuItemOnline02b-pair-play");
+    d.Set(row, "text", "PAIR PLAY");
+    d.Set(row, "textid", nullptr);
+    d.Set(row, "textid360", nullptr);
+    for (int k = 7; k >= 3; --k)
+        for (const char* stem : { "StaticOnlineMode00", "StaticOnlineModeValue00" })
+        {
+            const std::string from = stem + std::to_string(k), to = stem + std::to_string(k + 1);
+            d.Set(d.Find(from.c_str()), "name", to.c_str());
+            RenameInScripts(d, from, to);
+        }
+    const struct { const char* after; const char* name; const char* text; } statics[] = {
+        { "StaticOnlineMode002", "StaticOnlineMode003", "2v2 tag battles: team up with friends, each on their own PC." },
+        { "StaticOnlineModeValue002", "StaticOnlineModeValue003", "" },
+    };
+    for (const auto& st : statics)
+    {
+        size_t at = 0;
+        std::vector<Node>& list = d.ListOf(st.after, at);
+        Node copy = list[at];
+        d.Set(copy, "name", st.name);
+        d.Set(copy, "text", st.text);
+        d.Set(copy, "textid", nullptr);
+        d.Set(copy, "textid360", nullptr);
+        list.insert(list.begin() + std::ptrdiff_t(at) + 1, std::move(copy));
+    }
+    XtalInsertArrayElements(d.Event(d.Find("MenuOnlineMenu"), "OnLoad").text, 2);
+    size_t at = 0;
+    std::vector<Node>& items = d.ListOf("MenuItemOnline02-player-match", at);
+    items.insert(items.begin() + std::ptrdiff_t(at) + 1, std::move(row));
 }
 
 void AddServerRow(Doc& d)
@@ -1000,6 +1528,16 @@ void AddServerListFrame(Doc& d)
 
 } // namespace
 
+namespace { std::atomic<bool> g_pairPlayRow{ false }, g_rematchFrames{ false }, g_pairNamesFrame{ false }; }
+bool MenuPairNamesFrame() { return g_pairNamesFrame.load(); }
+bool MenuPairPlayRow() { return g_pairPlayRow.load(); }
+bool MenuRematchFrames() { return g_rematchFrames.load(); }
+const char* RematchHelp(int choice, bool host)
+{
+    if (choice == 5 && host) return kRematchHostLeaveHelp;
+    return choice >= 0 && choice < 6 ? kRematchRows[choice].help : "";
+}
+
 std::string ApplyPcEdits(const uint8_t* b, size_t size, const PcLists& lists, std::string* why, std::string* note)
 {
     try
@@ -1018,7 +1556,32 @@ std::string ApplyPcEdits(const uint8_t* b, size_t size, const PcLists& lists, st
         size_t p = 16;
         d.roots = ReadList(b, size, p, 0);
         if (p != elemOff) throw Fail("body does not end at the name tables");
-        if (online) { AddServerRow(d); AddServerListFrame(d); AddFriendInvite(d); }
+        if (online)
+        {
+            AddServerRow(d);
+            AddServerListFrame(d);
+            AddFriendInvite(d);
+            try { AddRematchRow(d); }
+            catch (const Fail& e) { if (note) *note = std::string("the room's REMATCH MENU row left out: ") + e.what(); }
+            try
+            {
+                AddRematchFrames(d);
+                g_rematchFrames = true;
+            }
+            catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "the rematch menu left out: " + e.what(); }
+            try
+            {
+                AddPairNames(d);
+                g_pairNamesFrame = true;
+            }
+            catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "PAIR PLAY names left out: " + e.what(); }
+            try
+            {
+                AddPairPlayRow(d);
+                g_pairPlayRow = true;
+            }
+            catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "PAIR PLAY row left out: " + e.what(); }
+        }
         else Edit(d, lists, note);
         std::string body;
         WriteList(d.roots, body);

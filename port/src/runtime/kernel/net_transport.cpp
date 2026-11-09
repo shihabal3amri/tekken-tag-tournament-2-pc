@@ -411,7 +411,15 @@ const char* GameProtocol()
     // "-9": test build 6d - the file loaders at rest across snapshots and restores; the time sync slows the
     //       leader's vblank clock instead of yielding frames.
     // "-10": test build 7 - 6d plus the community servers (servers accept it: server/internal/config).
-    return ::SessionEnabled() ? "ttt2-port-10-rollback" : "ttt2-port-1";
+    // "-11": 0.1.8 (TEST 18, 2026-11-04) - 0.1.8 only meets 0.1.8, in Steam lobbies and on community servers (a server
+    //        accepts it once its accepted_protocols says so, 0.1.8's server by default; older servers show OTHER VERSION).
+    // "-12": TEST 19 (2026-11-07) - the end menu's REMATCH / STAGE SELECT / CHARACTER SELECT start the next match straight
+    //        from the end menu (online_straight.cpp; the rematch packets changed: no START / stage pick) - a "-11" PC would
+    //        wait in the room for a START that never comes.
+    // "-13": TEST 20 (2026-11-09) - the end menu's LEAVE and its decision's stage chooser (the loser chooses: the game host
+    //        moves - online_stage_mirror.cpp), the PAIR PLAY places' coin: a "-12" PC would start the engine with another
+    //        host (two hosts or none).
+    return ::SessionEnabled() ? "ttt2-port-13-rollback" : "ttt2-port-1";
 }
 
 std::shared_ptr<community::Client> Community() { return std::atomic_load(&g_server); }

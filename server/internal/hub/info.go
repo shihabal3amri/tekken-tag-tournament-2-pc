@@ -5,6 +5,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"ttt2-server/internal/config"
 	"ttt2-server/internal/wire"
 )
 
@@ -145,6 +146,9 @@ func (h *Hub) infoReply(nonce uint64, limit int) []byte {
 		}
 		if h.verifier != nil {
 			flags |= 2
+		}
+		if h.keepsFiles() && cfg.Ranks == config.RanksServer {
+			flags |= 4 // the ranks are this server's own ("Ranks")
 		}
 		w.U8(flags)
 		w.Str(trim(cfg.Name, 64))

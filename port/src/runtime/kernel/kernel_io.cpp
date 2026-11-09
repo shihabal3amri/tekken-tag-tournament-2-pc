@@ -5,6 +5,8 @@
 #include "kernel_objects.h"
 #include "save_store.h"
 #include "kernel_content.h"
+#include "dlc_content.h"
+#include "log_utf8.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <atomic>
@@ -18,6 +20,7 @@
 #include <algorithm>
 
 void RollbackBeforeHostWrite(uint32_t addr, uint32_t size);   // rollback.cpp
+namespace frame_overlap { void BeforeHostWrite(uint32_t addr, uint32_t size); }   // frame_overlap.cpp
 void RollbackNoteIo(bool frameOnly, const char* op = "", const PPCContext* ctx = nullptr);   // rollback.cpp: no rewind across I/O
 
 // Where the extracted disc lives. TTT2_VFS_ROOT overrides it, which is how a tree of
@@ -32,6 +35,7 @@ static const char* VfsRoot()
     return root.c_str();
 }
 #define VFS_ROOT VfsRoot()
+const char* GameFilesRoot() { return VfsRoot(); }   // dlc_content.cpp: <game>\dlc
 
 struct FileRecord
 {
@@ -132,6 +136,8 @@ static std::string ReadObjAttrPath(uint8_t* base, uint32_t objAttrPtr)
 
 static std::string ResolvePath(std::string p)
 {
+    // A mounted downloadable content package (dlc_content.h): its own folder, never the disc.
+    if (std::string dlcHost; dlc::Resolve(p, dlcHost)) return dlcHost;
     // Strip a drive ("game:\", "d:\") or device ("\Device\Cdrom0\") prefix, then look under VFS_ROOT.
     auto colon = p.find(':');
     // "update:" is the mounted title update, NOT the disc: only <VFS_ROOT>/update (TU3's
@@ -160,11 +166,13 @@ static std::string ResolvePath(std::string p)
     std::string full = std::string(VFS_ROOT) + "/" + p;
     if (std::filesystem::exists(full, ec)) return full;
 
-    // Fall back to the basename, case-insensitively (the game's data*.bin live at the root).
+    // Fall back to the basename, case-insensitively (the game's data*.bin live at the root). The names are compared
+    // wide: filename().string() throws at a name outside the ANSI code page (log_utf8.h), a file the player put there.
     auto slash = p.find_last_of('/');
     std::string bn = (slash == std::string::npos) ? p : p.substr(slash + 1);
+    const std::wstring wideBn(bn.begin(), bn.end());   // the game's names are ASCII
     for (auto& e : std::filesystem::directory_iterator(VFS_ROOT, ec))
-        if (_stricmp(e.path().filename().string().c_str(), bn.c_str()) == 0)
+        if (_wcsicmp(e.path().filename().c_str(), wideBn.c_str()) == 0)
             return e.path().string();
     return full;
 }
@@ -220,7 +228,9 @@ static void DoOpen(PPCContext& ctx, uint8_t* base,bool create)
     }
     std::filesystem::path savePath,container;uint32_t saveError=0;
     bool save=ResolveSaveFile(guestPath,savePath,container,saveError);
-    std::string host = save?savePath.string():ResolvePath(guestPath);
+    // A save is opened by its wide path below; host only names it in the log and the file record, as UTF-8
+    // (log_utf8.h: path::string() threw at a user name outside the ANSI code page, aborting the game's save load).
+    std::string host = save?LogUtf8(savePath):ResolvePath(guestPath);
     HANDLE h=INVALID_HANDLE_VALUE;uint32_t status=STATUS_SUCCESS,information=1;
     const uint32_t writeMask=0x50010116u; // generic write/all, delete, write/append/EA/attributes
     const bool writable=(ctx.r4.u32&writeMask)!=0;
@@ -260,7 +270,7 @@ static void DoOpen(PPCContext& ctx, uint8_t* base,bool create)
                 if(!GetFileInformationByHandle(parent,&pi) || (pi.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT) ||
                    actual.empty() || _wcsicmp(actual.c_str(),expected.c_str())) {
                     status=0xC0000022u;stage="final-path";
-                    std::fprintf(stderr,"[io] save container final path '%ls' != '%ls'\n",actual.c_str(),expected.c_str());
+                    std::fprintf(stderr,"[io] save container final path '%s' != '%s'\n",LogUtf8(actual).c_str(),LogUtf8(expected).c_str());
                 }
                 else if(savePath==container) {
                     if(!directory||disposition!=1||writable){status=0xC0000022u;stage="root-access";}
@@ -276,6 +286,9 @@ static void DoOpen(PPCContext& ctx, uint8_t* base,bool create)
                     NativeAttributes oa{sizeof(NativeAttributes),parent,&text,0x40,nullptr,nullptr};NativeStatus ios{};
                     LARGE_INTEGER allocation{};LARGE_INTEGER* allocationPtr=nullptr;
                     if(create&&ctx.r7.u32){allocation.QuadPart=(uint64_t(GRead32(base,ctx.r7.u32))<<32)|GRead32(base,ctx.r7.u32+4);allocationPtr=&allocation;}
+                    // Online: a journaled save's file is copied before this open can change it (write / delete
+                    // access, or a disposition that supersedes or truncates it).
+                    if(writable||disposition==0||disposition==4||disposition==5)SaveJournalBeforeChange(container,savePath);
                     // Host reads/writes use synchronous handles; guest options and
                     // access still control permission, sharing and disposition. The guest's
                     // FILE_NO_INTERMEDIATE_BUFFERING (0x8, TTT2's save writes use 0x48) is dropped:
@@ -364,6 +377,73 @@ static void LogSlowIo(const char* what, std::chrono::steady_clock::time_point st
 PPC_FUNC(__imp__NtCreateFile) { KTrace("NtCreateFile"); RollbackNoteIo(true, "NtCreateFile", &ctx); const auto t = std::chrono::steady_clock::now(); DoOpen(ctx, base,true); LogSlowIo("open", t, 0); }
 PPC_FUNC(__imp__NtOpenFile)   { KTrace("NtOpenFile");   RollbackNoteIo(true, "NtOpenFile", &ctx); const auto t = std::chrono::steady_clock::now(); DoOpen(ctx, base,false); LogSlowIo("open", t, 0); }
 
+// The save manager's file delete (sub_82586B70: DeleteFileA of the path in r3; 0 = deleted, 1 = failed). A file
+// that is not there is the game's assertion (a write to address 0) and a failed save: "Save Error", and after
+// "Continue without saving" no more saves until a restart. The console never deletes a file it does not have; the
+// port's save journal can make it: a rewind across a save puts the save's files back (save_store.cpp) while the
+// game's record of which of a record's two copies is current may stay as the save left it (the save worker's
+// pages are not rewound), so the re-simulated save writes the other copy, then deletes the one the undo removed
+// (MEASURED 2026-10-24, a real online match: journal undo, then write 21_000_0.BIN, delete 21_000_1.BIN - not there -
+// Save Error, Retry three times, Continue without saving; no save in the evening's next 9 matches). A save file
+// that is not there is deleted already.
+extern "C" PPC_FUNC(__imp__sub_82586B70);
+int32_t RollbackSaveJournalFrame();   // rollback.cpp: the frame of a save a rewind may still re-simulate, else -1
+// TEST (TTT2_TEST_SAVE_FAIL=N, never set by the game or the installer): in an online session the save manager's first N
+// deletes of a save file fail, as on 2026-10-24 - the save job's "Save Error" box comes up in an online match (the
+// session's waits for the save job must not wait for it: rollback.cpp SessionWaitSaveJob, kernel_ui.cpp
+// XamSaveJobAsksPlayer). MEASURED 2026-11-09 (sf1, m176): a failed container create (112) shows no box - the job ends
+// at once and the game saves again later.
+static bool TestSaveFails()
+{
+    static std::atomic<int> left{ [] { const char* e = std::getenv("TTT2_TEST_SAVE_FAIL"); return e ? std::atoi(e) : 0; }() };
+    return left.load() > 0 && left.fetch_sub(1) > 0;
+}
+PPC_FUNC(sub_82586B70)
+{
+    const uint32_t name = ctx.r3.u32;
+    std::string path;
+    for (uint32_t i = 0; i < 260 && name && XamGuestRange(name + i, 1, 1); ++i)
+    {
+        const char c = char(base[name + i]);
+        if (!c) break;
+        path += c;
+    }
+    std::filesystem::path host, container;
+    uint32_t error = 0;
+    std::error_code ec;
+    if (!path.empty() && ResolveSaveFile(path, host, container, error) && !error && !host.empty() && host != container &&
+        !std::filesystem::exists(host, ec) && !ec)
+    {
+        std::fprintf(stderr, "[io] delete '%s': not there - deleted already (a save done again after a rewind)\n", path.c_str());
+        ctx.r3.u64 = 0;
+        return;
+    }
+    if (!path.empty() && RollbackSaveJournalFrame() >= 0 && TestSaveFails())
+    {
+        std::fprintf(stderr, "[io] TEST: delete '%s' fails (TTT2_TEST_SAVE_FAIL)\n", path.c_str());
+        ctx.r3.u64 = 1;
+        return;
+    }
+    __imp__sub_82586B70(ctx, base);
+}
+
+// [slowframe] (gpu_hw_d3d11.h): the game's file reads since the last presented frame - count, bytes and the longest.
+static std::atomic<uint64_t> g_frameReads{ 0 }, g_frameReadBytes{ 0 }, g_frameReadLongestUs{ 0 };
+void KernelTakeFrameReads(uint64_t& reads, uint64_t& bytes, double& longestMs)
+{
+    reads = g_frameReads.exchange(0, std::memory_order_relaxed);
+    bytes = g_frameReadBytes.exchange(0, std::memory_order_relaxed);
+    longestMs = double(g_frameReadLongestUs.exchange(0, std::memory_order_relaxed)) / 1000.0;
+}
+static void NoteFrameRead(std::chrono::steady_clock::time_point start, uint32_t bytes)
+{
+    const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+    g_frameReads.fetch_add(1, std::memory_order_relaxed);
+    g_frameReadBytes.fetch_add(bytes, std::memory_order_relaxed);
+    uint64_t seen = g_frameReadLongestUs.load(std::memory_order_relaxed);
+    while (us > seen && !g_frameReadLongestUs.compare_exchange_weak(seen, us, std::memory_order_relaxed)) {}
+}
+
 PPC_FUNC(__imp__NtReadFile)
 {
     KTrace("NtReadFile");
@@ -408,6 +488,7 @@ PPC_FUNC(__imp__NtReadFile)
                 if (status == STATUS_SUCCESS)
                 {
                     RollbackBeforeHostWrite(buffer, length);   // rollback.cpp: write-protected pages
+                    frame_overlap::BeforeHostWrite(buffer, length);   // frame_overlap.cpp: pages a frame in flight reads
                     if (!ReadFile(file->handle, base + buffer, length, &read, nullptr))
                         status = FileErrorStatus(GetLastError());
                     else if (read == 0)
@@ -423,6 +504,7 @@ PPC_FUNC(__imp__NtReadFile)
         // A valid zero-length read succeeds without changing the file position.
     }
     LogSlowIo("read", ioStart, length);
+    NoteFrameRead(ioStart, read);
     {
         static std::atomic<uint64_t> dlog{0};
         uint64_t dn = ++dlog;
@@ -523,6 +605,7 @@ PPC_FUNC(__imp__NtSetInformationFile)
             info->ReplaceIfExists=replace;info->RootDirectory=nullptr;
             info->FileNameLength=DWORD(name.size()*sizeof(wchar_t));
             std::memcpy(info->FileName,name.data(),name.size()*sizeof(wchar_t));
+            if(replace)SaveJournalBeforeChange(container,host);         // the file a rename replaces (online save journal)
             std::lock_guard fileLock(file->mutex);
             if(!SetFileInformationByHandle(file->handle,FileRenameInfo,info,DWORD(buf.size())))status=FileErrorStatus(GetLastError());
         }
@@ -612,18 +695,20 @@ PPC_FUNC(__imp__NtQueryFullAttributesFile)
     std::filesystem::path savePath,container;uint32_t saveError=0;
     bool save=ResolveSaveFile(guestPath,savePath,container,saveError);
     if(saveError){ctx.r3.u32=FileErrorStatus(saveError);return;}
-    std::string host = save?savePath.string():ResolvePath(guestPath);
+    // A save by its wide path, host only for the log (as in DoOpen); the disc's files by their path as before.
+    const std::string host = save?LogUtf8(savePath):ResolvePath(guestPath);
+    const std::filesystem::path hostPath = save?savePath:std::filesystem::path(host);
     std::error_code ec;
     {
         char line[1200];
         std::snprintf(line, sizeof(line), "[io] query '%s' -> %s\n", guestPath.c_str(),
-                      std::filesystem::exists(host, ec) ? host.c_str() : "NOT FOUND");
+                      std::filesystem::exists(hostPath, ec) ? host.c_str() : "NOT FOUND");
         std::fputs(line, stderr);
     }
-    if (std::filesystem::exists(host, ec))
+    if (std::filesystem::exists(hostPath, ec))
     {
-        const bool directory=std::filesystem::is_directory(host,ec);
-        uint64_t sz=directory?0:std::filesystem::file_size(host,ec);
+        const bool directory=std::filesystem::is_directory(hostPath,ec);
+        uint64_t sz=directory?0:std::filesystem::file_size(hostPath,ec);
         if(ec){ctx.r3.u32=FileErrorStatus(DWORD(ec.value()));return;}
         uint32_t o = ctx.r4.u32;
         // FILE_NETWORK_OPEN_INFORMATION: times @0..0x18, AllocationSize @0x20, EndOfFile @0x28, Attributes @0x30
@@ -693,7 +778,12 @@ PPC_FUNC(__imp__NtQueryDirectoryFile)
         file->directoryItems.clear();
         for(auto it=std::filesystem::directory_iterator(file->saveContainer,ec);!ec&&it!=std::filesystem::directory_iterator();it.increment(ec)) {
             const auto& d=*it;
-            auto name=d.path().filename().string();if(name.empty()||name[0]=='.')continue;
+            // The game's names are ASCII (save_store's Component()): another file the player put there is not listed
+            // (filename().string() threw at a name outside the ANSI code page, log_utf8.h).
+            const std::wstring wide=d.path().filename().wstring();
+            if(std::any_of(wide.begin(),wide.end(),[](wchar_t c){return c>=0x80;}))continue;
+            std::string name;for(wchar_t c:wide)name+=char(c);
+            if(name.empty()||name[0]=='.')continue;
             DWORD attr=GetFileAttributesW(d.path().c_str());
             if(attr==INVALID_FILE_ATTRIBUTES){status=FileErrorStatus(GetLastError());break;}
             if(attr&FILE_ATTRIBUTE_REPARSE_POINT){status=0xC0000022u;break;}

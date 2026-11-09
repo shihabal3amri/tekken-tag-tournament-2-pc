@@ -17,13 +17,21 @@ namespace timeline {
 enum Event : uint8_t
 {
     Swap, Vblank, CpVblankWait, CpRing, MainGpuWait, MainResourceWait, WorkerCounterWait, SkinJob, PoolSet,
-    PoolWake, RbDrain, CpPresent, CpIb, InputRead, Count_
+    PoolWake, RbDrain, CpPresent, CpIb, InputRead,
+    // TEST ONLY (input latency work, 2026-11-01): the game's update / draw / frame kick, the skinned-vertex ring's
+    // advances and allocations (caller, region << 28 | offset, bytes), the skinning jobs' outputs and the command
+    // processor's reads of the ring (region << 28 | offset; RingBump, RingBumpSize and CpRingRead came from a probe
+    // removed after the measurement).
+    GameUpdate, GameDraw, FrameKick, RingAdvance, RingAlloc, RingBump, RingBumpSize, SkinOut, CpRingRead, RingKick, RingKickLr,
+    Count_
 };
 inline const char* Name(uint8_t e)
 {
     static const char* names[] = { "swap", "vblank", "cp-vblank-wait", "cp-ring", "main-gpu-wait",
                                    "main-resource-wait", "worker-counter-wait", "skin-job", "pool-set",
-                                   "pool-wake", "rb-drain", "cp-present", "cp-ib", "input-read" };
+                                   "pool-wake", "rb-drain", "cp-present", "cp-ib", "input-read",
+                                   "game-update", "game-draw", "frame-kick", "ring-advance", "ring-alloc",
+                                   "ring-bump", "ring-bump-size", "skin-out", "cp-ring-read", "ring-kick", "ring-kick-lr" };
     return e < Count_ ? names[e] : "?";
 }
 

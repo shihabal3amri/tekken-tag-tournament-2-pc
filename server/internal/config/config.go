@@ -12,6 +12,12 @@ import (
 	"strings"
 )
 
+// The ranks setting's values.
+const (
+	RanksServer = "server"
+	RanksPlayer = "player"
+)
+
 // Regions are the game's own region names (GIN `region`).
 var Regions = []string{"world", "north-america", "south-america", "europe", "middle-east", "africa", "oceania", "asia"}
 
@@ -38,6 +44,10 @@ type Config struct {
 	KickMinutes int
 	// How long the match history is kept (days; 0 = for ever).
 	KeepMatchesDays int
+	// Whose ranks count here (PROTOCOL.md "Ranks"): RanksServer - this server's own record of each player (a player
+	// starts here as a beginner and ranks up by playing here), or RanksPlayer - the rank each player brings from their
+	// PC, kept in sync with it.
+	Ranks string
 	// The web admin panel (internal/panel): HTTPS on its own TCP port, off unless turned on.
 	AdminPanel     bool
 	AdminPanelPort int
@@ -57,12 +67,13 @@ func Default() Config {
 		MaxPlayers:         64,
 		Port:               28200,
 		DataDir:            "data",
-		AcceptedProtocols:  []string{"ttt2-port-10-rollback"},
+		AcceptedProtocols:  []string{"ttt2-port-13-rollback"},
 		SteamAppID:         480,
 		MaxConnsPerIP:      8,
 		MaxUploadStorageMB: 1024,
 		KickMinutes:        10,
 		KeepMatchesDays:    365,
+		Ranks:              RanksServer,
 		AdminPanelPort:     28201,
 		AdminPanelBind:     "0.0.0.0",
 	}
@@ -92,7 +103,7 @@ bind_address = ""
 data_dir = "data"
 
 # Game versions this server accepts (the port's online protocol strings).
-accepted_protocols = ["ttt2-port-10-rollback"]
+accepted_protocols = ["ttt2-port-13-rollback"]
 
 # Players are identified by their Steam ID, checked with Steam at every login. That needs a Steam Web API key:
 # https://steamcommunity.com/dev/apikey (keep it secret; this file should be readable by the server only).
@@ -111,6 +122,13 @@ max_upload_storage_mb = 1024
 kick_minutes = 10
 # Every match played here is kept in the database (the matches command lists them) this many days; 0 = for ever.
 keep_matches_days = 365
+
+# Whose ranks count here.
+#  "server": this server's own. Every player starts here as a beginner and ranks up by playing ranked matches here;
+#            the ranks are kept by the server, so a player's own saved rank (or an edited save) never counts here,
+#            and what they earn here never changes their rank on Steam or on other servers.
+#  "player": the rank each player brings from their PC. Their ranked matches here change their own saved rank.
+ranks = "server"
 
 # The web admin panel: players, kicks, bans and matches in a browser (HTTPS), on its own TCP port. Off by default.
 # Before turning it on, make its login: "ttt2admin panel-setup" (or "ttt2-server admin panel-setup") shows a password
@@ -208,6 +226,8 @@ func Parse(s *bufio.Scanner, name string) (Config, error) {
 			c.KickMinutes, err = parseInt(value)
 		case "keep_matches_days":
 			c.KeepMatchesDays, err = parseInt(value)
+		case "ranks":
+			c.Ranks, err = parseString(value)
 		case "admin_panel":
 			c.AdminPanel, err = parseBool(value)
 		case "admin_panel_port":
@@ -264,6 +284,8 @@ func (c Config) Check() error {
 		return fmt.Errorf("kick_minutes %d: 0..%d", c.KickMinutes, MaxKickMinutes)
 	case c.KeepMatchesDays < 0 || c.KeepMatchesDays > 36500:
 		return fmt.Errorf("keep_matches_days %d: 0..36500", c.KeepMatchesDays)
+	case c.Ranks != RanksServer && c.Ranks != RanksPlayer:
+		return fmt.Errorf(`ranks %q: "server" (this server's own) or "player" (each player's own)`, c.Ranks)
 	case len(c.AcceptedProtocols) == 0:
 		return fmt.Errorf("accepted_protocols is empty")
 	case c.AdminPanelPort < 1 || c.AdminPanelPort > 65535:

@@ -5,7 +5,7 @@
 <h3 align="center">The Xbox 360 tag-team fighter, rebuilt to run natively on Windows.</h3>
 
 <p align="center">
-  59 fighters &nbsp;•&nbsp; Tag battles &nbsp;•&nbsp; Up to 4K at 60 fps &nbsp;•&nbsp; Rollback netcode &nbsp;•&nbsp; Ranked on community servers
+  59 fighters &nbsp;•&nbsp; Tag battles &nbsp;•&nbsp; Up to 4K at 60 fps &nbsp;•&nbsp; Rollback netcode &nbsp;•&nbsp; Ranked on Steam and community servers
 </p>
 
 <p align="center">
@@ -60,8 +60,8 @@
   <tr>
     <td valign="top">
       <h3>🏆 Ranked is back</h3>
-      Join a <b>community server</b> run by players for Ranked Match, leaderboards, teams,
-      Tekken Channel replays and other players' ghosts. Anyone can host one.
+      Ranked Match over Steam, or on a <b>community server</b> run by players, which adds
+      leaderboards, teams, Tekken Channel replays and other players' ghosts. Anyone can host one.
     </td>
     <td valign="top">
       <h3>⚡ Less input delay</h3>
@@ -151,7 +151,8 @@ game's shaders for you, usually in a few minutes.
 
 ## Play online
 
-Both of you install the **same version** of the port and keep **Steam** running. Online fights
+Both of you install the **same version** of the port and keep **Steam** running (0.2.0 only
+plays with 0.2.0; older versions don't see it, in Steam rooms or on community servers). Online fights
 use rollback netcode, and every match runs directly between the two players' PCs over Steam.
 
 ### With a friend, over Steam
@@ -162,6 +163,9 @@ use rollback netcode, and every match runs directly between the two players' PCs
    `SEARCH SESSION` and pick your session.
 3. Fight!
 
+**Ranked Match** works over Steam too: `ONLINE MODE` → `RANKED MATCH` → `BEGIN SEARCH`. On Steam
+you play with the ranks saved on your PC.
+
 The first time you open Online Mode, the game shows Namco's online terms; accept them to
 continue. Steam will show you as playing **Spacewar**. That's normal: it's the free Steam test
 app the port uses to connect players.
@@ -169,9 +173,9 @@ app the port uses to connect players.
 ### On a community server: Ranked, leaderboards, replays
 
 Community servers are run by players. They're where players find each other, and they bring
-back what used to need Namco's servers: **Ranked Match, leaderboards, teams, Tekken Channel
-replay search and other players' ghosts**. Matches still run directly between the two
-players over Steam; the server never carries them.
+back what used to need Namco's servers: **leaderboards, teams, Tekken Channel replay search and
+other players' ghosts**, and Ranked Match among the server's players. Matches still run directly
+between the two players over Steam; the server never carries them.
 
 1. `ONLINE MODE` → `SERVER` → `ADD SERVER`, and type the server's address (a name or an IP;
    add `:port` if it isn't 28200; `Ctrl` + `V` pastes).
@@ -181,9 +185,14 @@ The list also shows each server's players and ping, and servers on your local ne
 server you meet only that server's players. Servers know you by your Steam account, so Steam
 still has to be running.
 
+**Ranks:** each server decides whose ranks count there, and `SERVER INFO` (`Y` in the list) says
+which. Most keep their own: you start there as a Beginner, and what you earn stays on that
+server, while the ranks saved on your PC stay as they are. Others use the ranks saved on your PC,
+like Steam.
+
 **Host your own:** download `ttt2-server` for Windows or Linux from the
 [latest release](https://github.com/shihabal3amri/tekken-tag-tournament-2-pc/releases/latest)
-and follow the [server guide](server/README.md). It's one small program with no game data, and
+and follow the [step-by-step guide](server/HOSTING.md). It's one small program with no game data, and
 it comes with an admin panel in your browser (kicks, bans, match history, players online).
 
 ### Netcode settings
@@ -193,7 +202,7 @@ it comes with an admin panel in your browser (kicks, bans, match history, player
 | Setting | What it does |
 |---|---|
 | `STANDARD` (default) | The game's own input delay for your ping; rollback smooths out the bumps |
-| `PRIORITIZE RESPONSE` | One frame less input delay, more rollback corrections |
+| `PRIORITIZE RESPONSE` | One frame less input delay, more rollback corrections. If the connection can't keep up, the match switches to STANDARD's delay by itself |
 | `PRIORITIZE GRAPHICS` | One frame more input delay, fewer corrections |
 | `CUSTOM` | Set the input delay and the rollback limit yourself |
 
@@ -203,6 +212,25 @@ Both players always share one input delay, and the host's setting decides it.
 
 Pick `PAIR` at character select, then press `START` on the second controller when the game asks.
 It works offline and online; the second player plays as a guest of the first player's profile.
+
+### PAIR PLAY online: 2v2 on four PCs *(beta)*
+
+Two tag teams, each player on their own PC, with the same screens as offline PAIR PLAY.
+
+1. **ONLINE MODE → PAIR PLAY**, then create a session or find one (it lists PAIR PLAY sessions only;
+   Player Match stays 1v1). Up to six players fit; whoever has no place watches.
+2. When everyone is in, the room host opens the room menu (`Y`) and picks **TEAMS**. Everyone sees
+   the PAIR PLAY screen: press `START`, move to a stone with `LEFT` / `RIGHT` and confirm with `A`.
+   Each stone shows the name of the player standing on it.
+   Red is one team, blue the other. The lower stone fights; the upper stone plays the second
+   character and tags in. Three players make a **2v1**.
+3. At character select both teammates see the PAIR select: the fighter picks first, then the
+   teammate picks the second character with their own controller.
+4. In the fight, the teammate's controller plays their character, tags included, and they watch it
+   live on their own screen. Both teammates play with the same input delay. Teams stay for the next
+   match; the host can pick TEAMS again anytime.
+
+Everyone in the session needs the same version.
 
 ---
 
@@ -224,9 +252,22 @@ left/right to switch it to `KEYBOARD`, then `A` to edit. Pick a button, press `A
 new key. `LB` / `RB` show the movement, START and BACK keys, plus `DEFAULTS` to undo everything.
 
 **Display settings** are in the game's own menu, `OPTIONS` → `DISPLAY SETTINGS`: window mode,
-resolution (360p to 4K), `VSYNC`, `SHARPNESS`, `ANTI-ALIASING` (FXAA), `TEXTURE FILTERING` and
-`SHADOWS`. The picture options are off by default, so the game looks the way it did on the console.
-In borderless and full screen the mouse pointer is hidden.
+resolution (360p to 4K), `VSYNC`, `BRIGHTNESS`, `LOW LATENCY` (off by default; on shows each
+picture a frame sooner in fights, but a slower PC can then drop below 60 fps) and `QUICK START` (off
+by default; on skips the logos and the intro movie, straight to Press Start). In borderless and
+full screen the mouse pointer is hidden.
+
+**Graphics settings**, `OPTIONS` → `GRAPHICS SETTINGS`: `SHARPNESS`, `ANTI-ALIASING`,
+`TEXTURE FILTERING`, `SHADOWS`, `DEPTH OF FIELD`, `BLOOM`, `LIGHT SHAFTS`, `WEATHER EFFECTS` and
+`FPS COUNTER` (off, or a corner of the screen). `TEXTURE FILTERING` offers `TRILINEAR` (smoother
+distant textures, very light) and `ANISOTROPIC 2X` to `16X` (sharp at an angle).
+`ANTI-ALIASING` offers SMAA (light, keeps the picture sharp) and supersampling: `SSAA 1.5X` / `SSAA 2X` draw the game at 1.5 / 2 times
+the `RESOLUTION` setting (at most 4 times 720p) and scale it down to the window. That gives the
+smoothest edges, but it costs a lot more GPU time.
+By default the picture looks the way it did on the console, except that the console's dynamic
+resolution (the scene drawn narrower when the game thinks it is running late) is always off: on a
+PC it only blurred the picture. Turning shadows, depth of field, bloom or light shafts off makes the
+game lighter on older graphics cards; `WEATHER EFFECTS` off saves processor time on slower PCs.
 
 **Profiles:** `OPTIONS` → `SWITCH PROFILE` lists them; press `Y` to rename one (its saves stay
 with it).
@@ -290,10 +331,10 @@ Graphics</b>.
 <details>
 <summary><b>Ranked Match can't find my friend.</b></summary>
 <br>
-Both of you need to be on the same community server. The game also only pairs players whose ranks
-are close: its default <code>RANK LIMITS</code> turns away a big rank gap. If you're far apart,
-both set <code>RANKED MATCH</code> → <code>RANK LIMITS</code> to <b>No Restrictions</b> before
-searching.
+Both of you need to be on the same network: Steam, or the same community server. The game also
+only pairs players whose ranks are close: its default <code>RANK LIMITS</code> turns away a big
+rank gap. If you're far apart, both set <code>RANKED MATCH</code> → <code>RANK LIMITS</code> to
+<b>No Restrictions</b> before searching.
 </details>
 
 <details>
@@ -339,7 +380,7 @@ and attach <code>%LOCALAPPDATA%\TTT2Recomp\log.txt</code>. It tells us what happ
 ## Not available (yet)
 
 World Arena relied on Namco's servers, which are gone, and no community server has its lobbies
-yet. Voice chat isn't supported. Ranked Match, leaderboards, teams and replay search need a
+yet. Voice chat isn't supported. Leaderboards, teams and replay search need a
 [community server](#on-a-community-server-ranked-leaderboards-replays); on plain Steam they're
 grayed out.
 
@@ -358,7 +399,7 @@ grayed out.
 <p align="center">
   <b>For developers:</b> <a href="BUILDING.md">Building from source</a> &nbsp;•&nbsp;
   <a href="port/INSTALLER.md">How the installer works</a> &nbsp;•&nbsp;
-  <a href="server/README.md">Hosting a community server</a>
+  <a href="server/HOSTING.md">Hosting a community server</a>
 </p>
 
 <sub>

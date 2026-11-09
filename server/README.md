@@ -8,6 +8,9 @@ Steam P2P, never through the server. Nobody runs a central server: every communi
 One program, no game data, nothing else to install (its database is built in). Windows and Linux (x86-64 and
 ARM64). Ship `THIRD_PARTY_NOTICES.txt` with it.
 
+**New to hosting? [HOSTING.md](HOSTING.md) walks through it step by step** (a Windows PC or a Linux VPS, the port,
+the settings that matter, getting players on it). This README is the full reference.
+
 ## Run it
 
 1. Put `ttt2-server` (Linux) or `ttt2-server.exe` (Windows) in a folder of its own.
@@ -226,6 +229,24 @@ Players are identified by their Steam account. Choose one:
 
 The server will not start until you choose.
 
+## Ranks
+
+`ranks` in `server.toml` decides whose ranks count on your server:
+
+- **`"server"` (the default): the server's own.** Every player starts here as a beginner (every fighter Beginner, no
+  Battle Points) and ranks up by playing ranked matches here. The server keeps each player's license - their rank and
+  points per fighter, highest rank, Battle Points, online record - and the penalty for leaving a ranked match early.
+  A player's saved rank, or an edited save, never counts here. And what they earn here stays here: the save on their
+  PC keeps their own ranks, which are the ones that count on Steam and on `"player"` servers. Needs the game 0.2.0 or
+  newer; an older game still plays Player Matches here, but its ranked matches do not count.
+- **`"player"`: the rank each player brings from their PC**, as on Steam. Their ranked matches here change their own
+  saved rank; the server keeps a copy for other players to see. Someone with an edited save brings its rank.
+
+You can change it later (`reload` or a restart; players online then keep the old setting until they connect again).
+The two are kept apart in the database: from `"player"` to `"server"` everyone starts as a beginner; back to
+`"player"`, the server's ranks stay in the database, unused, and count again if you switch back. `wipe <steam id>`
+deletes a player's ranks here too (they start again as a beginner).
+
 ## The server key - back it up
 
 `data/tls.key` is your server's identity. Every player's game remembers it the first time they connect and
@@ -247,7 +268,9 @@ the start-up log) shows the key's fingerprint; you can publish it so players can
   (XUID), whether Steam confirmed the Steam ID at the last login, first and last login, number of logins - and
   the game profile the game uploads (its ranked data, at most 64 KB of JSON per player) - and the leaderboards
   (the game's own boards: battle points, rank per fighter, ranked match wins, World Arena, chicken, survival,
-  time attack). Ranked results count only when both players' games report the same result. Also what the game
+  time attack). Ranked results count only when both players' games report the same result. Each player's license
+  (Ranks: with `ranks = "server"` the one that counts here, with `"player"` a copy of theirs for others to see) and,
+  with `"server"`, their penalties for ranked matches left early. Also what the game
   uploads, as it sent it: its last match reports (50) and offline records (20) per player; ghosts (GHOST BATTLE
   fights other players' ghosts: one per player, dan belt and kind, the newest 300 players' per belt) and replays
   (TEKKEN CHANNEL: one per match, 20 per player, 20000 in all); teams. 30 uploads an hour at most, 8 MB per player,
@@ -308,7 +331,7 @@ commands). Use a port above 1024 (the defaults 28200 and 28201 are fine): it nee
 ### Docker
 
 ```bash
-docker build -t ttt2-server --build-arg VERSION=0.1.7 .
+docker build -t ttt2-server --build-arg VERSION=0.2.0 .
 docker run -it --name ttt2 -p 28200:28200/tcp -p 28200:28200/udp -v /srv/ttt2:/srv/ttt2 ttt2-server
 ```
 
@@ -325,7 +348,7 @@ forwards only IPv6 `localhost` (`[::1]`) to it, so `127.0.0.1` does not work the
 ### Releases
 
 `tools/release.sh <version>` builds the three archives (Windows x86-64 zip, Linux x86-64 and ARM64 tar.gz - static,
-the version stamped in) with this README, PROTOCOL.md, THIRD_PARTY_NOTICES.txt and the admin wrapper
+the version stamped in) with HOSTING.md, this README, PROTOCOL.md, THIRD_PARTY_NOTICES.txt and the admin wrapper
 (`ttt2admin.cmd`; on Linux `ttt2admin` and the systemd unit), plus SHA256SUMS, into `dist/<version>/`.
 
 ## Building from source

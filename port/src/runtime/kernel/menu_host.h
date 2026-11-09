@@ -15,10 +15,14 @@ void SetText(PPCContext& ctx, uint8_t* base, const std::string& widget, const st
 // lib::MenuSetVisible / lib::MenuSetFocusable (bool, widget): a menu row hidden and skipped by the cursor
 void SetVisible(PPCContext& ctx, uint8_t* base, const std::string& widget, bool visible);
 void SetFocusable(PPCContext& ctx, uint8_t* base, const std::string& widget, bool focusable);
+// lib::MenuEntitySetTextHide(bool, widget): a text widget's text hidden (the widget stays)
+void TextHide(PPCContext& ctx, uint8_t* base, const std::string& widget, bool hide);
 // lib::MenuIFLumenSetMovieVisible(movie, bool)
 void MovieVisible(PPCContext& ctx, uint8_t* base, const std::string& movie, bool visible);
 // lib::MenuContainerGetCursor(menu)
 int Cursor(PPCContext& ctx, uint8_t* base, const std::string& menu);
+// lib::MenuContainerSetCursor(index, menu)
+void SetCursor(PPCContext& ctx, uint8_t* base, const std::string& menu, int index);
 // lib::MenuSoundKeyOn with the menus' cursor / decide / cancel sounds
 enum Sound : uint32_t { SoundCursor = 8426, SoundCancel = 8427, SoundDecide = 8428 };
 void PlaySound(PPCContext& ctx, uint8_t* base, Sound sound);
@@ -26,6 +30,12 @@ void PlaySound(PPCContext& ctx, uint8_t* base, Sound sound);
 bool WindowShowing(PPCContext& ctx, uint8_t* base);
 // lib::WindowPrintKeyInfoText(key, text): one more hint in the bottom bar's key help, this frame
 void KeyHint(PPCContext& ctx, uint8_t* base, uint32_t key, const std::string& text);
+// The online rooms' chat log window (tkcsnet::lobby::CChatLogWindow, the lobby [0x82F3188C] + 52): shown or not.
+bool ChatLogShown(PPCContext& ctx, uint8_t* base);
+void ChatLogShow(PPCContext& ctx, uint8_t* base, bool shown);
+
+// lib::MenuSwitchFrame(name): the menu shows that frame
+void ShowFrame(PPCContext& ctx, uint8_t* base, const std::string& frame);
 
 // Frames since the start (the UI hook's count; a native called from a page's OnTick tells its first call per
 // frame by it).

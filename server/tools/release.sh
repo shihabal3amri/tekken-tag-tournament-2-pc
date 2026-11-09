@@ -1,8 +1,8 @@
 #!/bin/bash
 # release.sh <version>: the server's release archives in server/dist/<version>/ - Windows (zip), Linux x86-64 and
-# ARM64 (tar.gz), each with the program, README.md, PROTOCOL.md, THIRD_PARTY_NOTICES.txt and the admin command
-# wrapper (ttt2admin.cmd; on Linux ttt2admin, executable, and the systemd unit), plus SHA256SUMS. Static builds
-# (CGO_ENABLED=0), the version stamped into the program (it logs it at start).
+# ARM64 (tar.gz), each with the program, HOSTING.md, README.md, PROTOCOL.md, THIRD_PARTY_NOTICES.txt and the admin
+# command wrapper (ttt2admin.cmd; on Linux ttt2admin, executable, and the systemd unit), plus SHA256SUMS. Static
+# builds (CGO_ENABLED=0), the version stamped into the program (it logs it at start).
 # Needs Go (PATH, or tools/go of this project) and Python (tools/pack.py: archives with the right file modes).
 set -euo pipefail
 VERSION=${1:?usage: release.sh <version>}
@@ -25,7 +25,7 @@ for target in windows/amd64 linux/amd64 linux/arm64; do
   exe=ttt2-server
   [ "$os" = windows ] && exe=ttt2-server.exe
   GOOS=$os GOARCH=$arch "$GO" build -ldflags "-s -w -X main.version=$VERSION" -o "$stage/$exe" ./cmd/ttt2-server
-  cp README.md PROTOCOL.md THIRD_PARTY_NOTICES.txt "$stage/"
+  cp HOSTING.md README.md PROTOCOL.md THIRD_PARTY_NOTICES.txt "$stage/"
   if [ "$os" = linux ]; then
     cp deploy/ttt2-server.service "$stage/"
     tr -d '\r' < deploy/ttt2admin > "$stage/ttt2admin" # LF only: a shell script with CR line ends does not run

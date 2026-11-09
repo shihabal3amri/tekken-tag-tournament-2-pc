@@ -18,6 +18,20 @@
 #include <vector>
 
 void XamNotifyEnqueueEvent(uint32_t id, uint32_t param);
+bool KernelOnSaveJobThread();      // kernel_thread.cpp: this thread runs the save / load job
+
+// rollback.cpp (the online session's waits for the save / load job, reviews wf_f788ef00-b3b, wf_fd6326af-ace): the job
+// asks the player something - a failed save's "Save Error" box (Retry / Continue without saving; sub_8258ADF8 ->
+// sub_825890E0, which polls the answer with Sleep(100) and asks again, after a Sleep(100), while another box is up).
+// Only the main thread shows and answers it, so a wait for the job there cannot end. 1: the job asks (its box up, or
+// refused - it asks again); 2: answered - until the job's next sleep returns (kernel_thread.cpp KeDelayExecutionThread),
+// after which it works again (the answer's own clear made the main thread wait out the job's poll sleep, up to 100 ms);
+// cleared by the job's end too.
+static std::atomic<int> g_saveJobBox{ 0 };
+bool XamSaveJobAsksPlayer() { return g_saveJobBox.load(std::memory_order_relaxed) != 0; }
+void XamSaveJobBoxClear() { g_saveJobBox.store(0, std::memory_order_relaxed); }
+void XamSaveJobAwake() { int answered = 2; g_saveJobBox.compare_exchange_strong(answered, 0); }
+
 
 namespace {
 constexpr uint32_t kPending = 997, kInvalidParameter = 87;
@@ -76,8 +90,10 @@ std::string Utf8(const std::wstring& text) {
 }
 
 struct Completion { uint8_t* base; uint32_t result, overlapped; };
-void Finish(const Completion& c, int choice) {
+void Finish(const Completion& c, int choice, bool saveJob) {
     GWrite32(c.base, c.result, uint32_t(choice));
+    // The save job's box: answered before the job can see it (its next sleep's return clears the flag).
+    if (saveJob) { int asking = 1; g_saveJobBox.compare_exchange_strong(asking, 2); }
     XamCompleteOverlapped(c.base, c.overlapped, 0, 0, 0);
     // Match XAM's UI-close ordering: polling may observe the completed request before the
     // UI-hidden notification.
@@ -90,6 +106,8 @@ void Finish(const Completion& c, int choice) {
 // Argument nine is at SP+0x54, after the eight register arguments.
 PPC_FUNC(__imp__XamShowMessageBoxUI) {
     KTrace("XamShowMessageBoxUI");
+    const bool saveJob = KernelOnSaveJobThread();
+    if (saveJob) g_saveJobBox.store(1, std::memory_order_relaxed);   // until answered and seen (a refused box: it asks again)
     const uint32_t count = ctx.r6.u32, buttonArray = ctx.r7.u32;
     const uint32_t active = ctx.r8.u32, result = ctx.r10.u32;
     uint32_t overlapped;
@@ -119,6 +137,7 @@ PPC_FUNC(__imp__XamShowMessageBoxUI) {
         SysUiMessageBox box;
         box.text = Utf8(text);
         box.active = int(active);
+        box.system = true;
         for (uint32_t i = 0; i < count; ++i) {
             uint32_t pointer;
             std::wstring label;
@@ -131,8 +150,8 @@ PPC_FUNC(__imp__XamShowMessageBoxUI) {
         }
         std::fprintf(stderr, "[xam] XamShowMessageBoxUI '%s' (%u buttons)\n", Utf8(title).c_str(), count);
         const Completion completion{ base, result, overlapped };
-        box.done = [completion](int choice) {
-            std::thread([completion, choice] { Finish(completion, choice); }).detach();
+        box.done = [completion, saveJob](int choice) {
+            std::thread([completion, choice, saveJob] { Finish(completion, choice, saveJob); }).detach();
         };
         // Pending before the box is queued (the answer may complete it from the main thread at
         // once); a refused box restores the caller's words.

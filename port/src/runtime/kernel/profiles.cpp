@@ -1,5 +1,6 @@
 // Local player profiles - see profiles.h.
 #include "profiles.h"
+#include "log_utf8.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -56,6 +57,7 @@ void LoadLocked()
     g_loaded = true;
     const std::filesystem::path path = File();
     std::ifstream in(path);
+    const bool found = in.is_open();    // TEST 17: a missing file (the default profile below) is logged as such
     std::string line;
     while (in && std::getline(in, line))
     {
@@ -84,9 +86,9 @@ void LoadLocked()
             if (g_list[i].xuid == want) g_active = int(i);
     }
     else if (autoSignIn && *autoSignIn == '1') g_active = g_last;
-    std::fprintf(stderr, "[profiles] %zu profile(s) in %ls, last '%s'%s%s\n", g_list.size(), path.c_str(),
-                 g_list[g_last].name.c_str(), g_active >= 0 ? " - signed in (TTT2_AUTO_SIGNIN): " : " - signed out",
-                 g_active >= 0 ? g_list[g_active].name.c_str() : "");
+    std::fprintf(stderr, "[profiles] %zu profile(s) in %s%s, last '%s'%s%s\n", g_list.size(), LogUtf8(path).c_str(),
+                 found ? "" : " (no such file: made with the default profile)", g_list[g_last].name.c_str(),
+                 g_active >= 0 ? " - signed in (TTT2_AUTO_SIGNIN): " : " - signed out", g_active >= 0 ? g_list[g_active].name.c_str() : "");
 }
 
 } // namespace

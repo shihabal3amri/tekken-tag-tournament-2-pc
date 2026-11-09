@@ -80,6 +80,9 @@ void Close(uint32_t chunk)
     g_open[chunk] = 0;
 }
 
+} // namespace
+namespace frame_overlap { void BeforeGpuDataRead(); }   // frame_overlap.cpp
+namespace {
 LONG CALLBACK MirrorVeh(EXCEPTION_POINTERS* ep)
 {
     const EXCEPTION_RECORD* r = ep->ExceptionRecord;
@@ -89,6 +92,7 @@ LONG CALLBACK MirrorVeh(EXCEPTION_POINTERS* ep)
     const uint64_t fault = r->ExceptionInformation[1];
     if (fault < lo || fault >= lo + VIEW_SIZE) return EXCEPTION_CONTINUE_SEARCH;
     const uint32_t chunk = uint32_t((fault - lo) / CHUNK);
+    frame_overlap::BeforeGpuDataRead();          // a frame in flight: its resolves first (no lock held here)
     for (int attempt = 0;; ++attempt)
     {
         // The writeback takes the GPU backend lock; never hold the mirror lock across it

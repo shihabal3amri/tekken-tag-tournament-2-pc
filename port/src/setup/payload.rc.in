@@ -13,8 +13,9 @@ IDR_MSVCP140_ATOMIC    RCDATA  "@CRT_MSVCP140_ATOMIC@"
 IDR_VCRUNTIME140       RCDATA  "@CRT_VCRUNTIME140@"
 IDR_VCRUNTIME140_1     RCDATA  "@CRT_VCRUNTIME140_1@"
 IDR_README             RCDATA  "@TTT2_README_TXT@"
+IDR_PAYLOAD_SHA256     RCDATA  "@TTT2_PAYLOAD_HASHES@"
 
-IDD_MAIN DIALOGEX 0, 0, 320, 250
+IDD_MAIN DIALOGEX 0, 0, 320, 284
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Install Tekken Tag Tournament 2 (PC port)"
 FONT 9, "Segoe UI", 400, 0, 0x1
@@ -27,17 +28,20 @@ BEGIN
     LTEXT           "Title Update 3 (file TU_..._O2, or the folder holding it):", IDC_TU_LABEL, 10, 74, 300, 9
     EDITTEXT        IDC_TU_PATH, 10, 86, 240, 14, ES_AUTOHSCROLL
     PUSHBUTTON      "Browse...", IDC_TU_BROWSE, 256, 85, 54, 16
-    LTEXT           "Install to:", IDC_DEST_LABEL, 10, 108, 120, 9
-    EDITTEXT        IDC_DEST_PATH, 10, 120, 240, 14, ES_AUTOHSCROLL
-    PUSHBUTTON      "Browse...", IDC_DEST_BROWSE, 256, 119, 54, 16
+    LTEXT           "Downloadable content (optional, the folder holding your DLC packages):", IDC_DLC_LABEL, 10, 108, 300, 9
+    EDITTEXT        IDC_DLC_PATH, 10, 120, 240, 14, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...", IDC_DLC_BROWSE, 256, 119, 54, 16
+    LTEXT           "Install to:", IDC_DEST_LABEL, 10, 142, 120, 9
+    EDITTEXT        IDC_DEST_PATH, 10, 154, 240, 14, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...", IDC_DEST_BROWSE, 256, 153, 54, 16
     CONTROL         "Create a &Desktop shortcut", IDC_SC_DESKTOP, "Button",
-                    BS_AUTOCHECKBOX | WS_TABSTOP, 10, 144, 140, 10
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 10, 178, 140, 10
     CONTROL         "Add to the &Start menu", IDC_SC_STARTMENU, "Button",
-                    BS_AUTOCHECKBOX | WS_TABSTOP, 160, 144, 140, 10
-    CONTROL         "", IDC_PROGRESS, "msctls_progress32", WS_BORDER, 10, 168, 300, 12
-    LTEXT           "", IDC_STATUS, 10, 186, 300, 34
-    DEFPUSHBUTTON   "&Install", IDC_INSTALL, 196, 226, 54, 16
-    PUSHBUTTON      "Cancel", IDCANCEL, 256, 226, 54, 16
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 160, 178, 140, 10
+    CONTROL         "", IDC_PROGRESS, "msctls_progress32", WS_BORDER, 10, 202, 300, 12
+    LTEXT           "", IDC_STATUS, 10, 220, 300, 34
+    DEFPUSHBUTTON   "&Install", IDC_INSTALL, 196, 260, 54, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 256, 260, 54, 16
 END
 
 IDD_UNINSTALL DIALOGEX 0, 0, 268, 110

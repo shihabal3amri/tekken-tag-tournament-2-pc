@@ -5,6 +5,7 @@
 // adapter by DXGI's GPU preference is used instead (the dedicated GPU when there is one; the exe also
 // exports NvOptimusEnablement / AmdPowerXpressRequestHighPerformance, main.cpp). TTT2_GPU_ADAPTER=<n>
 // picks DXGI's n-th adapter. Every adapter is listed in the log once.
+#include "log_utf8.h"
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <cstdio>
@@ -44,7 +45,8 @@ inline Microsoft::WRL::ComPtr<IDXGIAdapter1> PreferredGpuAdapter()
             DXGI_ADAPTER_DESC1 p{};
             if (pick) pick->GetDesc1(&p);
             const bool chosen = pick && p.AdapterLuid.LowPart == d.AdapterLuid.LowPart && p.AdapterLuid.HighPart == d.AdapterLuid.HighPart;
-            std::fprintf(stderr, "[gpu] adapter %u: %ls, %llu MB dedicated%s%s\n", i, d.Description,
+            // UTF-8 (log_utf8.h): without a vendor driver Windows names the adapter in its own language.
+            std::fprintf(stderr, "[gpu] adapter %u: %s, %llu MB dedicated%s%s\n", i, LogUtf8(d.Description).c_str(),
                          (unsigned long long)(d.DedicatedVideoMemory >> 20), (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? " (software)" : "",
                          chosen ? " <- rendering here" : "");
         }

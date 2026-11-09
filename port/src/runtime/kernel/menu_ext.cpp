@@ -16,6 +16,7 @@
 // port/tools/menu_proto.py from C:/ttt2/port/menu_override/<fnv1a>.bin instead of editing.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include "online_2v2.h"
 #include "kernel_shared.h"
 #include "guest_heap.h"
 #include "display_settings.h"
@@ -24,8 +25,10 @@
 #include "profiles.h"
 #include "keyboard_keys.h"
 #include "menu_host.h"
+#include "rank_sync.h"
 #include "server_ui.h"
 #include "gin_service.h"
+#include "unlock_all.h"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -50,6 +53,7 @@ extern "C" PPC_FUNC(__imp__sub_8241B9D0);
 extern "C" PPC_FUNC(__imp__sub_8256C708);
 extern "C" PPC_FUNC(__imp__sub_82374700);
 extern "C" PPC_FUNC(__imp__sub_823747C0);
+extern "C" PPC_FUNC(__imp__sub_823752A0);
 extern "C" PPC_FUNC(__imp__sub_8241F988);
 extern "C" PPC_FUNC(__imp__sub_8241B588);
 extern void (*g_uiFrameHook)(PPCContext& ctx, uint8_t* base);
@@ -630,7 +634,7 @@ void BoxFrame(PPCContext& ctx, uint8_t* base)
     const uint16_t now = HostControllerButtons();
     const uint16_t pressed = now & ~b.prev;
     b.prev = now;
-    if (g_boxDismiss.exchange(false) && b.showing)
+    if (g_boxDismiss.exchange(false) && b.showing && !b.box.system)   // the game's own box waits for the answer
     {
         HideDialog(ctx, base);
         b.showing = false;
@@ -703,6 +707,10 @@ void BoxFrame(PPCContext& ctx, uint8_t* base)
         TypeFrame(ctx, base, b, pressed);
         return;
     }
+    // Its first third of a second the box ignores the controller (as the rematch menu's first moment): a press meant
+    // for the game - a fight's last inputs at the KO, where the save's "Save Error" box comes up - neither moves nor
+    // answers it (2026-11-09 sf3: a fight bot's DOWN+B presses moved that box's cursor before anyone saw it).
+    if (b.upFrames <= 20) return;
     int choice = -1;
     switch (b.style)
     {
@@ -1201,6 +1209,7 @@ std::atomic<uint32_t> g_frameCount{ 0 };
 namespace menu_host {
 std::string CurrentFrame(PPCContext& ctx, uint8_t* base) { return keyui::CurrentFrame(ctx, base); }
 void SetText(PPCContext& ctx, uint8_t* base, const std::string& widget, const std::string& text) { MenuSetText(ctx, base, widget, text); }
+void TextHide(PPCContext& ctx, uint8_t* base, const std::string& widget, bool hide) { MenuTextHide(ctx, base, widget, hide); }
 void SetVisible(PPCContext& ctx, uint8_t* base, const std::string& widget, bool visible)
 {
     GuestFrame frame(ctx, base, 0x100);
@@ -1217,12 +1226,33 @@ void SetFocusable(PPCContext& ctx, uint8_t* base, const std::string& widget, boo
 }
 void MovieVisible(PPCContext& ctx, uint8_t* base, const std::string& movie, bool visible) { MenuMovieVisible(ctx, base, movie, visible); }
 int Cursor(PPCContext& ctx, uint8_t* base, const std::string& menu) { return keyui::MenuCursor(ctx, base, menu); }
+void SetCursor(PPCContext& ctx, uint8_t* base, const std::string& menu, int index) { MenuSetCursor(ctx, base, menu, index); }
 void PlaySound(PPCContext& ctx, uint8_t* base, Sound sound) { MenuSound(ctx, base, sound); }
 bool WindowShowing(PPCContext& ctx, uint8_t* base)
 {
     GuestFrame frame(ctx, base, 0x100);
     sub_8241E828(ctx, base);                              // lib::WindowIsShowing
     return (ctx.r3.u32 & 0xFF) != 0;
+}
+// The lobby's chat log window: sub_8269B290 (window->isVisible, its vtable +0x28) / sub_8269B218 (window->setVisible,
+// +0x24: +8 and the child window's).
+bool ChatLogShown(PPCContext& ctx, uint8_t* base)
+{
+    const uint32_t lobby = GRead32(base, 0x82F3188Cu);
+    if (!lobby || !GRead32(base, lobby + 52)) return false;
+    GuestFrame frame(ctx, base, 0x100);
+    ctx.r3.u64 = lobby;
+    sub_8269B290(ctx, base);
+    return (ctx.r3.u32 & 0xFF) != 0;
+}
+void ChatLogShow(PPCContext& ctx, uint8_t* base, bool shown)
+{
+    const uint32_t lobby = GRead32(base, 0x82F3188Cu);
+    if (!lobby || !GRead32(base, lobby + 52)) return;
+    GuestFrame frame(ctx, base, 0x100);
+    ctx.r3.u64 = lobby;
+    ctx.r4.u64 = shown ? 1 : 0;
+    sub_8269B218(ctx, base);
 }
 void KeyHint(PPCContext& ctx, uint8_t* base, uint32_t key, const std::string& text)
 {
@@ -1236,12 +1266,13 @@ void KeyHint(PPCContext& ctx, uint8_t* base, uint32_t key, const std::string& te
     sub_8241FAB8(ctx, base);                              // lib::WindowPrintKeyInfoText(key, text)
 }
 uint32_t FrameCount() { return g_frameCount.load(); }
+void ShowFrame(PPCContext& ctx, uint8_t* base, const std::string& frame) { SwitchFrame(ctx, base, frame.c_str()); }
 } // namespace menu_host
 
 namespace {
 
 // Runs on the game's main thread once per frame (end of VdSwap, registers restored after): the
-// system UI, and a diagnostics trigger - C:/ttt2/port/ui.trigger, one command per line: a frame name
+// system UI, and a diagnostics trigger - C:/ttt2/port/ui.trigger (ui<TTT2_INSTANCE>.trigger), one command per line: a frame name
 // switches the menu to that frame, "text <widget>=<text>" sets a widget's text ("\\n" = new line),
 // "cursor <menu>=<index>" moves a menu's cursor, "movie <name>=0|1" hides / shows a menu movie,
 // "telop <widget>" aims the bottom bar, "box <text>|<button>|<button>" shows a message box (UI mock-ups).
@@ -1251,6 +1282,9 @@ void UiFrame(PPCContext& ctx, uint8_t* base)
     sysui::Frame(ctx, base);
     keyui::Frame(ctx, base);
     server_ui::Frame(ctx, base);
+    rank_sync::Frame(ctx, base);
+    online2v2::Frame(ctx, base);
+    unlock_all::Frame(ctx, base);
     static uint32_t tick = 0;
     if (++tick % 30) return;
     FILE* f = std::fopen("C:/ttt2/port/ui.trigger", "rb");
@@ -1309,7 +1343,10 @@ struct UiHookInstall { UiHookInstall() { g_uiFrameHook = UiFrame; } } g_uiHookIn
 bool SysUiRequestSignIn() { sysui::g_signInRequest = true; return true; }
 bool SysUiOwnsInput() { return sysui::g_owns.load() || sysui::g_boxOwns.load() || keyui::g_capture.load(); }
 bool SysUiKeyCaptureActive() { return keyui::g_capture.load(); }
-uint16_t SysUiGameButtonMask() { return keyui::g_gameMask.load() & server_ui::GameButtonMask(); }
+uint16_t SysUiGameButtonMask()
+{
+    return keyui::g_gameMask.load() & server_ui::GameButtonMask() & rank_sync::GameButtonMask() & unlock_all::GameButtonMask();
+}
 void SysUiOnKey(int vk)
 {
     if (!keyui::g_capture.load()) return;
@@ -1335,7 +1372,8 @@ bool SysUiShowTextBox(SysUiTextBox box)
 void SysUiDismissBox()
 {
     std::lock_guard l(sysui::g_boxMutex);
-    sysui::g_boxQueue.clear();
+    // The game's own box (XamShowMessageBoxUI) is never dropped: its caller waits for the answer (sys_ui.h `system`).
+    std::erase_if(sysui::g_boxQueue, [](const SysUiMessageBox& box) { return !box.system; });
     sysui::g_textQueue.clear();
     sysui::g_boxDismiss = true;
 }
@@ -1369,6 +1407,7 @@ menu_doc::PcLists PcLists()
 constexpr uint32_t kSetterInt = 0x8203624C;   // void f(int)
 constexpr uint32_t kGetterInt = 0x8205B9A4;   // int f()
 constexpr uint32_t kGetterBool = 0x820025B8;  // bool f()
+constexpr uint32_t kVoid = 0x82001348;        // void f()
 
 PPC_FUNC(NativeSetWindowMode) { (void)base; display_settings::SetMode(static_cast<int>(ctx.r3.u32)); }
 PPC_FUNC(NativeGetWindowMode) { (void)base; ctx.r3.u64 = static_cast<uint32_t>(display_settings::GetMode()); }
@@ -1378,7 +1417,34 @@ PPC_FUNC(NativeSetSharpness) { (void)base; display_settings::SetSharpness(static
 PPC_FUNC(NativeSetAntiAliasing) { (void)base; display_settings::SetAntiAliasing(static_cast<int>(ctx.r3.u32)); }
 PPC_FUNC(NativeSetTextureFilter) { (void)base; display_settings::SetTextureFilter(static_cast<int>(ctx.r3.u32)); }
 PPC_FUNC(NativeSetVSync) { (void)base; display_settings::SetVSync(ctx.r3.u32 == 0); }     // ON, OFF
+PPC_FUNC(NativeSetBrightness)                                                             // -5 .. +5
+{
+    (void)base;
+    display_settings::SetBrightness(int(ctx.r3.u32) + display_settings::kMinBrightness);
+}
+PPC_FUNC(NativeSetLowLatency) { (void)base; display_settings::SetLowLatency(static_cast<int>(ctx.r3.u32)); }   // AUTO, ON, OFF
+PPC_FUNC(NativeSetFpsCounter) { (void)base; display_settings::SetFpsCounter(static_cast<int>(ctx.r3.u32)); }   // OFF, the four corners
+PPC_FUNC(NativeSetQuickStart) { (void)base; display_settings::SetQuickStart(ctx.r3.u32 != 0); }                 // OFF, ON
 PPC_FUNC(NativeSetShadows) { (void)base; display_settings::SetShadows(ctx.r3.u32 == 0); } // ON, OFF
+PPC_FUNC(NativeSetDepthOfField) { (void)base; display_settings::SetDepthOfField(ctx.r3.u32 == 0); } // ON, OFF
+PPC_FUNC(NativeSetBloom) { (void)base; display_settings::SetBloom(ctx.r3.u32 == 0); }             // ON, OFF
+PPC_FUNC(NativeSetLightShafts) { (void)base; display_settings::SetLightShafts(ctx.r3.u32 == 0); } // ON, OFF
+PPC_FUNC(NativeSetWeather) { (void)base; display_settings::SetWeather(ctx.r3.u32 == 0); }                   // ON, OFF
+// Graphics Settings' DEFAULT (menu_doc.cpp AddGraphicsPage): the picture as the game draws it; the page's lists follow
+// when the row's script re-initialises MOTION BLUR's (sub_8256CD28 below).
+PPC_FUNC(NativeGraphicsDefaults)
+{
+    (void)ctx; (void)base;
+    display_settings::SetSharpness(0);
+    display_settings::SetAntiAliasing(0);
+    display_settings::SetTextureFilter(0);
+    display_settings::SetShadows(true);
+    display_settings::SetDepthOfField(true);
+    display_settings::SetBloom(true);
+    display_settings::SetLightShafts(true);
+    display_settings::SetWeather(true);
+    display_settings::SetFpsCounter(display_settings::FpsOff);
+}
 // The room's Friend Invite: the native it replaces runs first (lib::OnlinePlayerMatchOperationMenuSetValue, sub_826002C8:
 // the room closes its operation menu - MEASURED 2026-10-23: the friend picker opened while the menu stayed on screen,
 // over the picker), then the Steam friend picker.
@@ -1387,6 +1453,19 @@ PPC_FUNC(NativeFriendInvite)
     __imp__sub_826002C8(ctx, base);
     server_ui::FriendInvite();
 }
+// The room's REMATCH MENU row (menu_doc.cpp AddRematchRow): on / off, the menu stays open (online_rematch.cpp writes the
+// value). The row is a copy of LICENSE, whose script asks the room for its operation 3 (OperationMenuSetValue(3, 0): show
+// the focused player's license): not asked - the room stays in its menu.
+PPC_FUNC(NativeRoomRematchToggle)
+{
+    rematch::RowToggled(ctx, base);
+}
+// The rematch menu's OnEnter (menu_doc.cpp AddRematchFrames, LICENSE's script): the focused row is this player's choice.
+PPC_FUNC(NativeRematchChoose)
+{
+    rematch::Chosen(ctx, base);
+}
+
 PPC_FUNC(NativeTrue) { (void)base; ctx.r3.u64 = 1; }
 
 // lib::ExitGameWindow - the exit dialog's lib::WindowGetValue: -1 while it waits, 0 for the
@@ -1441,9 +1520,18 @@ const HostNative kNatives[] = {
     { "DisplaySettingSetDispRes", kSetterInt, NativeSetResolution },
     { "DisplaySettingGetWindowMode", kGetterInt, NativeGetWindowMode },
     { "DisplaySettingGetResolution", kGetterInt, NativeGetResolution },
-    // VSYNC / SHARPNESS / ANTI-ALIASING / TEXTURE FILTERING (preview and store both apply live)
+    // VSYNC / BRIGHTNESS (Display Settings), SHARPNESS / ANTI-ALIASING / TEXTURE FILTERING / SHADOWS / DEPTH OF FIELD /
+    // BLOOM / LIGHT SHAFTS / WEATHER EFFECTS (Graphics Settings): preview and store both apply live
     { "MenuOptionDisplayVSyncOnOff", kSetterInt, NativeSetVSync },
     { "DisplaySettingSetVSyncOn", kSetterInt, NativeSetVSync },
+    { "MenuOptionDisplayBrightness", kSetterInt, NativeSetBrightness },
+    { "DisplaySettingSetBrightn", kSetterInt, NativeSetBrightness },
+    { "MenuOptionDisplayLowLatency", kSetterInt, NativeSetLowLatency },
+    { "DisplaySettingSetLowLatn", kSetterInt, NativeSetLowLatency },
+    { "MenuOptionDisplayFpsCounter", kSetterInt, NativeSetFpsCounter },
+    { "DisplaySettingSetFpsShow", kSetterInt, NativeSetFpsCounter },
+    { "MenuOptionDisplayQuickStart", kSetterInt, NativeSetQuickStart },
+    { "DisplaySettingSetQuickGo", kSetterInt, NativeSetQuickStart },
     { "MenuOptionDisplaySharpening", kSetterInt, NativeSetSharpness },
     { "DisplaySettingSetSharpen", kSetterInt, NativeSetSharpness },
     { "MenuOptionDisplayEdgeSmooth", kSetterInt, NativeSetAntiAliasing },
@@ -1452,10 +1540,23 @@ const HostNative kNatives[] = {
     { "DisplaySettingSetTexFilt", kSetterInt, NativeSetTextureFilter },
     { "MenuOptionDisplayShadowsOff", kSetterInt, NativeSetShadows },
     { "DisplaySettingSetShadows", kSetterInt, NativeSetShadows },
+    { "MenuOptionDisplayDepthField", kSetterInt, NativeSetDepthOfField },
+    { "DisplaySettingSetDofBlur", kSetterInt, NativeSetDepthOfField },
+    { "MenuOptionDisplayBloomGlare", kSetterInt, NativeSetBloom },
+    { "DisplaySettingSetBloomFx", kSetterInt, NativeSetBloom },
+    { "MenuOptionDisplayLightShaft", kSetterInt, NativeSetLightShafts },
+    { "DisplaySettingSetShaftFx", kSetterInt, NativeSetLightShafts },
+    { "MenuOptionDisplayRainSnowFx", kSetterInt, NativeSetWeather },
+    { "DisplaySettingSetWeather", kSetterInt, NativeSetWeather },
+    { "GraphicsSettingResetToDefaults", kVoid, NativeGraphicsDefaults },
     // the Player Match room's Friend Invite (menu_doc.cpp AddFriendInvite): the signature of the native it replaces,
     // OnlinePlayerMatchOperationMenuSetValue (sub_826002C8, two arguments - MEASURED 2026-10-23: with a one-int
     // setter's the call failed and the item did nothing)
     { "OnlinePlayerMatchSteamFriendInviteOpen", 0x8209FB4C, NativeFriendInvite },
+    // the room's REMATCH MENU row and the rematch menu's rows (menu_doc.cpp AddRematchRow / AddRematchFrames): the same
+    // signature
+    { "OnlineRoomRematchToggle", 0x8209FB4C, NativeRoomRematchToggle },
+    { "OnlineRematchChoose", 0x8209FB4C, NativeRematchChoose },
     // the exit confirmation's answer
     { "ExitGameWindow", kGetterInt, NativeExitGameWindow },
     // the switch-profile confirmation's answer
@@ -1520,9 +1621,9 @@ PPC_FUNC(sub_823756A8)
     ctx = saved;
 }
 
-// lib::MenuSelectValueSetCursor(cursor, name): when Display Settings initialises MOTION BLUR's
-// value (on open and on DEFAULT), the PC rows get their current values (cursor at widget+368); when
-// Game Options initialises BATTLE POSITION's, INPUT DELAY gets its own (OFF = 0, ON = 1).
+// lib::MenuSelectValueSetCursor(cursor, name): when Display Settings or Graphics Settings (whose scripts are Display
+// Settings') initialises MOTION BLUR's value (on open and on DEFAULT), the PC rows get their current values (cursor at
+// widget+368); when Game Options initialises BATTLE POSITION's, INPUT DELAY gets its own (OFF = 0, ON = 1).
 PPC_FUNC(sub_8256CD28)
 {
     const uint32_t nameAddr = ctx.r4.u32;
@@ -1541,16 +1642,33 @@ PPC_FUNC(sub_8256CD28)
             if (const uint32_t w = FindWidget(ctx, base, modeName)) GWrite32(base, w + 368, uint32_t(display_settings::GetMode()));
             if (const uint32_t w = FindWidget(ctx, base, resName))
                 GWrite32(base, w + 368, uint32_t(display_settings::GetResolutionIndex()));
-            static const uint32_t sharpName = GuestCString(base, "SelectValueMenuItemMode007-04-08");
-            static const uint32_t aaName = GuestCString(base, "SelectValueMenuItemMode007-04-09");
-            static const uint32_t filterName = GuestCString(base, "SelectValueMenuItemMode007-04-10");
+            static const uint32_t sharpName = GuestCString(base, "SelectValueMenuItemMode007-07-01");
+            static const uint32_t aaName = GuestCString(base, "SelectValueMenuItemMode007-07-02");
+            static const uint32_t filterName = GuestCString(base, "SelectValueMenuItemMode007-07-03");
             if (const uint32_t w = FindWidget(ctx, base, sharpName)) GWrite32(base, w + 368, uint32_t(display_settings::GetSharpness()));
             if (const uint32_t w = FindWidget(ctx, base, aaName)) GWrite32(base, w + 368, uint32_t(display_settings::GetAntiAliasing()));
             if (const uint32_t w = FindWidget(ctx, base, filterName)) GWrite32(base, w + 368, uint32_t(display_settings::GetTextureFilter()));
             static const uint32_t vsyncName = GuestCString(base, "SelectValueMenuItemMode007-04-11");
             if (const uint32_t w = FindWidget(ctx, base, vsyncName)) GWrite32(base, w + 368, display_settings::GetVSync() ? 0u : 1u);
-            static const uint32_t shadowsName = GuestCString(base, "SelectValueMenuItemMode007-04-12");
+            static const uint32_t brightName = GuestCString(base, "SelectValueMenuItemMode007-04-12");
+            if (const uint32_t w = FindWidget(ctx, base, brightName))
+                GWrite32(base, w + 368, uint32_t(display_settings::GetBrightness() - display_settings::kMinBrightness));
+            static const uint32_t latencyName = GuestCString(base, "SelectValueMenuItemMode007-04-13");
+            if (const uint32_t w = FindWidget(ctx, base, latencyName)) GWrite32(base, w + 368, uint32_t(display_settings::GetLowLatency()));
+            static const uint32_t fpsName = GuestCString(base, "SelectValueMenuItemMode007-07-09");
+            if (const uint32_t w = FindWidget(ctx, base, fpsName)) GWrite32(base, w + 368, uint32_t(display_settings::GetFpsCounter()));
+            static const uint32_t quickName = GuestCString(base, "SelectValueMenuItemMode007-04-14");
+            if (const uint32_t w = FindWidget(ctx, base, quickName)) GWrite32(base, w + 368, display_settings::GetQuickStart() ? 1u : 0u);
+            static const uint32_t shadowsName = GuestCString(base, "SelectValueMenuItemMode007-07-04");
             if (const uint32_t w = FindWidget(ctx, base, shadowsName)) GWrite32(base, w + 368, display_settings::GetShadows() ? 0u : 1u);
+            static const uint32_t dofName = GuestCString(base, "SelectValueMenuItemMode007-07-05");
+            if (const uint32_t w = FindWidget(ctx, base, dofName)) GWrite32(base, w + 368, display_settings::GetDepthOfField() ? 0u : 1u);
+            static const uint32_t bloomName = GuestCString(base, "SelectValueMenuItemMode007-07-06");
+            if (const uint32_t w = FindWidget(ctx, base, bloomName)) GWrite32(base, w + 368, display_settings::GetBloom() ? 0u : 1u);
+            static const uint32_t shaftsName = GuestCString(base, "SelectValueMenuItemMode007-07-07");
+            if (const uint32_t w = FindWidget(ctx, base, shaftsName)) GWrite32(base, w + 368, display_settings::GetLightShafts() ? 0u : 1u);
+            static const uint32_t weatherName = GuestCString(base, "SelectValueMenuItemMode007-07-08");
+            if (const uint32_t w = FindWidget(ctx, base, weatherName)) GWrite32(base, w + 368, display_settings::GetWeather() ? 0u : 1u);
         }
         else
         {
@@ -1603,6 +1721,18 @@ PPC_FUNC(sub_823747C0)
     display_settings::SetCustomRollback(display_settings::kMaxRollback);
 }
 
+// lib::DisplaySettingResetToDefaults (impl sub_823752A0, only the native table refers to it): Display Settings' DEFAULT
+// resets VSYNC, BRIGHTNESS, LOW LATENCY and QUICK START too (their cursors follow when the page re-initialises MOTION BLUR's).
+// DISPLAY MODE and RESOLUTION stay: they are the window's, not the picture's.
+PPC_FUNC(sub_823752A0)
+{
+    __imp__sub_823752A0(ctx, base);
+    display_settings::SetVSync(true);
+    display_settings::SetBrightness(0);
+    display_settings::SetLowLatency(display_settings::LowLatencyOff);
+    display_settings::SetQuickStart(false);
+}
+
 // TitleMode::Impl::state_title_main: the logo waiting for START (sub_82622B70); impl+40 counts the
 // frames in the state and the attract demo starts when it reaches impl+128 (MEASURED 2026-10-12).
 // The logo stays up while the system UI is open.
@@ -1623,6 +1753,12 @@ PPC_FUNC(sub_82623858)
 PPC_FUNC(sub_8241B588)
 {
     static const bool trace = EnvFlag("TTT2_SRV_TRACE");
+    // The PAIR PLAY screen (online_2v2_places.cpp) opens over the room, whose scripts keep printing its hints (GAME CHAT,
+    // TOGGLE LOG DISPLAY, MENU DISPLAY - through lib::WindowPrintKeyInfo, 0x8241FA04; the room takes none of those keys
+    // meanwhile): only the screen's own (SELECT, OK, BACK, from its C++ code) are shown.
+    // Its OK hint (key 1, printed at 0x8238B63C through sub_8241E6F8) goes too: online, OK takes nobody's place - the places
+    // are decided once everyone has picked a side (online_2v2_places.cpp strips the OK button).
+    if (online2v2::PlacesActive() && (uint32_t(ctx.lr) == 0x8241FA04u || uint32_t(ctx.lr) == 0x8238B63Cu)) return;
     if (trace && ctx.r5.u32)
     {
         static std::mutex m;
@@ -1671,8 +1807,115 @@ PPC_FUNC(sub_8256C708)
     __imp__sub_8256C708(ctx, base);
 }
 
+// Customize diagnostics (TEST 17): which Customize screens a tester reached and what its menus refused - the screens
+// its menus ask for, the EQUIP ITEM / BUY ITEM / EQUIP DECAL rows as they open or grey out, and BUY ITEM's refusal.
+// Customize is game mode 21 (online2v2::CurrentMode, MEASURED: log 48); its menus are the main-menu document's
+// FrameMode004-01 and the documents it opens, whose compiled scripts switch frames with lib::MenuSwitchFrame /
+// MenuDelaySwitchFrame (the natives their constant pools name, port/menu_bin dumps). Nothing in other modes (the online
+// and 2v2 menus run the same natives); at most 200 lines a session.
+namespace {
+constexpr uint32_t kModeCustomize = 21;
+constexpr int kCustomizeLines = 200;
+struct CustomizeLog
+{
+    std::mutex m;
+    uint32_t mode = ~0u;                      // the game mode at the last call: a new visit starts the records again
+    int lines = 0;
+    std::string screen;                       // the last screen logged (asked for again: no new line)
+    int rows[3] = { -1, -1, -1 };             // MenuItemMode004-02 / 03 / 04 focusable, as last logged
+};
+CustomizeLog g_customize;
+
+// Under g_customize.m: the game is in Customize.
+bool InCustomize()
+{
+    CustomizeLog& c = g_customize;
+    const uint32_t mode = online2v2::CurrentMode();
+    if (mode != c.mode)
+    {
+        c.mode = mode;
+        c.screen.clear();
+        for (int& r : c.rows) r = -1;
+    }
+    return mode == kModeCustomize;
+}
+
+// Under g_customize.m: one more line may be written (the first one past the cap says so instead).
+bool CustomizeLine()
+{
+    CustomizeLog& c = g_customize;
+    if (c.lines > kCustomizeLines) return false;
+    if (++c.lines <= kCustomizeLines) return true;
+    std::fprintf(stderr, "[customize] %d lines written: no more this session\n", kCustomizeLines);
+    return false;
+}
+
+// A screen Customize's menus ask for: `frames` menu updates later (lib::MenuDelaySwitchFrame) or at once (-1); lr: who
+// asked (the script engine's native call, or C++ such as sub_8272B490).
+void CustomizeScreen(uint8_t* base, uint32_t nameAddr, int32_t frames, uint32_t lr)
+{
+    std::lock_guard l(g_customize.m);
+    if (!InCustomize()) return;
+    const std::string name = GuestString(base, nameAddr, 64);
+    if (name == g_customize.screen || !CustomizeLine()) return;
+    g_customize.screen = name;
+    const char* shown = name.empty() ? "(none)" : name.c_str();
+    if (frames < 0) std::fprintf(stderr, "[customize] screen %s (t=%llu, lr %08X)\n", shown, online2v2::DiagMs(), lr);
+    else std::fprintf(stderr, "[customize] screen %s in %d frames (t=%llu, lr %08X)\n", shown, frames, online2v2::DiagMs(), lr);
+}
+
+// BUY ITEM refusing: its OnEnter shows text 1328 ("There are no items available for purchase.") in an information
+// window instead of opening FrameCustomizeItemBuyWait (read from its compiled script; no other dumped menu script has
+// the constant 1328).
+void CustomizeRefusal(uint8_t* base, uint32_t text)
+{
+    std::lock_guard l(g_customize.m);
+    if (InCustomize() && CustomizeLine())
+        std::fprintf(stderr, "[customize] BUY ITEM refused: '%s' (text 1328, t=%llu)\n", GuestString(base, text, 80).c_str(),
+                     online2v2::DiagMs());
+}
+} // namespace
+
+// lib::MenuSwitchFrame(name) (impl sub_8256BF88) and lib::MenuDelaySwitchFrame(frames, name) (impl sub_8256BFC8: the
+// menu manager switches `frames` of its updates later, sub_8233F550) - the native table, port/tools/xtal_natives.py
+// 82572618. C++ calls the first too (sub_8272B490 switches to "FrameMode004-01").
+extern "C" PPC_FUNC(__imp__sub_8256BF88);
+extern "C" PPC_FUNC(__imp__sub_8256BFC8);
+PPC_FUNC(sub_8256BF88)
+{
+    CustomizeScreen(base, ctx.r3.u32, -1, uint32_t(ctx.lr));
+    __imp__sub_8256BF88(ctx, base);
+}
+PPC_FUNC(sub_8256BFC8)
+{
+    CustomizeScreen(base, ctx.r4.u32, static_cast<int32_t>(ctx.r3.u32), uint32_t(ctx.lr));
+    __imp__sub_8256BFC8(ctx, base);
+}
+
+// lib::MenuSetFocusable(focusable, widget) (impl sub_8256C638; the low byte goes to widget+64): Customize's menu
+// (FrameMode004-01's OnFocus) opens or greys EQUIP ITEM / BUY ITEM / EQUIP DECAL - MenuItemMode004-02 / 03 / 04, the
+// rows its script names - each logged as it changes.
+extern "C" PPC_FUNC(__imp__sub_8256C638);
+PPC_FUNC(sub_8256C638)
+{
+    {
+        std::lock_guard l(g_customize.m);
+        const std::string widget = ctx.r4.u32 && InCustomize() ? GuestString(base, ctx.r4.u32, 32) : std::string();
+        const int row = widget.size() == 18 && widget.compare(0, 17, "MenuItemMode004-0") == 0 ? widget[17] - '2' : -1;
+        const int on = (ctx.r3.u32 & 0xFF) ? 1 : 0;
+        if (row >= 0 && row < 3 && g_customize.rows[row] != on && CustomizeLine())
+        {
+            static const char* const kLabels[3] = { "EQUIP ITEM", "BUY ITEM", "EQUIP DECAL" };
+            g_customize.rows[row] = on;
+            std::fprintf(stderr, "[customize] row %s %s: %s (t=%llu)\n", widget.c_str(), kLabels[row], on ? "open" : "greyed",
+                         online2v2::DiagMs());
+        }
+    }
+    __imp__sub_8256C638(ctx, base);
+}
+
 // Text lookup (text manager, id): the exit confirmation's message and button labels, the name
-// dialog's message.
+// dialog's message; Customize's BUY ITEM refusal is logged (CustomizeRefusal).
 PPC_FUNC(sub_8237F5D0)
 {
     const uint32_t id = ctx.r4.u32 & 0xFFFF;
@@ -1689,6 +1932,32 @@ PPC_FUNC(sub_8237F5D0)
         static const uint32_t yes = TableText(base, "YES"), no = TableText(base, "NO");
         g_exitLabelsPending.fetch_sub(1);
         ctx.r3.u64 = id == kOkTextId ? yes : no;
+        return;
+    }
+    // A 2v2 partner's words for the room's messages (online_2v2_team.cpp), PAIR PLAY's on the Player Match pages
+    // (online_2v2_pair.cpp).
+    if (const std::string t = online2v2::RoomText(id); !t.empty())
+    {
+        static uint32_t buffer = 0;
+        sysui::WriteTableText(base, buffer, 200, t);
+        ctx.r3.u64 = buffer;
+        return;
+    }
+    if (const std::string t = online2v2::PairPagesText(id); !t.empty())
+    {
+        static uint32_t buffers[2];
+        uint32_t& buffer = buffers[id == 0xB1 ? 0 : 1];
+        sysui::WriteTableText(base, buffer, 200, t);
+        ctx.r3.u64 = buffer;
+        return;
+    }
+    // The online PAIR PLAY screen's prompts and confirmation, with the players' names (online_2v2_places.cpp).
+    if (const std::string t = online2v2::PlacesText(base, id); !t.empty())
+    {
+        static uint32_t buffers[3];
+        uint32_t& buffer = buffers[id == 0x527 ? 0 : id == 0x628 ? 1 : 2];
+        sysui::WriteTableText(base, buffer, 400, t);
+        ctx.r3.u64 = buffer;
         return;
     }
     if (id == sysui::kNameTextId && sysui::g_nameText)
@@ -1792,6 +2061,8 @@ PPC_FUNC(sub_8237F5D0)
         }
     }
     __imp__sub_8237F5D0(ctx, base);
+    // a script's text 1328 (lib::MenuGetTextResourceByID, sub_8256F9F8, looks its texts up from 0x8256FA7C)
+    if (id == 0x530 && lr == 0x8256FA7Cu) CustomizeRefusal(base, ctx.r3.u32);
     static const bool trace = std::getenv("TTT2_TEXT_TRACE") != nullptr;
     if (trace)
     {

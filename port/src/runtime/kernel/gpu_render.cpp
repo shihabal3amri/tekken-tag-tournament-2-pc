@@ -7,8 +7,12 @@
 // surface the present path shows.
 #include "kernel_shared.h"
 #include "gpu_render.h"
+namespace frame_overlap { void NoteRead(int kind, uint32_t addr, uint32_t bytes); }   // frame_overlap.cpp
+bool PoisonOn();                                                                              // TEST ONLY (p_diag35)
+void PoisonScan(const char* kind, uint32_t addr, uint32_t bytes, uint64_t a, uint64_t b);     // kernel_memory.cpp
 #include <atomic>
 #include <emmintrin.h>
+#include <immintrin.h>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -18,6 +22,7 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+void DiagNameThread(const wchar_t* name);   // kernel_thread.cpp (TEST ONLY)
 #include <filesystem>
 #include <map>
 #include <set>
@@ -28,6 +33,12 @@
 #include <cstring>
 #include <unordered_map>
 #include <vector>
+
+namespace frame_overlap {   // frame_overlap.cpp: the command processor's reads as the frame drawn sees them
+const uint8_t* CpReadBegin(uint32_t addr, uint32_t bytes, std::vector<uint8_t>& scratch);
+void CpReadEnd();
+uint32_t CpReadGuestBegin(uint32_t addr, uint32_t bytes);
+}
 
 // Frame inventory sink (kernel_video sets it while a framelog_<n>.txt is open; CP thread only).
 void (*g_gpuFrameNote)(const char*) = nullptr;
@@ -175,6 +186,7 @@ private:
 
     void Worker()
     {
+        DiagNameThread(L"raster-pool");
         uint64_t seen = 0;
         for (;;)
         {
@@ -1240,6 +1252,8 @@ void ExecVertexFetch(ShaderCtx& sc, const VFetch& in)
     float fidx = sc.r[in.srcRegister()][in.srcSwizzle() & 3];
     uint32_t index = (uint32_t)std::max(0.0f, std::floor(fidx + 0.5f));
     uint32_t addr = base + index * stride * 4 + in.offset() * 4;
+    ::frame_overlap::NoteRead(1, addr, 16);             // the frame overlap's write guard learns what frames read
+    if (PoisonOn()) PoisonScan("cpu-vertex", addr, 16, slot, base);   // TEST ONLY (p_diag35)
     {
         // Format census (TTT2_FORMAT_CENSUS=1): first CPU-side vertex fetch of each format.
         static const bool census = [] { const char* e = std::getenv("TTT2_FORMAT_CENSUS"); return e && *e == '1'; }();
@@ -1248,7 +1262,9 @@ void ExecVertexFetch(ShaderCtx& sc, const VFetch& in)
         if (census && !(seen.fetch_or(bit) & bit))
             std::fprintf(stderr, "[census] cpu vertex fetch fmt=%u (first: stride %u)\n", in.format(), stride);
     }
-    V4 v = UnpackFormat(addr, in.format(), in.numFormatAll(), in.signedRfMode(), true);
+    const uint32_t at = ::frame_overlap::CpReadGuestBegin(addr, 16);   // as the frame drawn sees it
+    V4 v = UnpackFormat(at, in.format(), in.numFormatAll(), in.signedRfMode(), true);
+    ::frame_overlap::CpReadEnd();
     if (in.expAdjust()) { float m = std::exp2((float)in.expAdjust());
                           for (int i = 0; i < 4; ++i) v[i] *= m; }
     V4& dst = sc.r[in.dstRegister()];
@@ -1426,6 +1442,15 @@ void RunShader(ShaderCtx& sc, const std::vector<uint32_t>& code)
     }
 }
 
+// p_diag39: into a buffer the caller reuses (no allocation once it has grown).
+void LoadUcodeInto(const GpuShader& s, std::vector<uint32_t>& v)
+{
+    v.clear();
+    if (!s.addr || !s.size || s.size > 8192) return;
+    v.resize(s.size);
+    for (uint32_t i = 0; i < s.size; ++i) v[i] = GRead32(g_base, s.addr + i * 4);
+}
+
 std::vector<uint32_t> LoadUcode(const GpuShader& s)
 {
     std::vector<uint32_t> v;
@@ -1601,6 +1626,17 @@ bool DepthCompare(uint32_t func, float src, float dst)
 #include "gpu_hw_d3d11.h"
 #endif
 
+// main.cpp --warm-driver [ps|vs|all]: the disk cache's shaders drawn once on a device of their own (gpu_hw_d3d11.h).
+int GpuWarmDriverShaders(const char* mode)
+{
+#if defined(TTT2_GPU_HW_BACKEND)
+    try { return ttt2_hw::Backend::WarmDriverShaders(mode); }
+    catch (const std::exception& e) { std::fprintf(stderr, "[warm] stopped: %s\n", e.what()); return 5; }
+#else
+    (void)mode;
+    return 3;
+#endif
+}
 // main.cpp --build-shaders: the game's shaders into the disk cache ahead of time (gpu_hw_d3d11.h).
 int GpuPrebuildShaders(const std::vector<std::filesystem::path>& files, unsigned threads)
 {
@@ -1652,6 +1688,85 @@ bool GpuShaderPrebuildCurrent()
 #endif
 }
 
+// DIAGNOSTIC BUILD: parts of the draw preparation (gpu_hw_d3d11.h ReportDiag prints them): 0 microcode loads,
+// 1 index read + range, 2 triangle assembly + bounds, 3 draw state.
+std::atomic<int64_t> g_diagPrepTicks[7] = {};
+// p_diag41: the timestamp counter's ticks in QueryPerformanceCounter ticks (kernel_video.cpp's draw-packet timer).
+double GpuDiagTscToQpc() { return ttt2_hw::DiagTscToQpc(); }
+std::atomic<uint32_t> g_diagFrameCpuDraws{ 0 };   // TEST ONLY (kernel_video.cpp DiagSpikeFrame): CPU vertex path draws this frame
+std::atomic<uint32_t> g_diagFrameCpuWhy[4] = {};   // TEST ONLY: rectangle list, no GPU vertex shader, DrawGpuVs fallback, other
+std::atomic<uint32_t> g_diagFrameCpuVerts{ 0 };    // TEST ONLY: the vertices those draws shaded
+struct DiagPrepScope
+{
+    int part; uint64_t t0 = 0; bool done = false;
+    explicit DiagPrepScope(int p) : part(p), t0(__rdtsc()) {}       // p_diag39: the TSC
+    void Stop() { if (done) return; done = true; ttt2_hw::DiagAddSince(g_diagPrepTicks[part], t0); }
+    ~DiagPrepScope() { Stop(); }
+};
+
+// The index read four at a time (SSSE3 byte swaps, SSE4.1 unsigned min / max): the same values, restart cuts and range
+// as the scalar loop in GpuExecuteDraw. TTT2_INDEX_SIMD=0 keeps the scalar loop (A/B runs).
+static bool IndexSimdOn()
+{
+    static const bool on = [] {
+        const char* e = std::getenv("TTT2_INDEX_SIMD");
+        if (e && *e == '0') return false;
+        return IsProcessorFeaturePresent(PF_SSSE3_INSTRUCTIONS_AVAILABLE) && IsProcessorFeaturePresent(PF_SSE4_1_INSTRUCTIONS_AVAILABLE);
+    }();
+    return on;
+}
+__attribute__((target("ssse3,sse4.1")))
+static void ReadIndicesSse41(const uint8_t* src, uint32_t n, bool index32, bool restartOn, uint32_t restartIdx, uint32_t offset,
+                             bool clamp, uint32_t lo, uint32_t hi, uint32_t* idx, uint8_t* cut, bool& anyCut, uint32_t& maxIdx,
+                             uint32_t& minIdx)
+{
+    const __m128i swap16 = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
+    const __m128i swap32 = _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
+    const __m128i off = _mm_set1_epi32(int(offset)), mask24 = _mm_set1_epi32(0xFFFFFF);
+    const __m128i loV = _mm_set1_epi32(int(lo)), hiV = _mm_set1_epi32(int(hi)), restart = _mm_set1_epi32(int(restartIdx));
+    __m128i mx = _mm_setzero_si128(), mn = _mm_set1_epi32(-1);
+    uint32_t i = 0;
+    for (; i + 4 <= n; i += 4)
+    {
+        const __m128i raw = index32 ? _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src + size_t(i) * 4)), swap32)
+                                    : _mm_cvtepu16_epi32(_mm_shuffle_epi8(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + size_t(i) * 2)), swap16));
+        __m128i v = _mm_and_si128(_mm_add_epi32(raw, off), mask24);
+        if (clamp) v = _mm_min_epu32(_mm_max_epu32(v, loV), hiV);
+        if (restartOn)
+        {
+            const __m128i isCut = _mm_cmpeq_epi32(raw, restart);
+            if (const int m = _mm_movemask_ps(_mm_castsi128_ps(isCut)))
+            {
+                anyCut = true;
+                for (int k = 0; k < 4; ++k) if (m & (1 << k)) cut[i + k] = 1;
+                mx = _mm_max_epu32(mx, _mm_andnot_si128(isCut, v));     // a cut names no vertex: 0 / ~0 leave the range alone
+                v = _mm_or_si128(v, isCut);                             // D3D's strip cut, as the scalar loop stores it
+                mn = _mm_min_epu32(mn, v);
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(idx + i), v);
+                continue;
+            }
+        }
+        mx = _mm_max_epu32(mx, v);
+        mn = _mm_min_epu32(mn, v);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(idx + i), v);
+    }
+    alignas(16) uint32_t a[4], b[4];
+    _mm_store_si128(reinterpret_cast<__m128i*>(a), mx);
+    _mm_store_si128(reinterpret_cast<__m128i*>(b), mn);
+    for (int k = 0; k < 4; ++k) { maxIdx = std::max(maxIdx, a[k]); minIdx = std::min(minIdx, b[k]); }
+    for (; i < n; ++i)
+    {
+        const uint32_t raw = index32 ? __builtin_bswap32(reinterpret_cast<const uint32_t*>(src)[i])
+                                     : __builtin_bswap16(reinterpret_cast<const uint16_t*>(src)[i]);
+        if (restartOn && raw == restartIdx) { cut[i] = 1; anyCut = true; idx[i] = 0xFFFFFFFFu; continue; }
+        uint32_t v = (raw + offset) & 0xFFFFFF;
+        if (clamp) v = std::min(std::max(v, lo), hi);
+        idx[i] = v;
+        maxIdx = std::max(maxIdx, v);
+        minIdx = std::min(minIdx, v);
+    }
+}
+
 bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr,
                     bool index32, const GpuShader& vsRef, const GpuShader& psRef)
 {
@@ -1669,7 +1784,14 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
                prim == PRIM_QUAD_LIST;
     if (prim != PRIM_RECT_LIST && !tri) return false;             // points and lines: later
 
-    std::vector<uint32_t> vsCode = LoadUcode(vsRef), psCode = LoadUcode(psRef);
+    DiagPrepScope dUc(0);
+    // p_diag39: per-thread buffers, reused draw after draw (two allocations a draw before).
+    thread_local std::vector<uint32_t> vsCodeBuffer, psCodeBuffer;
+    LoadUcodeInto(vsRef, vsCodeBuffer);
+    LoadUcodeInto(psRef, psCodeBuffer);
+    const std::vector<uint32_t>& vsCode = vsCodeBuffer;
+    const std::vector<uint32_t>& psCode = psCodeBuffer;
+    dUc.Stop();
     if (vsCode.empty()) return false;
 #if defined(TTT2_DRAW_CAPTURE_DIAGNOSTICS)
     GpuDrawProfileScope drawProfile(psCode.data(), psCode.size(), prim, numIdx);
@@ -1693,27 +1815,114 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
     const uint32_t indexOffset = regs[0x2102];
     const uint32_t minIndex = regs[0x2101] & 0xFFFFFF, maxIndex = regs[0x2100] & 0xFFFFFF;
     const bool clampIndex = maxIndex != 0 && maxIndex >= minIndex;
-    std::vector<uint32_t> idx(numIdx);
-    std::vector<uint8_t> cut(numIdx, 0);
+    DiagPrepScope dIx(1);
+    // Per-thread buffers, reused draw after draw (they were two allocations per draw - with ~500 draws a
+    // frame, MEASURED 2026-10-25, a low-end PC's command processor spent ~1 ms a frame on indices). The
+    // references are what the lambdas below capture: on a pool worker the NAMES of thread_local
+    // variables would resolve to the worker's own instances.
+    thread_local std::vector<uint32_t> tlsIdx;
+    thread_local std::vector<uint8_t> tlsCut;
+    std::vector<uint32_t>& idx = tlsIdx;
+    std::vector<uint8_t>& cut = tlsCut;
     bool anyCut = false;
     extern void GpuNoteMemory(int kind, uint32_t addr, uint32_t bytes);
-    if (srcSel != 2 && indexAddr) GpuNoteMemory(2, indexAddr, numIdx * (index32 ? 4 : 2));
-    for (uint32_t i = 0; i < numIdx; ++i)
-    {
-        uint32_t raw;
-        if (srcSel == 2 || !indexAddr) raw = i;                   // auto index
-        else if (index32) raw = GRead32(g_base, indexAddr + i * 4);
-        else raw = GRead16(g_base, indexAddr + i * 2);
-        if (restartOn && raw == restartIdx) { cut[i] = 1; anyCut = true; idx[i] = 0; continue; }
+    const bool fromMemory = srcSel != 2 && indexAddr;
+    if (fromMemory) GpuNoteMemory(2, indexAddr, numIdx * (index32 ? 4 : 2));
+    if (fromMemory && PoisonOn()) PoisonScan("index", indexAddr, numIdx * (index32 ? 4 : 2), numIdx, colorBase);   // TEST ONLY (p_diag35)
+    // One pass: raw index -> offset, clamp; the range of the indices that name a vertex on the way.
+    uint32_t maxIdx = 0, minIdxSeen = 0xFFFFFFFFu;
+    auto take = [&](uint32_t i, uint32_t raw) {
+        if (restartOn && raw == restartIdx) { cut[i] = 1; anyCut = true; idx[i] = 0xFFFFFFFFu; return; }   // D3D's strip cut
         uint32_t v = (raw + indexOffset) & 0xFFFFFF;
         if (clampIndex) v = std::min(std::max(v, minIndex), maxIndex);
         idx[i] = v;
-    }
+        maxIdx = std::max(maxIdx, v);
+        minIdxSeen = std::min(minIdxSeen, v);
+    };
+    const uint64_t indexBytes = uint64_t(numIdx) * (index32 ? 4 : 2);
+    static const bool verify = [] { const char* e = std::getenv("TTT2_DIAG_VERIFY"); return e && *e == '1'; }();
+    static int verifyLogged = 0;
+    // p103: not read for a draw the index cache holds (gpu_hw_d3d11.h IndexCacheFind) - unless that draw ends up
+    // elsewhere than the GPU-vertex path after all.
+    auto readIndices = [&] {
+        idx.resize(numIdx);
+        cut.assign(numIdx, 0);
+        anyCut = false;
+        maxIdx = 0; minIdxSeen = 0xFFFFFFFFu;
+        if (!fromMemory) for (uint32_t i = 0; i < numIdx; ++i) take(i, i);                 // auto index
+        else if (uint64_t(indexAddr) + indexBytes > 0x100000000ull)                      // wraps: as before
+            for (uint32_t i = 0; i < numIdx; ++i) take(i, index32 ? GRead32(g_base, indexAddr + i * 4) : GRead16(g_base, indexAddr + i * 2));
+        else
+        {
+            // As the frame drawn sees them (the frame overlap's copies of pages the game wrote since).
+            thread_local std::vector<uint8_t> overlapScratch;
+            const uint8_t* ib = ::frame_overlap::CpReadBegin(indexAddr, uint32_t(indexBytes), overlapScratch);
+            if (IndexSimdOn())
+                ReadIndicesSse41(ib, numIdx, index32, restartOn, restartIdx, indexOffset, clampIndex, minIndex, maxIndex,
+                                 idx.data(), cut.data(), anyCut, maxIdx, minIdxSeen);
+            else if (index32)
+            {
+                const uint32_t* src = reinterpret_cast<const uint32_t*>(ib);
+                for (uint32_t i = 0; i < numIdx; ++i) take(i, __builtin_bswap32(src[i]));
+            }
+            else
+            {
+                const uint16_t* src = reinterpret_cast<const uint16_t*>(ib);
+                for (uint32_t i = 0; i < numIdx; ++i) take(i, __builtin_bswap16(src[i]));
+            }
+            if (ttt2_hw::GeoDumpFile())     // TEST ONLY (p102): the draw's index range and what it is read as
+                ttt2_hw::GeoDump('I', indexAddr, uint32_t(indexBytes), ib,
+                                 (uint64_t(prim) | uint64_t(index32) << 6 | uint64_t(restartOn) << 7 | uint64_t(clampIndex) << 8) ^
+                                 (uint64_t(indexOffset) << 9) ^ (uint64_t(minIndex) << 33) ^ (uint64_t(maxIndex) * 0x9E3779B97F4A7C15ull));
+            ::frame_overlap::CpReadEnd();
+        }
+        if (verify)
+        {
+            // The old code, for comparison.
+            std::vector<uint32_t> oIdx(numIdx);
+            std::vector<uint8_t> oCut(numIdx, 0);
+            for (uint32_t i = 0; i < numIdx; ++i)
+            {
+                uint32_t raw;
+                if (srcSel == 2 || !indexAddr) raw = i;
+                else if (index32) raw = GRead32(g_base, indexAddr + i * 4);
+                else raw = GRead16(g_base, indexAddr + i * 2);
+                if (restartOn && raw == restartIdx) { oCut[i] = 1; oIdx[i] = 0; continue; }
+                uint32_t v = (raw + indexOffset) & 0xFFFFFF;
+                if (clampIndex) v = std::min(std::max(v, minIndex), maxIndex);
+                oIdx[i] = v;
+            }
+            uint32_t oMax = 0, oMin = 0xFFFFFFFFu;
+            for (uint32_t i = 0; i < numIdx; ++i) if (!oCut[i]) { oMax = std::max(oMax, oIdx[i]); oMin = std::min(oMin, oIdx[i]); }
+            bool sameIdx = true;
+            for (uint32_t i = 0; i < numIdx; ++i) if (!oCut[i] && oIdx[i] != idx[i]) sameIdx = false;
+            for (uint32_t i = 0; i < numIdx; ++i) if (oCut[i] && idx[i] != 0xFFFFFFFFu) sameIdx = false;
+            if ((!sameIdx || oCut != cut || oMax != maxIdx || oMin != minIdxSeen) && verifyLogged++ < 20)
+                std::fprintf(stderr, "[verify] index read differs: %u indices, max %u / %u, min %u / %u\n", numIdx, oMax, maxIdx, oMin, minIdxSeen);
+            static uint64_t indexChecks = 0;
+            if (++indexChecks % 100000 == 0) std::fprintf(stderr, "[verify] %llu draws' index reads checked\n", (unsigned long long)indexChecks);
+        }
+    };
+#if defined(TTT2_GPU_HW_BACKEND)
+    ttt2_hw::Backend::IxFind ixFind{};
+    const ttt2_hw::Backend::IxEntry* ixCheck = nullptr;     // verify runs: a hit, read and compared all the same
+    const ttt2_hw::Backend::IxKey ixKey{ fromMemory ? indexAddr : 0u, numIdx, indexOffset, minIndex, maxIndex, restartOn ? restartIdx : 0u,
+                                         prim | (index32 ? 1u << 6 : 0u) | (restartOn ? 1u << 7 : 0u) | (clampIndex ? 1u << 8 : 0u) |
+                                         (fromMemory ? 0u : 1u << 9) };
+    if (ttt2_hw::ActiveMode() == ttt2_hw::Mode::On && prim != PRIM_RECT_LIST && !g_gpuFrameNote && !PoisonOn() &&
+        (!fromMemory || uint64_t(indexAddr) + indexBytes <= 0x100000000ull))
+        ttt2_hw::Guarded("index cache", [&] { ixFind = ttt2_hw::Get().IndexCacheFind(ixKey, fromMemory ? uint32_t(indexBytes) : 0u); });
+    if (ixFind.hit && verify) { ixCheck = ixFind.hit; ixFind.hit = nullptr; }
+    if (ixFind.hit) { maxIdx = ixFind.hit->maxIdx; minIdxSeen = ixFind.hit->lowest; }
+    else readIndices();
+#else
+    readIndices();
+#endif
 
     // ---- vertex stage (one shader run per distinct index) ----
-    uint32_t maxIdx = 0;
-    for (uint32_t i = 0; i < numIdx; ++i) if (!cut[i]) maxIdx = std::max(maxIdx, idx[i]);
+    dIx.Stop();
     if (maxIdx > (1u << 20)) return false;
+    DiagPrepScope dPx(4);
 
     uint32_t vte = regs[0x2206];
     float xs = AsFloat(regs[0x210F]), xo = AsFloat(regs[0x2110]);
@@ -1845,7 +2054,7 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
     // accepts only validated movie draws and commits the surface after successful
     // readback; any unsupported state or device failure continues through CPU.
     static const bool movieHardwareBudgetAllowed = std::getenv("TTT2_MAXPIX") == nullptr;
-    if (!hwDraw && movieHardwareBudgetAllowed && prim == PRIM_QUAD_LIST && numIdx == 4 &&
+    if (!hwDraw && movieHardwareBudgetAllowed && prim == PRIM_QUAD_LIST && numIdx == 4 && !anyCut &&
         psCode.size() == 33 && D3D11MovieEnabled())
     {
         Vertex quad[4];
@@ -2298,7 +2507,9 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
         }
     };
 
+    dPx.Stop();
 #if defined(TTT2_GPU_HW_BACKEND)
+    int diagCpuWhy = prim == PRIM_RECT_LIST ? 0 : 3;   // TEST ONLY (DiagSpikeFrame)
     auto makeHwState = [&] {
         ttt2_hw::DrawState st;
         st.pitch = pitch; st.sampX = sampX; st.sampY = sampY;
@@ -2324,69 +2535,182 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
     if (hwDraw && !cpuRaster && prim != PRIM_RECT_LIST && !g_gpuFrameNote)
     {
         ttt2_hw::Backend::VsEntry* vsEntry = nullptr;
-        ttt2_hw::Guarded("vs", [&] { vsEntry = ttt2_hw::Get().VertexShader(vsCode); });
+        { DiagPrepScope dGv(5); ttt2_hw::Guarded("vs", [&] { vsEntry = ttt2_hw::Get().VertexShader(vsCode); }); }
+        diagCpuWhy = vsEntry ? 2 : 1;
+        if (vsEntry && ixFind.hit)      // p103: drawn from the index cache's copy
+        {
+            const ttt2_hw::Backend::IxEntry& e = *ixFind.hit;
+            DiagPrepScope dSs(3);
+            const ttt2_hw::DrawState st = makeHwState();
+            dSs.Stop();
+            auto result = ttt2_hw::Backend::GpuVsResult::Fallback;
+            {
+                DiagPrepScope dGd(6);
+                static const std::vector<uint32_t> none;
+                ttt2_hw::Guarded("draw", [&] {
+                    result = ttt2_hw::Get().DrawGpuVs(regs, psCode, *vsEntry, none, e.lowest, e.highest, st,
+                                                      e.strip ? D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, &e);
+                });
+            }
+            if (result != ttt2_hw::Backend::GpuVsResult::Fallback)
+            {
+                if (LogOn() || LogPrimOn(prim)) { LogUsed(); LogPrimUsed(prim); }
+                if (e.count) ++g_litDraws;
+                return e.count != 0;
+            }
+        }
+        if (ixFind.hit) { readIndices(); ixFind.hit = nullptr; }    // not drawn from the copy: as before, from the indices read
         if (vsEntry)
         {
+            DiagPrepScope dTr(2);
             thread_local std::vector<uint32_t> tri;
-            tri.clear();
-            auto emit = [&](uint32_t a, uint32_t b, uint32_t c) {
-                tri.push_back(idx[a]); tri.push_back(idx[b]); tri.push_back(idx[c]);
-            };
-            if (prim == PRIM_TRI_LIST)
+            uint32_t lowest = 0, highest = 0;
+            // A triangle list without restarts IS its triangles, in the same order: pass the indices as
+            // they are (their range is already known). Otherwise assemble through a pointer, the bounds
+            // on the way (no per-index capacity checks, no second pass).
+            const bool asIs = prim == PRIM_TRI_LIST && !anyCut && numIdx % 3 == 0;
+            // A strip as a strip (restarts are 0xFFFFFFFF already) - when it has a triangle at all.
+            bool asStrip = false;
+            if (prim == PRIM_TRI_STRIP)
             {
-                for (uint32_t i = 0; i + 2 < numIdx; i += 3)
-                    if (!(cut[i] | cut[i + 1] | cut[i + 2])) emit(i, i + 1, i + 2);
+                if (!anyCut) asStrip = numIdx >= 3;
+                else
+                    for (uint32_t i = 0, run = 0; i < numIdx && !asStrip; ++i)
+                        asStrip = (run = cut[i] ? 0 : run + 1) >= 3;
             }
-            else if (prim == PRIM_TRI_STRIP || prim == PRIM_TRI_FAN)
+            const std::vector<uint32_t>& triList = (asIs || asStrip) ? idx : tri;
+            if (asIs || asStrip) { lowest = minIdxSeen; highest = maxIdx; }
+            else
             {
-                for (uint32_t s = 0; s < numIdx;)
+                tri.resize(size_t(numIdx) * 3 + 6);
+                uint32_t* out = tri.data();
+                const uint32_t* ix = idx.data();
+                const uint8_t* ct = cut.data();
+                uint32_t lo = 0xFFFFFFFFu, hi = 0;
+                auto emit = [&](uint32_t a, uint32_t b, uint32_t c) {
+                    const uint32_t va = ix[a], vb = ix[b], vc = ix[c];
+                    out[0] = va; out[1] = vb; out[2] = vc;
+                    out += 3;
+                    lo = std::min(lo, std::min(va, std::min(vb, vc)));
+                    hi = std::max(hi, std::max(va, std::max(vb, vc)));
+                };
+                if (prim == PRIM_TRI_LIST)
                 {
-                    if (cut[s]) { ++s; continue; }
-                    uint32_t e = s;
-                    while (e < numIdx && !cut[e]) ++e;
-                    if (prim == PRIM_TRI_STRIP)
-                        for (uint32_t i = s; i + 2 < e; ++i)
-                        {
-                            if ((i - s) & 1) emit(i + 1, i, i + 2);
-                            else             emit(i, i + 1, i + 2);
-                        }
-                    else
-                        for (uint32_t i = s + 1; i + 1 < e; ++i) emit(s, i, i + 1);
-                    s = e;
+                    for (uint32_t i = 0; i + 2 < numIdx; i += 3)
+                        if (!(ct[i] | ct[i + 1] | ct[i + 2])) emit(i, i + 1, i + 2);
                 }
-            }
-            else if (prim == PRIM_QUAD_LIST)
-            {
-                for (uint32_t i = 0; i + 3 < numIdx; i += 4)
+                else if (prim == PRIM_TRI_STRIP || prim == PRIM_TRI_FAN)
                 {
-                    if (cut[i] | cut[i + 1] | cut[i + 2] | cut[i + 3]) continue;
-                    emit(i, i + 1, i + 2);
-                    emit(i, i + 2, i + 3);
+                    for (uint32_t s = 0; s < numIdx;)
+                    {
+                        if (ct[s]) { ++s; continue; }
+                        uint32_t e = s;
+                        while (e < numIdx && !ct[e]) ++e;
+                        if (prim == PRIM_TRI_STRIP)
+                            for (uint32_t i = s; i + 2 < e; ++i)
+                            {
+                                if ((i - s) & 1) emit(i + 1, i, i + 2);
+                                else             emit(i, i + 1, i + 2);
+                            }
+                        else
+                            for (uint32_t i = s + 1; i + 1 < e; ++i) emit(s, i, i + 1);
+                        s = e;
+                    }
                 }
+                else if (prim == PRIM_QUAD_LIST)
+                {
+                    for (uint32_t i = 0; i + 3 < numIdx; i += 4)
+                    {
+                        if (ct[i] | ct[i + 1] | ct[i + 2] | ct[i + 3]) continue;
+                        emit(i, i + 1, i + 2);
+                        emit(i, i + 2, i + 3);
+                    }
+                }
+                tri.resize(size_t(out - tri.data()));
+                if (!tri.empty()) { lowest = lo; highest = hi; }
             }
-            uint32_t lowest = tri.empty() ? 0 : 0xFFFFFFFFu, highest = 0;
-            for (uint32_t v : tri) { lowest = std::min(lowest, v); highest = std::max(highest, v); }
+            if (verify)
+            {
+                // The old assembly, for comparison.
+                std::vector<uint32_t> oTri;
+                auto oEmit = [&](uint32_t a, uint32_t b, uint32_t c) { oTri.push_back(idx[a]); oTri.push_back(idx[b]); oTri.push_back(idx[c]); };
+                if (prim == PRIM_TRI_LIST)
+                {
+                    for (uint32_t i = 0; i + 2 < numIdx; i += 3)
+                        if (!(cut[i] | cut[i + 1] | cut[i + 2])) oEmit(i, i + 1, i + 2);
+                }
+                else if (prim == PRIM_TRI_STRIP || prim == PRIM_TRI_FAN)
+                {
+                    for (uint32_t s = 0; s < numIdx;)
+                    {
+                        if (cut[s]) { ++s; continue; }
+                        uint32_t e = s;
+                        while (e < numIdx && !cut[e]) ++e;
+                        if (prim == PRIM_TRI_STRIP)
+                            for (uint32_t i = s; i + 2 < e; ++i)
+                            {
+                                if ((i - s) & 1) oEmit(i + 1, i, i + 2);
+                                else             oEmit(i, i + 1, i + 2);
+                            }
+                        else
+                            for (uint32_t i = s + 1; i + 1 < e; ++i) oEmit(s, i, i + 1);
+                        s = e;
+                    }
+                }
+                else if (prim == PRIM_QUAD_LIST)
+                {
+                    for (uint32_t i = 0; i + 3 < numIdx; i += 4)
+                    {
+                        if (cut[i] | cut[i + 1] | cut[i + 2] | cut[i + 3]) continue;
+                        oEmit(i, i + 1, i + 2);
+                        oEmit(i, i + 2, i + 3);
+                    }
+                }
+                uint32_t oLow = oTri.empty() ? 0 : 0xFFFFFFFFu, oHigh = 0;
+                for (uint32_t v : oTri) { oLow = std::min(oLow, v); oHigh = std::max(oHigh, v); }
+                static uint64_t checked = 0;
+                if (++checked % 50000 == 0) std::fprintf(stderr, "[verify] %llu draws' triangles checked\n", (unsigned long long)checked);
+                // A strip passed as a strip: the old triangles' range must lie inside the range uploaded.
+                const bool bad = asStrip ? (oTri.empty() || oLow < lowest || oHigh > highest)
+                                         : (oTri != triList || oLow != lowest || oHigh != highest);
+                if (bad && verifyLogged++ < 20)
+                    std::fprintf(stderr, "[verify] triangles differ: prim %u, %zu / %zu indices, range %u..%u / %u..%u\n",
+                                 prim, oTri.size(), triList.size(), oLow, oHigh, lowest, highest);
+            }
+            if (ixCheck) ttt2_hw::Get().IndexCacheCheck(*ixCheck, triList, lowest, highest, asStrip, maxIdx);   // p103 (TEST ONLY)
+            const ttt2_hw::Backend::IxEntry* ixKept = nullptr;
+            if (ixFind.slot)        // p103: kept for the next draws - and drawn from there now
+                ttt2_hw::Guarded("index cache", [&] { ixKept = ttt2_hw::Get().IndexCacheStore(ixFind, ixKey, triList, lowest, highest, asStrip, maxIdx); });
+            dTr.Stop();
+            DiagPrepScope dSs(3);
             const ttt2_hw::DrawState st = makeHwState();
+            dSs.Stop();
             auto result = ttt2_hw::Backend::GpuVsResult::Fallback;
-            ttt2_hw::Guarded("draw", [&] {
-                result = ttt2_hw::Get().DrawGpuVs(regs, psCode, *vsEntry, tri, lowest, highest, st);
-            });
+            {
+                DiagPrepScope dGd(6);
+                static const std::vector<uint32_t> none;
+                ttt2_hw::Guarded("draw", [&] {
+                    result = ttt2_hw::Get().DrawGpuVs(regs, psCode, *vsEntry, ixKept ? none : triList, lowest, highest, st,
+                                                      asStrip ? D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ixKept);
+                });
+            }
             if (result != ttt2_hw::Backend::GpuVsResult::Fallback)
             {
                 if (g_gpuFrameNote)
                 {
                     char note[160];
                     std::snprintf(note, sizeof(note), "    hw-vs: tris=%zu index range %u..%u z=%u/%u/%u samp=%ux%u sc=%d,%d..%d,%d clip=%08X\n",
-                                  tri.size() / 3, lowest, highest, (unsigned)zEnable, (unsigned)zWrite, zFunc,
+                                  triList.size() / 3, lowest, highest, (unsigned)zEnable, (unsigned)zWrite, zFunc,
                                   sampX, sampY, scX0, scY0, scX1, scY1, regs[0x2204]);
                     g_gpuFrameNote(note);
                 }
                 if (LogOn() || LogPrimOn(prim)) { LogUsed(); LogPrimUsed(prim); }
-                if (!tri.empty()) ++g_litDraws;
-                return !tri.empty();
+                if (!triList.empty()) ++g_litDraws;
+                return !triList.empty();
             }
         }
     }
+    if (ixFind.hit) { readIndices(); ixFind.hit = nullptr; }        // p103: the CPU paths need the indices
 #endif
 
     if (prim == PRIM_RECT_LIST)
@@ -2524,6 +2848,9 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
                 g_gpuFrameNote(note);
             }
         }
+        g_diagFrameCpuDraws.fetch_add(1, std::memory_order_relaxed);
+        g_diagFrameCpuWhy[diagCpuWhy].fetch_add(1, std::memory_order_relaxed);
+        g_diagFrameCpuVerts.fetch_add(uint32_t(uniqueIdx.size()), std::memory_order_relaxed);
         ttt2_hw::Guarded("draw", [&] {
             ttt2_hw::Get().Draw(regs, psCode, shaded.data(), uniqueIdx.size(), hwExtra, hwSlots, interpCount, st);
         });
@@ -2663,6 +2990,24 @@ bool GpuHwIsExclusiveFullscreen()
 #endif
 }
 
+// TEST ONLY (p_diag30, kernel_video.cpp DiagSpikeFrame): the shown frame kept on the GPU / the kept one read back.
+void GpuHwDiagKeepFront()
+{
+#if defined(TTT2_GPU_HW_BACKEND)
+    if (GpuHwMode()) ttt2_hw::Guarded("diag keep front", [&] { ttt2_hw::Get().DiagKeepFront(); });
+#endif
+}
+bool GpuHwDiagReadPrev(uint32_t* bgrx)
+{
+    bool read = false;
+#if defined(TTT2_GPU_HW_BACKEND)
+    if (GpuHwMode()) ttt2_hw::Guarded("readback", [&] { read = ttt2_hw::Get().ReadDiagPrev(bgrx); });
+#else
+    (void)bgrx;
+#endif
+    return read;
+}
+
 bool GpuHwReadFrontBuffer(uint32_t* bgrx)
 {
     bool read = false;
@@ -2673,6 +3018,25 @@ bool GpuHwReadFrontBuffer(uint32_t* bgrx)
     return read;
 }
 
+// TEST ONLY (kernel_video.cpp DiagSpikeFrame, p_diag27): first-bound vertex / pixel shaders and state objects made, so far.
+void GpuHwDiagFirstUseTotals(uint32_t* vs, uint32_t* ps, uint32_t* states)
+{
+#if defined(TTT2_GPU_HW_BACKEND)
+    *vs = ttt2_hw::g_diagFirstUseCount[0].load(std::memory_order_relaxed);
+    *ps = ttt2_hw::g_diagFirstUseCount[1].load(std::memory_order_relaxed);
+    *states = ttt2_hw::g_diagStateCreates.load(std::memory_order_relaxed);
+#else
+    *vs = *ps = *states = 0;
+#endif
+}
+// TEST ONLY (kernel_video.cpp DiagSpikeFrame): the renderer's running per-part timers and resolve count.
+void GpuHwDiagFrameTotals(int64_t* ticks, int count, uint64_t* resolves)
+{
+#if defined(TTT2_GPU_HW_BACKEND)
+    if (GpuHwMode()) ttt2_hw::Get().DiagTotals(ticks, count, resolves);
+#endif
+}
+
 bool GpuHwDumpResolved(uint32_t destBase, const char* path)
 {
     bool ok = false;
@@ -2681,6 +3045,14 @@ bool GpuHwDumpResolved(uint32_t destBase, const char* path)
         ttt2_hw::Guarded("dump", [&] { ok = ttt2_hw::Get().DumpResolved(destBase, path); });
 #endif
     return ok;
+}
+
+void GpuDiagFirstUses(double seconds, int& ps, int& vs)     // DIAGNOSTIC BUILD (kernel_video.cpp's freeze watch)
+{
+    ps = vs = 0;
+#if defined(TTT2_GPU_HW_BACKEND)
+    ttt2_hw::DiagFirstUsesWithin(seconds, ps, vs);
+#endif
 }
 
 void GpuHwWriteBackRange(uint32_t start, uint32_t size)
@@ -2694,6 +3066,13 @@ void GpuHwWriteBackRange(uint32_t start, uint32_t size)
     static const bool timing = [] { const char* e = std::getenv("TTT2_FRAMETIME"); return e && *e == '1'; }();
     const auto t0 = std::chrono::steady_clock::now();
     unsigned polls = 0;
+    // DIAGNOSTIC BUILD (diag4): TTT2_DIAG_SLOW_READ_MS=n makes each read that has to wait for a staged copy of the
+    // 1024x1024 image at A751B000 wait n/8, n/4, n/2 or n ms more (random), like the GT 730's 115/230/460/920 ms waits
+    // (logs 14-17: one such wait per bake) - to reproduce that PC's out-of-memory failure here.
+    static const unsigned diagSlowMs = [] { const char* e = std::getenv("TTT2_DIAG_SLOW_READ_MS"); return e ? unsigned(std::atoi(e)) : 0u; }();
+    // DIAGNOSTIC BUILD: the fence this read waits for, and how far the GPU had got when the wait began and ended.
+    uint64_t diagAwaited = 0, diagDoneAtStart = ~0ull, diagDoneAtEnd = 0;
+    unsigned diagTimeouts = 0;
     for (bool pending = GpuHwMode(); pending;)
     {
         const bool block = polls > 2000;
@@ -2705,12 +3084,40 @@ void GpuHwWriteBackRange(uint32_t start, uint32_t size)
             })) break;
         if (!pending) break;
         ++polls;
+        if (polls == 1 && diagSlowMs && start >= 0xA7500000u && start < 0xA7A00000u)
+        {
+            static thread_local uint32_t seed = GetCurrentThreadId() * 2654435761u;
+            seed = seed * 1664525u + 1013904223u;
+            Sleep(diagSlowMs >> ((seed >> 8) & 3));
+        }
         // Wait for exactly the copy (the GPU signals the fence after it); otherwise poll: yield
         // first, then 1 ms sleeps.
         static thread_local HANDLE copied = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (fence && copied && SUCCEEDED(fence->SetEventOnCompletion(fenceValue, copied))) WaitForSingleObject(copied, 100);
+        if (fence)
+        {
+            diagAwaited = fenceValue;
+            if (diagDoneAtStart == ~0ull) diagDoneAtStart = fence->GetCompletedValue();
+        }
+        if (fence && copied && SUCCEEDED(fence->SetEventOnCompletion(fenceValue, copied)))
+        {
+            if (WaitForSingleObject(copied, 100) == WAIT_TIMEOUT) ++diagTimeouts;
+            diagDoneAtEnd = fence->GetCompletedValue();
+        }
         else if (polls < 64) SwitchToThread();
         else Sleep(1);
+    }
+    {
+        const double total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        static std::atomic<int> logged{ 0 };
+        if (total >= 20.0 && logged++ < 300)
+        {
+            int ps = 0, vs = 0;
+            ttt2_hw::DiagFirstUsesWithin(1.0, ps, vs);
+            std::fprintf(stderr, "[diag] cpu-read wait %08X: %.1f ms, %u rounds (%u timed out), fence %llu awaited, the GPU at %llu then %llu; "
+                                 "shaders first bound in the last second: %d pixel, %d vertex\n",
+                         start, total, polls, diagTimeouts, (unsigned long long)diagAwaited,
+                         (unsigned long long)(diagDoneAtStart == ~0ull ? 0 : diagDoneAtStart), (unsigned long long)diagDoneAtEnd, ps, vs);
+        }
     }
     if (timing)
     {

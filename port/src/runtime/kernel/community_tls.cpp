@@ -1,5 +1,6 @@
 // SChannel TLS client (community_tls.h).
 #include "community_tls.h"
+#include "log_utf8.h"
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <bcrypt.h>
@@ -21,9 +22,15 @@ constexpr size_t kMaxBuffered = 4 * kMaxRecord;
 
 std::string Win32Message(long code)
 {
-    char text[256] = {};
-    FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, DWORD(code), 0, text, sizeof(text), nullptr);
-    std::string s = text;
+    // US English where Windows has it, else the system's language, as UTF-8 (log_utf8.h; -A gave the ANSI code page or
+    // '?'). English first: the in-game box shows ASCII only (server_ui.cpp GameText) and drops a translation's letters.
+    // A message too long for the buffer fails but leaves a cut copy behind: the bare code then, as -A gave.
+    const DWORD flags = FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+    wchar_t text[256] = {};
+    if (!FormatMessageW(flags, nullptr, DWORD(code), MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US), text, 256, nullptr) &&
+        !FormatMessageW(flags, nullptr, DWORD(code), 0, text, 256, nullptr))
+        text[0] = 0;
+    std::string s = LogUtf8(text);
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '.')) s.pop_back();
     char hex[16];
     std::snprintf(hex, sizeof(hex), "0x%08lX", static_cast<unsigned long>(code));

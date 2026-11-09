@@ -10,6 +10,7 @@
 #define IDR_VCRUNTIME140       105
 #define IDR_VCRUNTIME140_1     106
 #define IDR_README             107
+#define IDR_PAYLOAD_SHA256     108   // "<id> <sha256>" per line for 101..107 (tools/hash_payload.cmake)
 
 #define IDD_MAIN               200
 #define IDC_ISO_PATH           201
@@ -27,6 +28,9 @@
 #define IDC_TU_LABEL           213
 #define IDC_TU_PATH            214
 #define IDC_TU_BROWSE          215
+#define IDC_DLC_LABEL          216
+#define IDC_DLC_PATH           217
+#define IDC_DLC_BROWSE         218
 
 #define IDD_UNINSTALL          220
 #define IDC_UN_TEXT            221

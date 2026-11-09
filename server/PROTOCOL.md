@@ -45,8 +45,10 @@ connections that send nothing for 30 s (the client pings every 5 s) and handshak
 | 15 | XUID_NAMES | C->S | u32 request id, u8 count (<= 16) + u64 online XUIDs: the names of those players (the game's gamertag lookups, XUserFindUsers: TEKKEN CHANNEL shows a replay's players by name); 5 a second, burst 20 |
 | 16 | MATCH_EVENT | C->S | u64 session id, u8 event (1 started, 2 ended), u8 players at the sender's PC (1..4; 2 for pair play), u8 peer count (0..7) + u64 peers (the Steam IDs of the match's other PCs); only to a server whose WELCOME has flag bit 3 ("Match history") |
 | 17 | FILE_PUT | C->S | u64 own XUID, str item (`licence.dat`), blob the file (1..16384 bytes): this player's copy for the others ("Player files"); only to a server whose WELCOME has flag bit 4 |
-| 18 | FILE_GET | C->S | u32 request id, u64 owner XUID, str item: another player's file, by the online XUID their game uses; only to a server whose WELCOME has flag bit 4 |
-| 101 | WELCOME | S->C | u64 peer id (= Steam ID), u8 flags (bit 0: the Steam ID was checked with Steam; bit 1: GIN_REQUEST is answered; bit 2: statistics are kept - frames 10..13; bit 3: matches are recorded - frame 16; bit 4: player files are kept - frames 17, 18), str server name, str region, str message of the day |
+| 18 | FILE_GET | C->S | u32 request id, u64 owner XUID, str item: another player's file, by the online XUID their game uses (0: the asker's own, on a server whose WELCOME has flag bit 5, after OWN_RANKS - "Ranks"); only to a server whose WELCOME has flag bit 4 |
+| 19 | OWN_RANKS | C->S | (empty): the game takes its ranks from this server ("Ranks"); sent right after WELCOME; only to a server whose WELCOME has flag bit 5 |
+| 20 | FILE_DEL | C->S | u64 own XUID, str item (`licence.dat`, `penalty.dat`): delete this player's own copy ("Ranks"); after OWN_RANKS only; counted with FILE_PUT |
+| 101 | WELCOME | S->C | u64 peer id (= Steam ID), u8 flags (bit 0: the Steam ID was checked with Steam; bit 1: GIN_REQUEST is answered; bit 2: statistics are kept - frames 10..13; bit 3: matches are recorded - frame 16; bit 4: player files are kept - frames 17, 18; bit 5: the ranks are this server's own - frames 19, 20, needs bit 4), str server name, str region, str message of the day |
 | 102 | ERROR | S->C | u32 code, str text for the player; the server closes the connection after it |
 | 103 | PONG | S->C | u64 nonce |
 | 104 | SESSION_LIST_RESULT | S->C | u32 request id, u32 count, count x blob record |
@@ -246,6 +248,33 @@ statistics (bit 2): XUIDs are recorded there. Without it the game asks the games
 Limits: FILE_PUT 1 every 5 s (burst 6), beyond that dropped; FILE_GET 5 a second (burst 20), beyond that answered 2.
 Malformed (a file of 0 or more than 16384 bytes, bytes missing or left over): error 8.
 
+## Ranks
+
+Whose ranks count is the server owner's choice (`ranks` in server.toml). A player's ranks live in their license
+(`licence.dat`: each character's rank and points, the highest rank, Battle Points, the online record) and in
+`penalty.dat` (a ranked match left early, charged at the next visit).
+
+- `ranks = "server"` (the default): the server's own. Its WELCOME has flag bit 5 (with bit 4). The game answers
+  OWN_RANKS right after WELCOME and from then on keeps the player's license and penalties on the server, not on the
+  player's PC: it reads them with FILE_GET owner 0 at each ONLINE MODE visit (and again when the player switches to
+  this server inside ONLINE MODE), writes them with FILE_PUT and deletes them with FILE_DEL. The server keeps them
+  apart from the copies other players view (database item `server/licence.dat`, `server/penalty.dat`; FILE_GET of
+  another player's `licence.dat` answers their `server/licence.dat`). A player new to the server starts as a beginner
+  there: their game makes a beginner's license, never one from their own save. A game that did not send OWN_RANKS (an
+  older version) still plays here, but its FILE_PUTs are dropped and its ranked matches do not count (ARB_REGISTER is
+  refused). Wiping a player's statistics (`ttt2-server admin wipe`) also deletes these files: they start again.
+- `ranks = "player"`: each player's own. No bit 5; OWN_RANKS / FILE_DEL close the connection (error 8). The game keeps
+  the license and penalties on the player's PC as on Steam, and gives the server a copy for others to view (FILE_PUT).
+
+The player's PC keeps none of a server's ranks. The game also mirrors the license's fields in its own save: it copies a
+license it reads into the save, builds the license it stores from the save, and builds one from the save when none is
+found. While a server's own ranks are in use, the game puts the player's own fields back into every save it writes
+(the save on the PC keeps their own ranks; the server's apply only while they play there), and their `licence.dat`
+is not touched. Switching back to Steam or a `"player"` server reads the PC's license again.
+
+Trust: a game sends its license itself. A modified game could send a made-up one; the server does not check the
+license against the ranked results it records.
+
 ## UDP: the server list's status query
 
 `u8 kind` first; nothing else is ever sent over UDP.
@@ -253,7 +282,7 @@ Malformed (a file of 0 or more than 16384 bytes, bytes missing or left over): er
 | Kind | Name | Direction | Payload |
 |---|---|---|---|
 | 1 | INFO_REQ | C->S | u32 magic `TTSI`, u64 nonce, zero padding to at least 128 bytes |
-| 2 | INFO | S->C | u32 magic, u64 nonce, u16 protocol version, u8 flags (bit 0 password required, bit 1 Steam IDs checked), str name, str region, u16 players online, u16 max players, u16 players in a match, u16 open sessions, str message of the day (cut so the reply is at most 3 x the request), str accepted game protocols (comma separated) |
+| 2 | INFO | S->C | u32 magic, u64 nonce, u16 protocol version, u8 flags (bit 0 password required, bit 1 Steam IDs checked, bit 2 the ranks are this server's own - "Ranks"), str name, str region, u16 players online, u16 max players, u16 players in a match, u16 open sessions, str message of the day (cut so the reply is at most 3 x the request), str accepted game protocols (comma separated) |
 
 INFO is for the server list (the answer time is the ping; also broadcast on the LAN). "Players in a match" is
 the players in open sessions (hosts and who joined them) - the server sees no match traffic (the admin's `status`

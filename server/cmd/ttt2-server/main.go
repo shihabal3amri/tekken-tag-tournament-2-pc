@@ -149,6 +149,7 @@ func main() {
 	logger.Printf("ttt2-server %s: %q (%s), port %d TCP+UDP, up to %d players, accepts %s",
 		version, cfg.Name, cfg.Region, cfg.Port, cfg.MaxPlayers, strings.Join(cfg.AcceptedProtocols, ", "))
 	logger.Printf("%s", check)
+	logger.Printf("ranks: %s", ranksText(cfg.Ranks))
 	logger.Printf("server key fingerprint %s, Steam ticket identity %s (players' games remember the key; back up %s - a new key makes every game refuse this server)",
 		identity.FingerprintText(), identity.SteamIdentity(), filepath.Join(dataDir, "tls.key"))
 	known, _ := db.PlayerCount()
@@ -209,6 +210,9 @@ func reload(h *hub.Hub, db *store.Store, pnl *panel.Panel, configPath string, no
 	if cfg.Port != old.Port || cfg.SteamWebAPIKey != old.SteamWebAPIKey || cfg.TrustUnverified != old.TrustUnverified {
 		note("port and Steam settings change only with a restart")
 	}
+	if cfg.Ranks != old.Ranks {
+		note("ranks: %s from now on (players online now keep the old setting until they connect again)", ranksText(cfg.Ranks))
+	}
 	h.SetConfig(cfg)
 	db.SetUploadQuota(int64(cfg.MaxUploadStorageMB) << 20)
 	applyPanel(pnl, cfg, note)
@@ -217,6 +221,14 @@ func reload(h *hub.Hub, db *store.Store, pnl *panel.Panel, configPath string, no
 	} else {
 		note("configuration and bans reloaded (%d banned players removed)", n)
 	}
+}
+
+// ranksText says whose ranks count (config ranks).
+func ranksText(ranks string) string {
+	if ranks == config.RanksPlayer {
+		return "each player's own (the rank on their PC)"
+	}
+	return "this server's own (players start as beginners here)"
 }
 
 // console reads commands from the server's standard input (a service has none: `ttt2-server admin` reaches the same
@@ -258,8 +270,8 @@ func (c *commands) run(line string, out io.Writer) (quit bool) {
 	case "status":
 		st := c.h.Stats()
 		known, _ := c.db.PlayerCount()
-		fmt.Fprintf(out, "%d players online, %d in rooms, %d in matches, %d open sessions, %d players seen, up %s\n",
-			st.Online, st.InRooms, st.InMatches, st.Sessions, known, st.Uptime.Round(time.Second))
+		fmt.Fprintf(out, "%d players online, %d in rooms, %d in matches, %d open sessions, %d players seen, up %s; ranks: %s\n",
+			st.Online, st.InRooms, st.InMatches, st.Sessions, known, st.Uptime.Round(time.Second), ranksText(c.h.Config().Ranks))
 	case "players":
 		if sub, search, _ := strings.Cut(arg, " "); strings.EqualFold(sub, "all") {
 			c.allPlayers(out, strings.TrimSpace(search))

@@ -27,7 +27,7 @@ namespace {
 // server/PROTOCOL.md
 enum : uint8_t { kHello = 1, kAuth = 2, kPing = 3, kSessionPut = 4, kSessionDel = 5, kSessionList = 6, kSessionGet = 7, kInviteSend = 8,
                  kGinRequest = 9, kStatsWrite = 10, kStatsBoard = 11, kStatsPlayers = 12, kArbRegister = 13, kPeerCheck = 14, kXuidNames = 15,
-                 kMatchEvent = 16, kFilePut = 17, kFileGet = 18,
+                 kMatchEvent = 16, kFilePut = 17, kFileGet = 18, kOwnRanks = 19, kFileDel = 20,
                  kWelcome = 101, kError = 102, kPong = 103, kListResult = 104, kGetResult = 105, kInvite = 106,
                  kNotice = 109, kGinResponse = 110, kStatsResult = 111, kPeerResult = 112, kNamesResult = 113,
                  kFileResult = 114 };
@@ -214,6 +214,8 @@ struct Client::Impl
     bool stats = false;                        // ... keeps statistics (bit 2)
     bool matches = false;                      // ... records matches (bit 3)
     bool files = false;                        // ... keeps the players' license files (bit 4)
+    bool serverRanks = false;                  // ... the ranks are its own (bit 5)
+    std::string serverKey;                     // the server key's fingerprint (64 hex digits): which server this is
     std::atomic<uint64_t> banUntil{ ~0ull };   // ERROR 6's until (~0: not said)
     std::set<uint32_t> outstanding;            // requests still waited for (answers to others are dropped)
     std::deque<std::pair<uint64_t, std::vector<uint8_t>>> invites;
@@ -596,10 +598,13 @@ bool Client::Connect(const Options& opts, Welcome& welcome, std::string& error)
     welcome.stats = (flags & 4) != 0;
     welcome.matches = (flags & 8) != 0;
     welcome.files = (flags & 16) != 0;
+    welcome.serverRanks = welcome.files && (flags & 32) != 0;
     m.gin = welcome.gin;
     m.stats = welcome.stats;
     m.matches = welcome.matches;
     m.files = welcome.files;
+    m.serverRanks = welcome.serverRanks;
+    m.serverKey = fingerprint;
     welcome.name = Clean(r.Str(256), 64);
     welcome.region = Clean(r.Str(64), 32);
     welcome.motd = Clean(r.Str(4096), 1000);
@@ -615,9 +620,13 @@ bool Client::Connect(const Options& opts, Welcome& welcome, std::string& error)
     m.reader = std::thread([&m] { m.ReaderLoop(); });
     m.writer = std::thread([&m] { m.WriterLoop(); });
     m.timer = std::thread([&m] { m.TimerLoop(); });
-    std::fprintf(stderr, "[community] connected to %s \"%s\" (%s, %s, key %s, %s)\n", server.c_str(), welcome.name.c_str(),
+    // this game takes its own license from a server whose ranks are its own (title_server.cpp), and says so: the
+    // server lets only such games put a license there or play ranked matches that count
+    if (m.serverRanks) m.Queue(kOwnRanks, {});
+    std::fprintf(stderr, "[community] connected to %s \"%s\" (%s, %s, key %s, %s; ranks: %s)\n", server.c_str(), welcome.name.c_str(),
                  welcome.region.c_str(), welcome.tls.c_str(), welcome.fingerprint.c_str(),
-                 welcome.verified ? "Steam ID checked" : "Steam ID NOT checked");
+                 welcome.verified ? "Steam ID checked" : "Steam ID NOT checked",
+                 m.serverRanks ? "the server's own" : "each player's own");
     return true;
 }
 
@@ -828,6 +837,17 @@ bool Client::NamesOf(const std::vector<uint64_t>& xuids, std::map<uint64_t, std:
 }
 
 bool Client::KeepsFiles() const { return Connected() && impl_->files; }
+bool Client::ServerRanks() const { return Connected() && impl_->serverRanks; }
+std::string Client::ServerKey() const { return impl_ ? impl_->serverKey : std::string(); }
+
+void Client::DeleteOwnFile(uint64_t ownXuid, const std::string& item)
+{
+    if (!ServerRanks() || !ownXuid || item.empty() || item.size() > 32) return;
+    Writer w;
+    w.U64(ownXuid);
+    w.Str(item);
+    impl_->Queue(kFileDel, w.b);
+}
 
 void Client::PutFile(uint64_t ownXuid, const std::string& item, const std::vector<uint8_t>& data)
 {
@@ -841,7 +861,7 @@ void Client::PutFile(uint64_t ownXuid, const std::string& item, const std::vecto
 
 int Client::GetFile(uint64_t ownerXuid, const std::string& item, std::vector<uint8_t>& data, int timeoutMs)
 {
-    if (!KeepsFiles() || !ownerXuid || item.empty() || item.size() > 32) return -1;
+    if (!KeepsFiles() || (!ownerXuid && !ServerRanks()) || item.empty() || item.size() > 32) return -1;
     Impl& m = *impl_;
     uint32_t id;
     {
@@ -986,6 +1006,7 @@ bool ParseInfo(const uint8_t* data, size_t size, uint64_t nonce, ServerInfo& inf
     const uint8_t flags = r.U8();
     out.password = (flags & 1) != 0;
     out.verified = (flags & 2) != 0;
+    out.ownRanks = (flags & 4) != 0;
     out.name = Clean(r.Str(256), 64);
     out.region = Clean(r.Str(256), 32);
     out.online = r.U16();

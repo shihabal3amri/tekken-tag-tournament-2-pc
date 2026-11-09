@@ -66,6 +66,7 @@ bool On()
     return on;
 }
 void GhostStep(bool begin, uint32_t lr);
+void ReplayStep(PPCContext& ctx, uint8_t* base);   // award_journal.cpp's sub_82654CE8 override calls it
 } // namespace gin_trace
 using gin_trace::On;
 
@@ -326,9 +327,14 @@ PPC_FUNC(sub_8266C5F0)
     __imp__sub_8266C5F0(ctx, base);
 }
 
+namespace online2v2 { void LatchStreakLabel(PPCContext& ctx, uint8_t* base); }   // online_pair_room.cpp
+namespace online2v2 { uint32_t VsRankRecord(uint8_t* base, uint32_t side, uint32_t record); }   // online_2v2_team.cpp
 PPC_FUNC(sub_8266C5E0)
 {
     if (On()) std::fprintf(stderr, "[gin-trace] GIN state [+8] = %d (lr %08X)\n", int32_t(ctx.r4.u32), uint32_t(ctx.lr));
+    // from the battle setup's apply (sub_826689C8 at 0x82668C44, every PC), right after it set S+754 / S+756 - the fight
+    // HUD's WIN label: online_pair_room.cpp takes its own from the same room data
+    if (uint32_t(ctx.lr) == 0x82668C48u) online2v2::LatchStreakLabel(ctx, base);
     __imp__sub_8266C5E0(ctx, base);
 }
 
@@ -336,8 +342,11 @@ PPC_FUNC(sub_8266C5E0)
 // (sub_825548F0: non-zero = go on)
 PPC_FUNC(sub_82653478)
 {
-    const uint32_t side = ctx.r4.u32;
+    const uint32_t side = ctx.r4.u32, lr = uint32_t(ctx.lr);
     __imp__sub_82653478(ctx, base);
+    // the VS screen's character panel (sub_826357C8): PAIR PLAY's ranks, each its controller's (online_2v2_team.cpp)
+    if (lr == 0x82635854u)
+        if (const uint32_t record = online2v2::VsRankRecord(base, side, ctx.r3.u32)) ctx.r3.u64 = record;
     if (On() && g_inGhostStep)
         std::fprintf(stderr, "[gin-trace]   user slot of side %u: %08X byte0 %u\n", side, ctx.r3.u32, ctx.r3.u32 ? base[ctx.r3.u32] : 0);
 }
@@ -443,8 +452,9 @@ PPC_FUNC(sub_826EDC60)
 
 // The replay upload: sub_82654CE8 (needs its +60/+64 set and +152 clear) asks the manager whether GIN is up
 // (sub_8266C748) and sub_823069E0, then sub_8266C830 requests it (replay object sub_826ED9C0) unless the
-// manager's +16 user check sub_826EF3D8 says no.
-PPC_FUNC(sub_82654CE8)
+// manager's +16 user check sub_826EF3D8 says no. The program's one override of sub_82654CE8 is award_journal.cpp's (the
+// online award journal); it calls this for the trace and the game's own step.
+void gin_trace::ReplayStep(PPCContext& ctx, uint8_t* base)
 {
     if (On())
         std::fprintf(stderr, "[gin-trace] replay step %08X: +60 %08X +64 %08X +152 %08X (lr %08X)\n", ctx.r3.u32,
