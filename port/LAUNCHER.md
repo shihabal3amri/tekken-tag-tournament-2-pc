@@ -18,6 +18,8 @@ Why `ttt2_setup_probe.exe` and not `ttt2_setup.exe`: `ttt2_setup.exe` asks for a
 (Program Files, the Add or remove programs entry), and the launcher can't answer that prompt. The probe
 build is the same program without it, so no uninstall entry is made; the launcher removes the game.
 
+To build it: run `toolsbuild_setup.cmd`, then `toolspackage_launcher_zip.cmd` (writes `dist	tt2-<version>-windows-amd64.zip`; the version comes from `TTT2_VERSION` in `port/CMakeLists.txt`). Upload that zip next to `ttt2_setup.exe`.
+
 Name the zip with `windows` and `amd64`, like the server zips, so the launcher picks the right file.
 The server zips are never taken for the game while a game zip is in the release.
 
