@@ -1,0 +1,24 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "repo": "shihabal3amri/tekken-tag-tournament-2-pc",
+  "game": {
+    "kind": "iso",
+    "label": "Your Tekken Tag Tournament 2 (USA, Europe) Xbox 360 disc image (.iso).",
+    "check": { "xdvdfs": "default.xex" },
+    "update": {
+      "into": "title-update",
+      "label": "Your Title Update 3 file, or the folder that holds it.",
+      "accepts": "file or folder"
+    }
+  },
+  "prepare": {
+    "program": ["ttt2_setup_probe.exe"],
+    "args": ["/silent", "{game}", "{install}/title-update", "{install}"],
+    "label": "Building the game from your disc",
+    "timeout": 1800
+  },
+  "start": {
+    "program": ["Tekken Tag Tournament 2.exe"]
+  }
+}
